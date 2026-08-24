@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,8 @@ from paper_reviewer.adapters.security.keyring_store import SystemCredentialStore
 from paper_reviewer.application.app_state import AppPaths, PreferencesStore, read_json_lines
 from paper_reviewer.application.models import (
     ProviderCompatibilityResult,
+    ProviderErrorDetails,
+    ProviderResponseDiagnostics,
     ReportExportFormat,
     ReportExportResult,
     ReportView,
@@ -285,7 +287,7 @@ class ReviewApplicationService:
                                 },
                             )
                         ],
-                        max_output_tokens=32,
+                        max_output_tokens=1024,
                         trace_id="provider-compatibility-test",
                         idempotency_key="provider-compatibility-test",
                         forced_tool_name="paper_reviewer_compatibility_probe",
@@ -304,12 +306,16 @@ class ReviewApplicationService:
                     else "Provider 可响应，但没有产生所需的 Agent 工具调用。"
                 ),
                 protocol=selected_protocol,
+                response_diagnostics=_provider_response_diagnostics(response),
             )
         except Exception as error:
+            error_details = _extract_provider_error_details(error, secrets=(resolved_key,))
             return ProviderCompatibilityResult(
                 compatible=False,
                 message=_sanitize_provider_error(error, secrets=(resolved_key,)),
                 protocol=selected_protocol,
+                error_details=error_details,
+                response_diagnostics=_provider_error_response_diagnostics(error),
             )
         finally:
             await adapter.close()
@@ -859,11 +865,125 @@ _AUTHORIZATION_PATTERN = re.compile(
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _LIKELY_KEY_PATTERN = re.compile(r"\b(?:sk|key)-[A-Za-z0-9_-]{12,}\b", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://[^\s\]\[(){}<>\"']+", re.IGNORECASE)
+_NAMED_SECRET_PATTERN = re.compile(
+    r"(?i)(\b(?:api[-_ ]?key|access[-_ ]?token|secret)\s*[:=]\s*)[^\s,;]+"
+)
+_CONTROL_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+_PROVIDER_DETAIL_LIMITS = {"message": 300, "code": 80, "param": 120}
+_RESPONSE_STATUSES = {
+    "completed",
+    "incomplete",
+    "failed",
+    "cancelled",
+    "queued",
+    "in_progress",
+}
+_INCOMPLETE_REASONS = {"max_output_tokens", "content_filter"}
+_FINISH_REASONS = {"stop", "tool_calls", "length", "content_filter", "incomplete"}
+_OUTPUT_ITEM_TYPES = {
+    "message",
+    "reasoning",
+    "function_call",
+    "function_call_output",
+    "computer_call",
+    "web_search_call",
+    "file_search_call",
+    "code_interpreter_call",
+    "image_generation_call",
+    "mcp_call",
+    "mcp_list_tools",
+    "local_shell_call",
+    "custom_tool_call",
+}
 
 
-def _sanitize_provider_error(
+def _provider_response_diagnostics(response: Any) -> ProviderResponseDiagnostics:
+    """Build bounded response metadata without copying model-generated content."""
+
+    status = _diagnostic_value(response.response_status, _RESPONSE_STATUSES)
+    incomplete_reason = _diagnostic_value(
+        response.incomplete_reason, _INCOMPLETE_REASONS
+    )
+    finish_reason = _diagnostic_value(response.finish_reason, _FINISH_REASONS)
+    item_types: list[str] = []
+    for raw_type in response.output_item_types[:12]:
+        item_type = raw_type if raw_type in _OUTPUT_ITEM_TYPES else "unknown"
+        if item_type not in item_types:
+            item_types.append(item_type)
+    return ProviderResponseDiagnostics(
+        response_status=status,
+        incomplete_reason=incomplete_reason,
+        finish_reason=finish_reason,
+        output_item_types=item_types,
+        plain_text_only=response.plain_text_only,
+    )
+
+
+def _provider_error_response_diagnostics(
+    error: BaseException,
+) -> ProviderResponseDiagnostics | None:
+    if not hasattr(error, "response_status"):
+        return None
+    return _provider_response_diagnostics(error)
+
+
+def _diagnostic_value(value: object, allowed: set[str]) -> str | None:
+    if value is None:
+        return None
+    return value if isinstance(value, str) and value in allowed else "unknown"
+
+
+def _extract_provider_error_details(
     error: BaseException, *, secrets: tuple[str, ...] = ()
-) -> str:
+) -> ProviderErrorDetails | None:
+    """Extract only display-safe message/code/param fields from an SDK error.
+
+    The response body is never stringified. Unknown fields, headers, request
+    content, and nested objects are deliberately ignored.
+    """
+
+    body = getattr(error, "body", None)
+    payload: Mapping[object, object] | None = body if isinstance(body, Mapping) else None
+    if payload is not None:
+        nested = payload.get("error")
+        if isinstance(nested, Mapping):
+            payload = nested
+
+    values: dict[str, str | None] = {"message": None, "code": None, "param": None}
+    for field, limit in _PROVIDER_DETAIL_LIMITS.items():
+        candidate: object | None = payload.get(field) if payload is not None else None
+        if candidate is None and field in {"code", "param"}:
+            candidate = getattr(error, field, None)
+        values[field] = _sanitize_provider_detail(candidate, secrets=secrets, limit=limit)
+
+    details = ProviderErrorDetails.model_validate(values)
+    return details if any((details.message, details.code, details.param)) else None
+
+
+def _sanitize_provider_detail(value: object, *, secrets: tuple[str, ...], limit: int) -> str | None:
+    if value is None or isinstance(value, (Mapping, list, tuple, set)):
+        return None
+    if not isinstance(value, (str, int, float, bool)):
+        return None
+    message = _CONTROL_PATTERN.sub(" ", str(value))
+    message = " ".join(message.split())
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[API Key 已隐藏]")
+    message = _AUTHORIZATION_PATTERN.sub(r"\1[已隐藏]", message)
+    message = _BEARER_PATTERN.sub("Bearer [已隐藏]", message)
+    message = _LIKELY_KEY_PATTERN.sub("[API Key 已隐藏]", message)
+    message = _NAMED_SECRET_PATTERN.sub(r"\1[已隐藏]", message)
+    message = _URL_PATTERN.sub("[Provider URL 已隐藏]", message)
+    message = message.strip()
+    if not message:
+        return None
+    if len(message) > limit:
+        return message[: limit - 1].rstrip() + "…"
+    return message
+
+
+def _sanitize_provider_error(error: BaseException, *, secrets: tuple[str, ...] = ()) -> str:
     """Return a bounded provider error without credentials, URLs, or response bodies."""
 
     module = type(error).__module__

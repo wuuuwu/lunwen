@@ -72,6 +72,8 @@ async def test_complete_maps_metadata_and_preserves_max_tokens() -> None:
 
     assert result.content == '{"result":"ok"}'
     assert result.finish_reason == "stop"
+    assert result.output_item_types == ["message"]
+    assert result.plain_text_only is True
     assert result.reasoning_content_present is True
     assert result.usage.input_tokens == 11
     assert result.usage.output_tokens == 17
@@ -98,6 +100,8 @@ async def test_complete_defaults_optional_metadata_without_reasoning_text() -> N
     result = await adapter.complete(_request())
 
     assert result.finish_reason is None
+    assert result.output_item_types == ["message"]
+    assert result.plain_text_only is True
     assert result.reasoning_content_present is False
     assert result.usage.reasoning_tokens == 0
 

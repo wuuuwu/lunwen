@@ -32,10 +32,30 @@ class ReportExportResult(BaseModel):
     reconstructed_from_snapshot: bool = False
 
 
+class ProviderErrorDetails(BaseModel):
+    """Whitelisted, display-safe fields returned by a Provider."""
+
+    message: str | None = None
+    code: str | None = None
+    param: str | None = None
+
+
+class ProviderResponseDiagnostics(BaseModel):
+    """Content-free metadata from a compatibility probe response."""
+
+    response_status: str | None = None
+    incomplete_reason: str | None = None
+    finish_reason: str | None = None
+    output_item_types: list[str] = Field(default_factory=list)
+    plain_text_only: bool = False
+
+
 class ProviderCompatibilityResult(BaseModel):
     compatible: bool
     message: str
     protocol: ModelApiProtocol
+    error_details: ProviderErrorDetails | None = None
+    response_diagnostics: ProviderResponseDiagnostics | None = None
 
 
 class ReviewRequest(BaseModel):

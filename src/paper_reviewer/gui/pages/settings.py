@@ -641,11 +641,65 @@ class SettingsPage(QWidget):
         if isinstance(result, dict):
             success = bool(result.get("success", result.get("compatible", success)))
             detail = str(result.get("message", result.get("detail", "兼容性测试通过")))
+            error_details = result.get("error_details")
+            response_diagnostics = result.get("response_diagnostics")
         else:
             detail = str(getattr(result, "message", "兼容性测试通过"))
+            error_details = getattr(result, "error_details", None)
+            response_diagnostics = getattr(result, "response_diagnostics", None)
         dialog.set_busy(False)
         prefix = "兼容性测试通过：" if success else "兼容性测试失败："
-        dialog.show_test_result(success, prefix + detail)
+        message = prefix + detail
+        if not success:
+            provider_fields = self._provider_error_fields(error_details)
+            if provider_fields:
+                message += "\n服务商返回（已脱敏）：\n" + "\n".join(provider_fields)
+        diagnostic_fields = self._provider_response_fields(response_diagnostics)
+        if diagnostic_fields:
+            message += "\n响应诊断（不含正文）：\n" + "\n".join(diagnostic_fields)
+        dialog.show_test_result(success, message)
+
+    @staticmethod
+    def _provider_error_fields(details: object) -> list[str]:
+        if details is None:
+            return []
+        fields: list[str] = []
+        for name in ("message", "code", "param"):
+            if isinstance(details, dict):
+                value = details.get(name)
+            else:
+                value = getattr(details, name, None)
+            if isinstance(value, str) and value:
+                fields.append(f"{name}: {value}")
+        return fields
+
+    @staticmethod
+    def _provider_response_fields(diagnostics: object) -> list[str]:
+        if diagnostics is None:
+            return []
+
+        def value(name: str) -> object:
+            if isinstance(diagnostics, dict):
+                return diagnostics.get(name)
+            return getattr(diagnostics, name, None)
+
+        response_status = value("response_status")
+        incomplete_reason = value("incomplete_reason")
+        finish_reason = value("finish_reason")
+        output_item_types = value("output_item_types")
+        plain_text_only = value("plain_text_only")
+        item_types = (
+            "、".join(str(item) for item in output_item_types)
+            if isinstance(output_item_types, list) and output_item_types
+            else "无"
+        )
+        return [
+            f"response.status: {response_status or '无/不适用'}",
+            f"incomplete_details.reason: {incomplete_reason or '无'}",
+            f"finish_reason: {finish_reason or '无/不适用'}",
+            f"output item 类型: {item_types}",
+            f"仅返回普通文本: {'是' if plain_text_only is True else '否'}",
+        ]
 
     def _provider_test_failed(self, message: str, _traceback: str) -> None:
         if self._provider_dialog is not None:

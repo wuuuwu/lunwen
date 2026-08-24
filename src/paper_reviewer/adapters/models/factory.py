@@ -52,6 +52,17 @@ def create_model_adapter(
     )
     if resolved_key is None:  # pragma: no cover - guarded by provider branches above
         raise ValueError("provider API Key is not configured")
+    if adapter_type is OpenAIResponsesAdapter:
+        return adapter_type(
+            api_key=resolved_key,
+            model=model,
+            base_url=resolved_base_url,
+            timeout=timeout,
+            # Third-party Responses-compatible APIs do not consistently
+            # accept OpenAI's optional ``include`` field. Their returned
+            # output items are still replayed when present.
+            include_encrypted_reasoning=not normalized.startswith("custom:"),
+        )
     return adapter_type(
         api_key=resolved_key,
         model=model,

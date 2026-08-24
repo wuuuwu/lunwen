@@ -6,6 +6,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 
 from paper_reviewer.application.app_state import AppPaths, GuiPreferences
+from paper_reviewer.application.models import (
+    ProviderCompatibilityResult,
+    ProviderErrorDetails,
+    ProviderResponseDiagnostics,
+)
 from paper_reviewer.domain.provider import CustomProviderProfile, ModelApiProtocol
 from paper_reviewer.gui.icons import FluentIconService
 from paper_reviewer.gui.pages.settings import SettingsPage
@@ -115,4 +120,59 @@ def test_settings_page_lists_custom_provider_and_escape_closes_editor(qapp, tmp_
     dialog.show()
     QTest.keyClick(dialog, Qt.Key.Key_Escape)
     assert not dialog.isVisible()
+    page.deleteLater()
+
+
+def test_provider_compatibility_error_displays_only_sanitized_fields(qapp, tmp_path: Path) -> None:
+    profile = _profile()
+    service = _Service(profile)
+    paths = AppPaths(
+        root=tmp_path,
+        data_dir=tmp_path / "data",
+        runs_dir=tmp_path / "runs",
+        logs_dir=tmp_path / "logs",
+        config_dir=tmp_path / "config",
+    )
+    theme = FluentThemeManager(qapp)
+    page = SettingsPage(service, GuiPreferences(), paths, FluentIconService(theme))
+    dialog = ProviderEditorDialog(parent=page)
+    page._provider_dialog = dialog
+
+    page._provider_test_completed(
+        ProviderCompatibilityResult(
+            compatible=False,
+            message="BadRequestError: Provider 拒绝了请求。(HTTP 400)",
+            protocol=ModelApiProtocol.CHAT_COMPLETIONS,
+            error_details=ProviderErrorDetails(
+                message="tools are not supported",
+                code="unsupported_parameter",
+                param="tool_choice",
+            ),
+            response_diagnostics=ProviderResponseDiagnostics(
+                response_status="incomplete",
+                incomplete_reason="max_output_tokens",
+                finish_reason="length",
+                output_item_types=["reasoning", "message"],
+                plain_text_only=True,
+            ),
+        )
+    )
+
+    assert dialog.error_label.textFormat() is Qt.TextFormat.PlainText
+    assert dialog.error_label.text() == (
+        "兼容性测试失败：BadRequestError: Provider 拒绝了请求。(HTTP 400)\n"
+        "服务商返回（已脱敏）：\n"
+        "message: tools are not supported\n"
+        "code: unsupported_parameter\n"
+        "param: tool_choice\n"
+        "响应诊断（不含正文）：\n"
+        "response.status: incomplete\n"
+        "incomplete_details.reason: max_output_tokens\n"
+        "finish_reason: length\n"
+        "output item 类型: reasoning、message\n"
+        "仅返回普通文本: 是"
+    )
+    assert dialog.error_label.accessibleName() == "Provider 兼容性测试结果"
+    assert dialog.error_label.accessibleDescription() == dialog.error_label.text()
+    dialog.reject()
     page.deleteLater()

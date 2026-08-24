@@ -91,6 +91,9 @@ class OpenAICompatibleAdapter:
                 raise ValueError(f"tool arguments for {call.function.name} must be an object")
             tool_calls.append(ToolCall(id=call.id, name=call.function.name, arguments=arguments))
         usage = response.usage
+        output_item_types = ["message"]
+        if tool_calls:
+            output_item_types.append("function_call")
         return ModelResponse(
             # Only expose the model's final answer.  Some compatible providers
             # attach a reasoning_content field to the message; detect its
@@ -104,6 +107,8 @@ class OpenAICompatibleAdapter:
             ),
             response_id=response.id,
             finish_reason=_optional_value(choice, "finish_reason"),
+            output_item_types=output_item_types,
+            plain_text_only=bool(message.content) and not tool_calls,
             reasoning_content_present=_has_optional_field(message, "reasoning_content"),
         )
 

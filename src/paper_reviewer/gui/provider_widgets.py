@@ -238,6 +238,8 @@ class ProviderEditorDialog(QDialog):
         root.addLayout(form)
         self.error_label = QLabel()
         self.error_label.setWordWrap(True)
+        self.error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.error_label.setAccessibleName("Provider 兼容性测试结果")
         self.error_label.setProperty("fluentType", "danger")
         self.error_label.hide()
         root.addWidget(self.error_label)
@@ -390,6 +392,7 @@ class ProviderEditorDialog(QDialog):
 
     def show_test_result(self, success: bool, message: str) -> None:
         self.error_label.setText(message)
+        self.error_label.setAccessibleDescription(message)
         self.error_label.setProperty("fluentType", "secondary" if success else "danger")
         self.error_label.show()
         self.error_label.style().unpolish(self.error_label)

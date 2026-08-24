@@ -34,8 +34,14 @@ def _request(*, messages: list[Message] | None = None) -> ModelRequest:
     )
 
 
-def _adapter_with_response(response: object) -> tuple[OpenAIResponsesAdapter, AsyncMock]:
-    adapter = OpenAIResponsesAdapter(api_key="test-key", model="gpt-test")
+def _adapter_with_response(
+    response: object, *, include_encrypted_reasoning: bool = True
+) -> tuple[OpenAIResponsesAdapter, AsyncMock]:
+    adapter = OpenAIResponsesAdapter(
+        api_key="test-key",
+        model="gpt-test",
+        include_encrypted_reasoning=include_encrypted_reasoning,
+    )
     create = AsyncMock(return_value=response)
     adapter.client.responses.create = create
     return adapter, create
@@ -79,6 +85,10 @@ async def test_complete_uses_responses_wire_format_and_maps_output() -> None:
         ToolCall(id="call_1", name="lookup", arguments={"query": "source"})
     ]
     assert result.finish_reason == "tool_calls"
+    assert result.response_status == "completed"
+    assert result.incomplete_reason is None
+    assert result.output_item_types == ["reasoning", "function_call"]
+    assert result.plain_text_only is False
     assert result.reasoning_content_present is True
     assert result.response_id is None
     assert result.usage.input_tokens == 11
@@ -106,6 +116,38 @@ async def test_complete_uses_responses_wire_format_and_maps_output() -> None:
     assert "temperature" not in kwargs
     assert "previous_response_id" not in kwargs
     assert adapter.client.max_retries == 0
+
+
+@pytest.mark.asyncio
+async def test_custom_compatible_request_can_omit_openai_include_field() -> None:
+    adapter, create = _adapter_with_response(
+        {
+            "status": "completed",
+            "output": [],
+            "output_text": "ok",
+            "usage": {},
+        },
+        include_encrypted_reasoning=False,
+    )
+
+    result = await adapter.complete_once(
+        ModelRequest(
+            messages=[Message(role="user", content="test")],
+            max_output_tokens=32,
+            trace_id="custom-responses-test",
+            idempotency_key="custom-responses-test",
+        )
+    )
+
+    kwargs = create.await_args.kwargs
+    assert kwargs["store"] is False
+    assert "include" not in kwargs
+    assert "temperature" not in kwargs
+    assert "previous_response_id" not in kwargs
+    assert adapter.client.max_retries == 0
+    assert result.response_status == "completed"
+    assert result.output_item_types == []
+    assert result.plain_text_only is True
 
 
 @pytest.mark.asyncio
@@ -164,7 +206,13 @@ async def test_incomplete_max_tokens_maps_to_length() -> None:
         id="resp_3",
         status="incomplete",
         output_text="partial",
-        output=[],
+        output=[
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "private partial text"}],
+            }
+        ],
         usage=SimpleNamespace(input_tokens=1, output_tokens=321),
         incomplete_details=SimpleNamespace(reason="max_output_tokens"),
     )
@@ -173,6 +221,13 @@ async def test_incomplete_max_tokens_maps_to_length() -> None:
     result = await adapter.complete(_request())
 
     assert result.finish_reason == "length"
+    assert result.response_status == "incomplete"
+    assert result.incomplete_reason == "max_output_tokens"
+    assert result.output_item_types == ["message"]
+    assert result.plain_text_only is True
+    assert "private partial text" not in result.model_dump_json(
+        exclude={"content", "continuation_items"}
+    )
 
 
 @pytest.mark.asyncio
@@ -188,6 +243,11 @@ async def test_failed_status_raises_structured_error_without_server_message() ->
         await adapter.complete(_request())
 
     assert "secret response body" not in str(caught.value)
+    assert caught.value.response_status == "failed"
+    assert caught.value.incomplete_reason is None
+    assert caught.value.finish_reason is None
+    assert caught.value.output_item_types == []
+    assert caught.value.plain_text_only is False
 
 
 @pytest.mark.asyncio

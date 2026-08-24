@@ -51,6 +51,10 @@ class ModelResponse(BaseModel):
     usage: Usage = Field(default_factory=Usage)
     response_id: str | None = None
     finish_reason: str | None = None
+    response_status: str | None = None
+    incomplete_reason: str | None = None
+    output_item_types: list[str] = Field(default_factory=list)
+    plain_text_only: bool = False
     reasoning_content_present: bool = False
     continuation_items: list[dict[str, object]] = Field(
         default_factory=list,
