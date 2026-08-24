@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -20,6 +20,13 @@ from paper_reviewer.application.app_state import GuiPreferences
 from paper_reviewer.application.models import ReviewRequest, RubricValidationResult
 from paper_reviewer.application.service import ReviewApplicationService
 from paper_reviewer.gui.icons import FluentIconService
+from paper_reviewer.gui.models import (
+    ProviderDisplay,
+    provider_connections,
+    provider_display,
+    provider_has_key,
+    provider_protocol_text,
+)
 from paper_reviewer.gui.resource_paths import bundled_config
 from paper_reviewer.gui.theme import set_fluent_property
 from paper_reviewer.gui.widgets import MessageBar, PageHeader, PathPicker, RubricPreview
@@ -50,6 +57,8 @@ class NewReviewPage(QWidget):
         self.profile_path = self._zhejiang_profile_path or self._legacy_profile_path
         self.validation: RubricValidationResult | None = None
         self._busy = False
+        self._provider_catalog: list[ProviderDisplay] = []
+        self._provider_catalog_error = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -112,12 +121,19 @@ class NewReviewPage(QWidget):
         form.addRow("", self.discipline_profile_error)
 
         self.provider = QComboBox()
-        self.provider.addItem("OpenAI", "openai")
-        self.provider.addItem("DeepSeek", "deepseek")
-        provider_index = max(0, self.provider.findData(preferences.default_provider))
-        self.provider.setCurrentIndex(provider_index)
+        self.provider.setObjectName("providerSelector")
+        self.provider.setAccessibleName("模型 Provider")
+        self.provider.setToolTip("选择模型接口协议；自定义 Provider 的协议和端点不可在此处修改")
         self.provider.currentIndexChanged.connect(self._provider_changed)
         form.addRow("Provider", self.provider)
+
+        self.provider_info = QLabel()
+        self.provider_info.setObjectName("providerInfo")
+        self.provider_info.setWordWrap(True)
+        self.provider_info.setProperty("fluentType", "secondary")
+        self.provider_info.setAccessibleName("Provider 接口信息")
+        form.addRow("", self.provider_info)
+        self._load_providers(preferred=preferences.default_provider)
 
         self.model = QComboBox()
         self.model.setEditable(True)
@@ -126,7 +142,9 @@ class NewReviewPage(QWidget):
         self.model.currentTextChanged.connect(self._inputs_changed)
         form.addRow("模型", self.model)
 
-        self.external_search = QCheckBox("检索 OpenAlex、Crossref 和 arXiv 元数据")
+        self.external_search = QCheckBox(
+            "自动联网检索并核验参考文献（DDGS / OpenAlex / Crossref / arXiv）"
+        )
         self.external_search.setChecked(preferences.external_search)
         form.addRow("外部检索", self.external_search)
 
@@ -188,7 +206,8 @@ class NewReviewPage(QWidget):
         self.rubric_picker.set_path(default_rubric)
         self._rubric_changed(str(default_rubric))
         self._inputs_changed()
-        self._update_start_state()
+        if hasattr(self, "start_button"):
+            self._update_start_state()
 
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -201,11 +220,7 @@ class NewReviewPage(QWidget):
         self.message.show_message(message, severity="danger")
 
     def apply_preferences(self) -> None:
-        self.provider.blockSignals(True)
-        self.provider.setCurrentIndex(
-            max(0, self.provider.findData(self.preferences.default_provider))
-        )
-        self.provider.blockSignals(False)
+        self._load_providers(preferred=self.preferences.default_provider)
         self._load_models()
         self.external_search.setChecked(self.preferences.external_search)
         default_rubric = self._default_rubric_path(self.preferences.default_rubric)
@@ -215,7 +230,18 @@ class NewReviewPage(QWidget):
         self._update_start_state()
 
     def refresh_credentials(self) -> None:
+        self.refresh_providers()
         self._update_start_state()
+
+    def refresh_providers(self) -> None:
+        """Refresh the shared provider catalog while retaining a valid choice."""
+
+        current = str(self.provider.currentData() or self.preferences.default_provider)
+        self._load_providers(preferred=current)
+        if hasattr(self, "model"):
+            self._load_models()
+        if hasattr(self, "start_button"):
+            self._update_start_state()
 
     def _browse_paper(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择论文 PDF", "", "PDF 文件 (*.pdf)")
@@ -303,14 +329,74 @@ class NewReviewPage(QWidget):
             self.message.show_message(message, severity="danger")
         self._update_start_state()
 
-    def _provider_changed(self) -> None:
-        self._load_models()
-        self._update_start_state()
+    def _load_providers(self, *, preferred: str = "") -> None:
+        current = preferred or str(self.provider.currentData() or "")
+        catalog = provider_connections(self.service)
+        self._provider_catalog = catalog
+        self.provider.blockSignals(True)
+        self.provider.clear()
+        for item in catalog:
+            label = item.display_name
+            protocol = provider_protocol_text(item.protocol)
+            if protocol:
+                label = f"{label} · {protocol}"
+            self.provider.addItem(label, item.provider_ref)
+            index = self.provider.count() - 1
+            self.provider.setItemData(index, item.base_url, Qt.ItemDataRole.ToolTipRole)
+            self.provider.setItemData(
+                index,
+                f"{label}；Base URL 仅用于本次 Provider 配置，不会写入报告。",
+                Qt.ItemDataRole.AccessibleDescriptionRole,
+            )
+        selected = self.provider.findData(current)
+        if selected < 0:
+            selected = self.provider.findData(self.preferences.default_provider)
+        self.provider.setCurrentIndex(max(0, selected))
+        self.provider.blockSignals(False)
+        self._provider_changed()
+        catalog_error = str(getattr(self.service, "_provider_catalog_error", "") or "")
+        self._provider_catalog_error = catalog_error
+        if catalog_error and hasattr(self, "message"):
+            self.message.show_message(
+                f"自定义 Provider 配置读取失败，已暂时隐藏自定义条目：{catalog_error}",
+                severity="danger",
+            )
+
+    def _provider_changed(self, _index: int = -1) -> None:
+        provider_ref = str(self.provider.currentData() or "")
+        connection = next(
+            (item for item in self._provider_catalog if item.provider_ref == provider_ref),
+            provider_display(provider_ref),
+        )
+        protocol = provider_protocol_text(connection.protocol)
+        status = (
+            "已配置 API Key"
+            if provider_has_key(self.service, provider_ref)
+            else "尚未配置 API Key"
+        )
+        self.provider_info.setText(f"接口：{protocol or '未知'} · {status}")
+        self.provider_info.setToolTip(
+            f"{connection.display_name}\n协议：{protocol or '未知'}\n"
+            f"Base URL：{connection.base_url or '未提供'}"
+        )
+        if hasattr(self, "model"):
+            self._load_models()
+        if hasattr(self, "start_button"):
+            self._update_start_state()
 
     def _load_models(self) -> None:
         provider = str(self.provider.currentData() or "openai")
         recent = list(self.preferences.recent_models.get(provider, []))
-        defaults = ["gpt-5-mini", "gpt-4.1-mini"] if provider == "openai" else ["deepseek-chat"]
+        connection = next(
+            (item for item in self._provider_catalog if item.provider_ref == provider),
+            provider_display(provider),
+        )
+        if connection.default_model:
+            defaults = [connection.default_model]
+        elif provider == "openai":
+            defaults = ["gpt-5-mini", "gpt-4.1-mini"]
+        else:
+            defaults = ["deepseek-chat"]
         current = (
             self.preferences.default_model
             if provider == self.preferences.default_provider
@@ -375,7 +461,7 @@ class NewReviewPage(QWidget):
             and self.validation.valid
             and self._discipline_profile_is_valid()
             and self.model.currentText().strip()
-            and self.service.credentials.has(provider)
+            and provider_has_key(self.service, provider)
             and cloud_ok
             and non_classified_ok
         )
@@ -390,9 +476,16 @@ class NewReviewPage(QWidget):
             and self._discipline_profile_is_valid()
             and self.model.currentText().strip()
         )
-        if configuration_ready and not self.service.credentials.has(provider):
+        if configuration_ready and not provider_has_key(self.service, provider):
+            display = provider_display(provider, self._selected_provider()).display_name
             self.message.show_message(
-                f"尚未配置 {provider} API Key。", severity="warning", action_text="前往设置"
+                f"尚未配置 {display} API Key。", severity="warning", action_text="前往设置"
+            )
+        if self._provider_catalog_error:
+            self.message.show_message(
+                "自定义 Provider 配置读取失败，已暂时隐藏自定义条目："
+                f"{self._provider_catalog_error}",
+                severity="danger",
             )
 
     def _discipline_profile_is_valid(self) -> bool:
@@ -478,9 +571,10 @@ class NewReviewPage(QWidget):
             self.message.show_message(message, severity="danger")
             self._update_start_state()
             return
-        if not self.service.credentials.has(provider):
+        if not provider_has_key(self.service, provider):
+            display = provider_display(provider, self._selected_provider()).display_name
             self.message.show_message(
-                f"尚未配置 {provider} API Key。",
+                f"尚未配置 {display} API Key。",
                 severity="warning",
                 action_text="前往设置",
             )
@@ -508,3 +602,20 @@ class NewReviewPage(QWidget):
         )
         self.set_busy(True)
         self.start_requested.emit(request)
+
+    def _selected_provider(self) -> ProviderDisplay:
+        provider = str(self.provider.currentData() or "")
+        return next(
+            (item for item in self._provider_catalog if item.provider_ref == provider),
+            provider_display(provider),
+        )
+
+    def selected_provider_display(self, provider_ref: str | None = None) -> ProviderDisplay:
+        """Return the selected non-secret connection for the shell status bar."""
+
+        if provider_ref is None or provider_ref == str(self.provider.currentData() or ""):
+            return self._selected_provider()
+        return next(
+            (item for item in self._provider_catalog if item.provider_ref == provider_ref),
+            provider_display(provider_ref),
+        )

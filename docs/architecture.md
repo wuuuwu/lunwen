@@ -47,3 +47,24 @@ votes, the deterministic decision, or invent a new major or critical finding.
 
 External documents are data, never instructions. Tools are registered by trusted code and filtered
 through a static allowlist before every execution.
+
+## Web research and reference verification
+
+External-search runs use the provider-neutral `WebSearchPort`; the default adapter is the keyless,
+MIT-licensed DDGS metasearch client in `auto` mode. Search calls are bounded, rate-limited, and
+return snippets plus source URLs as metadata-level evidence. Reviewers may call `web_search` only
+when their profile allowlists it, and tool results are treated as untrusted evidence rather than
+instructions.
+
+Before reviewers start, the harness extracts numbered bibliography entries and checks DOI, title,
+and year matches against DDGS, OpenAlex, Crossref, and arXiv. Verified/probable matches are frozen
+into the run evidence ledger; unresolved, conflicting, or unavailable results are written to
+`reference-checks.json` and surfaced as audit warnings requesting manual verification. The existing
+human gates for policy and integrity decisions remain unchanged.
+
+The implementation borrows the provider-neutral function-tool and rate-limit pattern documented by
+[smolagents built-in tools](https://huggingface.co/docs/smolagents/reference/default_tools), while
+using the MIT-licensed [DDGS metasearch library](https://github.com/deedy5/ddgs) directly instead
+of requiring a commercial search API account. It intentionally does not fetch arbitrary result-page
+content: snippets remain metadata-level evidence, which keeps the first release within a smaller
+SSRF and prompt-injection surface.

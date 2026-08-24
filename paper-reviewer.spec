@@ -32,6 +32,7 @@ hiddenimports += collect_submodules(
     "aiosqlite",
     filter=lambda name: not name.startswith("aiosqlite.tests"),
 )
+hiddenimports += collect_submodules("ddgs")
 # keyring selects the Windows backend dynamically, and pywin32-ctypes redirects
 # its implementation modules at runtime. Keep these imports explicit so a
 # portable build cannot silently fall back to an unavailable backend.

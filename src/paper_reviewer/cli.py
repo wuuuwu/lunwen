@@ -28,12 +28,15 @@ from paper_reviewer.adapters.persistence.repositories import (
 from paper_reviewer.adapters.scholarly.arxiv import ArxivClient
 from paper_reviewer.adapters.scholarly.crossref import CrossrefClient
 from paper_reviewer.adapters.scholarly.openalex import OpenAlexClient
+from paper_reviewer.adapters.search.ddgs import DdgsWebSearchClient
 from paper_reviewer.application.orchestrator import (
     ReviewOrchestrator,
+    load_provider_snapshot,
     load_run_request_context,
     load_run_snapshots,
 )
 from paper_reviewer.config import Settings, load_review_profile, load_rubric
+from paper_reviewer.domain.provider import ModelApiProtocol
 from paper_reviewer.domain.run import RunRecord
 
 load_dotenv()
@@ -98,7 +101,10 @@ def run_review(
     rubric: Annotated[Path, typer.Option(exists=True, readable=True)] = DEFAULT_RUBRIC,
     profile: Annotated[Path, typer.Option(exists=True, readable=True)] = DEFAULT_PROFILE,
     no_external_search: Annotated[
-        bool, typer.Option(help="Disable OpenAlex, Crossref, and arXiv metadata search.")
+        bool,
+        typer.Option(
+            help="Disable DDGS web search, scholarly metadata search, and reference checks."
+        ),
     ] = False,
     discipline_name: Annotated[
         str | None, typer.Option("--discipline-name", help="本科论文所属专业名称。")
@@ -229,7 +235,8 @@ async def _run_new(
             if external_search
             else []
         )
-        orchestrator = _orchestrator(settings, model, sessions, scholarly)
+        web_search = _web_search_client(settings) if external_search else None
+        orchestrator = _orchestrator(settings, model, sessions, scholarly, web_search)
         try:
             return await _create_and_execute(
                 orchestrator,
@@ -294,8 +301,14 @@ async def _resume(run_id: str) -> RunRecord:
     if run is None:
         await engine.dispose()
         raise typer.BadParameter(f"unknown run id: {run_id}")
-    rubric, profile = load_run_snapshots(settings.runs_dir / run_id)
-    context = load_run_request_context(settings.runs_dir / run_id)
+    run_dir = settings.runs_dir / run_id
+    if _cli_resume_requires_desktop(run, run_dir):
+        await engine.dispose()
+        raise typer.BadParameter(
+            "自定义 Provider 和 Responses API 任务首版仅支持在桌面端恢复，请打开应用后恢复该任务。"
+        )
+    rubric, profile = load_run_snapshots(run_dir)
+    context = load_run_request_context(run_dir)
     external_search = context.get("external_search", True) is not False
     model = create_model_adapter(run.provider, run.model, timeout=settings.request_timeout_seconds)
     async with httpx.AsyncClient(timeout=settings.external_timeout_seconds) as client:
@@ -304,12 +317,27 @@ async def _resume(run_id: str) -> RunRecord:
             if external_search
             else []
         )
-        orchestrator = _orchestrator(settings, model, sessions, scholarly)
+        web_search = _web_search_client(settings) if external_search else None
+        orchestrator = _orchestrator(settings, model, sessions, scholarly, web_search)
         try:
             return await orchestrator.execute(run, rubric=rubric, profile=profile)
         finally:
             await model.close()
             await engine.dispose()
+
+
+def _cli_resume_requires_desktop(run: RunRecord, run_dir: Path) -> bool:
+    """Keep desktop-only Provider credentials and protocols out of the CLI."""
+
+    provider_snapshot = load_provider_snapshot(run_dir)
+    return (
+        run.provider.startswith("custom:")
+        or run.provider == "openai_responses"
+        or (
+            provider_snapshot is not None
+            and provider_snapshot.protocol is ModelApiProtocol.RESPONSES
+        )
+    )
 
 
 async def _get_run(run_id: str) -> RunRecord | None:
@@ -324,7 +352,11 @@ async def _get_run(run_id: str) -> RunRecord | None:
 
 
 def _orchestrator(
-    settings: Settings, model: Any, sessions: Any, scholarly: list[Any]
+    settings: Settings,
+    model: Any,
+    sessions: Any,
+    scholarly: list[Any],
+    web_search: Any | None,
 ) -> ReviewOrchestrator:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -339,6 +371,17 @@ def _orchestrator(
         evidence_repository=EvidenceRepository(sessions),
         review_repository=ReviewRepository(sessions),
         scholarly_clients=scholarly,
+        web_search_client=web_search,
+    )
+
+
+def _web_search_client(settings: Settings) -> DdgsWebSearchClient:
+    return DdgsWebSearchClient(
+        backend=settings.web_search_backend,
+        region=settings.web_search_region,
+        safesearch=settings.web_search_safesearch,
+        min_interval_seconds=settings.web_search_min_interval_seconds,
+        timeout_seconds=settings.external_timeout_seconds,
     )
 
 

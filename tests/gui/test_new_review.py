@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from PySide6.QtWidgets import QApplication
 
@@ -44,6 +45,33 @@ class StubReviewService:
             profile_compatible=self.valid,
         )
 
+
+class ProviderReviewService(StubReviewService):
+    def __init__(self) -> None:
+        super().__init__()
+        self._keys = {"openai_responses", "custom:" + "a" * 32}
+
+    def list_provider_connections(self, *, include_archived: bool = False) -> list[object]:
+        del include_archived
+        return [
+            SimpleNamespace(
+                provider_ref="openai_responses",
+                display_name="OpenAI · Responses API",
+                protocol="responses",
+                base_url="https://api.openai.com/v1",
+                default_model="gpt-5-mini",
+            ),
+            SimpleNamespace(
+                provider_ref="custom:" + "a" * 32,
+                display_name="校内模型",
+                protocol="chat_completions",
+                base_url="http://localhost:8000/v1",
+                default_model="校内-论文模型",
+            ),
+        ]
+
+    def provider_has_key(self, provider_ref: str) -> bool:
+        return provider_ref in self._keys
 
 def test_development_defaults_use_top_level_canonical_configs() -> None:
     project_root = Path(__file__).resolve().parents[2]
@@ -141,3 +169,29 @@ def test_review_request_contains_policy_context_and_no_report_path(
     assert request.cloud_processing_authorized is True
     assert request.contains_classified_material is False
     assert not hasattr(request, "integrity_report")
+
+
+def test_provider_selector_is_protocol_aware_and_uses_provider_specific_models(
+    qapp: QApplication,
+    qtbot: object,
+) -> None:
+    service = ProviderReviewService()
+    page = NewReviewPage(
+        service,  # type: ignore[arg-type]
+        GuiPreferences(default_provider="openai_responses"),
+        FluentIconService(FluentThemeManager(qapp)),
+    )
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+
+    refs = [page.provider.itemData(index) for index in range(page.provider.count())]
+    assert refs[:3] == ["openai", "openai_responses", "deepseek"]
+    assert "custom:" + "a" * 32 in refs
+    assert page.provider.currentData() == "openai_responses"
+    assert page.model.currentText() == "gpt-5-mini"
+    assert "Responses API" in page.provider.currentText()
+
+    custom_index = page.provider.findData("custom:" + "a" * 32)
+    page.provider.setCurrentIndex(custom_index)
+    assert page.model.currentText() == "校内-论文模型"
+    assert "localhost" in page.provider.toolTip() or "localhost" in page.provider_info.toolTip()
+    assert "aaaaaaaa" not in page.provider_info.text()

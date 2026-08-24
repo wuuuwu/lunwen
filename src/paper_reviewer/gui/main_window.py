@@ -39,7 +39,11 @@ from paper_reviewer.application.service import ReviewApplicationService
 from paper_reviewer.domain.review import HumanRuleDecision
 from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.gui.icons import FluentIconService
-from paper_reviewer.gui.models import NavigationItem, NavigationModel
+from paper_reviewer.gui.models import (
+    NavigationItem,
+    NavigationModel,
+    provider_label,
+)
 from paper_reviewer.gui.pages.new_review import NewReviewPage
 from paper_reviewer.gui.pages.rubrics import RubricsPage
 from paper_reviewer.gui.pages.run_detail import RunDetailPage
@@ -273,7 +277,8 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentWidget(self.run_detail_page)
         self._start_review_worker(operation)
         self.global_status.setText("正在评测")
-        self.context_status.setText(f"{request.provider} · {request.model}")
+        selected = self.new_review_page.selected_provider_display(request.provider)
+        self.context_status.setText(provider_label(request.provider, request.model, selected))
 
     def resume_review(self, run_id: str) -> None:
         if self._review_worker is not None and self._review_worker.isRunning():
@@ -536,8 +541,14 @@ class MainWindow(QMainWindow):
             if value.run.run_id != expected_run_id:
                 return
             self.run_detail_page.show_report(value, run_dir=self.paths.runs_dir / value.run.run_id)
+            source = (
+                getattr(value, "provider_snapshot", None)
+                or getattr(value.run, "provider_snapshot", None)
+                or value
+            )
             self.context_status.setText(
-                f"{value.run.provider} · {value.run.model} · {value.run.rubric_id}"
+                f"{provider_label(value.run.provider, value.run.model, source)} · "
+                f"{value.run.rubric_id}"
             )
             self._remember_active_run(value.run.run_id, value.run.status)
             self._set_global_status(value.run.status, fallback="报告已加载")
@@ -545,8 +556,14 @@ class MainWindow(QMainWindow):
             if value.run.run_id != expected_run_id:
                 return
             self.run_detail_page.show_detail(value, run_dir=self.paths.runs_dir / value.run.run_id)
+            source = (
+                getattr(value, "provider_snapshot", None)
+                or getattr(value.run, "provider_snapshot", None)
+                or value
+            )
             self.context_status.setText(
-                f"{value.run.provider} · {value.run.model} · {value.run.rubric_id}"
+                f"{provider_label(value.run.provider, value.run.model, source)} · "
+                f"{value.run.rubric_id}"
             )
             run_status = status_value(value.run.status)
             self._remember_active_run(value.run.run_id, run_status)

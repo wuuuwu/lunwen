@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Protocol
@@ -17,6 +18,219 @@ from PySide6.QtGui import QIcon
 
 from paper_reviewer.application.models import RunSummary
 from paper_reviewer.domain.review import ReviewFinding
+
+
+@dataclass(frozen=True)
+class ProviderDisplay:
+    """Non-secret information used by provider selectors and run summaries.
+
+    The GUI deliberately keeps this object independent from the credential
+    store.  A service may return a ``ProviderConnection`` or a pydantic model;
+    ``provider_display`` below normalizes either shape without exposing a key.
+    """
+
+    provider_ref: str
+    display_name: str
+    protocol: str
+    base_url: str = ""
+    default_model: str = ""
+    has_key: bool = False
+    archived: bool = False
+
+
+_BUILTIN_PROVIDER_DISPLAY: dict[str, ProviderDisplay] = {
+    "openai": ProviderDisplay(
+        "openai", "OpenAI", "chat_completions", "https://api.openai.com/v1", "gpt-5-mini"
+    ),
+    "openai_responses": ProviderDisplay(
+        "openai_responses",
+        "OpenAI",
+        "responses",
+        "https://api.openai.com/v1",
+        "gpt-5-mini",
+    ),
+    "deepseek": ProviderDisplay(
+        "deepseek",
+        "DeepSeek",
+        "chat_completions",
+        "https://api.deepseek.com",
+        "deepseek-chat",
+    ),
+}
+
+
+def _provider_field(source: object | None, *names: str, default: object = "") -> object:
+    if source is None:
+        return default
+    for name in names:
+        if isinstance(source, dict) and name in source:
+            return source[name]
+        value = getattr(source, name, None)
+        if value is not None:
+            return value
+    return default
+
+
+def provider_protocol_text(protocol: object) -> str:
+    value = getattr(protocol, "value", protocol)
+    return {
+        "chat_completions": "Chat Completions",
+        "responses": "Responses API",
+    }.get(str(value), str(value) or "未知接口")
+
+
+def _base_provider_name(name: str, protocol: str) -> str:
+    """Avoid repeating the protocol when a service label already includes it."""
+
+    suffix = f" · {provider_protocol_text(protocol)}"
+    return name.removesuffix(suffix).strip() or name
+
+
+def provider_display(
+    provider_ref: str,
+    source: object | None = None,
+    *,
+    has_key: bool | None = None,
+) -> ProviderDisplay:
+    """Normalize a connection/snapshot or an old provider reference.
+
+    ``source`` is intentionally optional: old task rows only contain a
+    provider reference, while newer rows may carry snapshot fields.
+    """
+
+    reference = str(provider_ref or "")
+    fallback = _BUILTIN_PROVIDER_DISPLAY.get(
+        reference,
+        ProviderDisplay(
+            reference,
+            "自定义 Provider" if reference.startswith("custom:") else reference,
+            "",
+        ),
+    )
+    name = str(
+        _provider_field(
+            source,
+            "display_name",
+            "provider_display_name",
+            default=fallback.display_name,
+        )
+        or fallback.display_name
+    )
+    protocol = str(
+        _provider_field(source, "protocol", "provider_protocol", default=fallback.protocol)
+        or fallback.protocol
+    )
+    name = _base_provider_name(name, protocol)
+    base_url = str(
+        _provider_field(source, "base_url", "provider_base_url", default=fallback.base_url)
+        or fallback.base_url
+    )
+    default_model = str(
+        _provider_field(source, "default_model", default=fallback.default_model)
+        or fallback.default_model
+    )
+    archived = bool(_provider_field(source, "archived", "is_archived", default=False))
+    return ProviderDisplay(
+        provider_ref=reference,
+        display_name=name,
+        protocol=protocol,
+        base_url=base_url,
+        default_model=default_model,
+        has_key=fallback.has_key if has_key is None else has_key,
+        archived=archived,
+    )
+
+
+def provider_label(provider_ref: str, model: str, source: object | None = None) -> str:
+    """Return the safe task-facing label; never shows custom IDs or Base URLs."""
+
+    display = provider_display(provider_ref, source)
+    protocol = provider_protocol_text(display.protocol)
+    provider_name = display.display_name
+    if protocol and protocol != provider_name:
+        provider_name = f"{provider_name} · {protocol}"
+    return f"{provider_name} · {model}"
+
+
+def provider_connections(service: object) -> list[ProviderDisplay]:
+    """Read the service provider catalog with a legacy built-in fallback."""
+
+    method = getattr(service, "list_provider_connections", None)
+    if not callable(method):
+        method = getattr(service, "list_providers", None)
+    values: object = []
+    try:
+        object.__setattr__(service, "_provider_catalog_error", "")
+    except Exception:
+        pass
+    if callable(method):
+        try:
+            values = method(include_archived=False)
+        except TypeError:
+            values = method()
+        except Exception as error:
+            try:
+                object.__setattr__(service, "_provider_catalog_error", str(error))
+            except Exception:
+                pass
+            values = []
+    if values is None:
+        values = []
+    result: list[ProviderDisplay] = []
+    if isinstance(values, Iterable) and not isinstance(values, (str, bytes, dict)):
+        for value in values:
+            reference = str(
+                _provider_field(value, "provider_ref", "ref", "provider_id", default="")
+            )
+            if (
+                reference
+                and reference not in _BUILTIN_PROVIDER_DISPLAY
+                and not reference.startswith("custom:")
+            ):
+                # A profile object exposes the bare UUID while a connection
+                # exposes ``custom:<uuid>``.  Normalize both forms here.
+                if len(reference) == 32:
+                    reference = f"custom:{reference}"
+                else:
+                    continue
+            if not reference:
+                continue
+            key_value = _provider_field(value, "has_key", default=None)
+            if key_value is None:
+                key_method = getattr(service, "provider_has_key", None)
+                try:
+                    key_value = key_method(reference) if callable(key_method) else None
+                except Exception:
+                    key_value = False
+            if reference and not reference.startswith("custom:"):
+                result.append(provider_display(reference, value, has_key=bool(key_value)))
+            elif reference:
+                result.append(provider_display(reference, value, has_key=bool(key_value)))
+    by_ref = {item.provider_ref: item for item in result}
+    builtin_items = [
+        by_ref.get(reference, fallback)
+        for reference, fallback in _BUILTIN_PROVIDER_DISPLAY.items()
+    ]
+    custom_items = [item for item in result if item.provider_ref.startswith("custom:")]
+    return builtin_items + custom_items
+
+
+def provider_has_key(service: object, provider_ref: str) -> bool:
+    method = getattr(service, "provider_has_key", None)
+    if callable(method):
+        try:
+            if bool(method(provider_ref)):
+                return True
+        except Exception:
+            pass
+    credentials = getattr(service, "credentials", None)
+    method = getattr(credentials, "has", None)
+    if callable(method):
+        try:
+            return bool(method(provider_ref))
+        except Exception:
+            return False
+    return False
 
 
 @dataclass(frozen=True)
@@ -179,10 +393,11 @@ class RunsTableModel(QAbstractTableModel):
             return None
         item = self.items[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
+            run_source = getattr(item, "provider_snapshot", None) or item
             return (
                 item.paper_name,
                 item.rubric_id,
-                f"{item.provider} / {item.model}",
+                provider_label(item.provider, item.model, run_source),
                 _as_local_time(item.created_at).strftime("%Y-%m-%d %H:%M"),
                 self.STATUS_TEXT.get(item.status.value, item.status.value),
                 _as_local_time(item.updated_at).strftime("%Y-%m-%d %H:%M"),

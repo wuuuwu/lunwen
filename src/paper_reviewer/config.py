@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     runs_dir: Path = Path("runs")
     request_timeout_seconds: float = 120
     external_timeout_seconds: float = 20
+    web_search_backend: str = "auto"
+    web_search_region: str = "wt-wt"
+    web_search_safesearch: str = "moderate"
+    web_search_min_interval_seconds: float = Field(default=1.0, ge=0)
+    max_reference_checks: int = Field(default=40, ge=1, le=200)
+    reference_check_concurrency: int = Field(default=3, ge=1, le=8)
+    reference_search_results: int = Field(default=3, ge=1, le=8)
     max_model_turns: int = 3
     max_tool_calls: int = 8
     max_output_repairs: int = 2

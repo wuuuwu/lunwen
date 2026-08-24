@@ -2,9 +2,15 @@ database_url: sqlite+aiosqlite:///./paper-reviewer.db
 runs_dir: ./runs
 request_timeout_seconds: 120
 external_timeout_seconds: 20
+web_search_backend: auto
+web_search_region: wt-wt
+web_search_safesearch: moderate
+web_search_min_interval_seconds: 1
+max_reference_checks: 40
+reference_check_concurrency: 3
+reference_search_results: 3
 max_model_turns: 3
 max_tool_calls: 8
 max_output_repairs: 2
 reviewer_concurrency: 3
 trace_content: false
-

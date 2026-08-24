@@ -22,11 +22,17 @@ class Message(BaseModel):
     content: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    continuation_items: list[dict[str, object]] = Field(
+        default_factory=list,
+        exclude=True,
+        repr=False,
+    )
 
 
 class ModelRequest(BaseModel):
     messages: list[Message]
     tools: list[ToolSpec] = Field(default_factory=list)
+    forced_tool_name: str | None = None
     max_output_tokens: int = 4096
     temperature: float = 0
     trace_id: str
@@ -46,6 +52,11 @@ class ModelResponse(BaseModel):
     response_id: str | None = None
     finish_reason: str | None = None
     reasoning_content_present: bool = False
+    continuation_items: list[dict[str, object]] = Field(
+        default_factory=list,
+        exclude=True,
+        repr=False,
+    )
 
 
 class ModelPort(Protocol):

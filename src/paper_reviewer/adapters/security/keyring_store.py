@@ -9,6 +9,13 @@ from typing import ClassVar
 import keyring
 from keyring.errors import KeyringError, PasswordDeleteError
 
+from paper_reviewer.domain.provider import (
+    CustomProviderProfile,
+    ModelApiProtocol,
+    ProviderSnapshot,
+    custom_provider_ref,
+)
+
 
 class SystemCredentialStore:
     SERVICE_NAME = "PaperReviewer"
@@ -23,6 +30,8 @@ class SystemCredentialStore:
 
     def get(self, provider: str) -> str | None:
         normalized = provider.lower()
+        if normalized == "openai_responses":
+            normalized = "openai"
         account = self.ACCOUNTS.get(normalized)
         if account is None:
             return None
@@ -37,6 +46,8 @@ class SystemCredentialStore:
 
     def set(self, provider: str, secret: str) -> None:
         normalized = provider.lower()
+        if normalized == "openai_responses":
+            normalized = "openai"
         account = self.ACCOUNTS.get(normalized)
         if account is None:
             raise ValueError(f"unsupported credential provider: {provider}")
@@ -46,6 +57,8 @@ class SystemCredentialStore:
 
     def delete(self, provider: str) -> None:
         normalized = provider.lower()
+        if normalized == "openai_responses":
+            normalized = "openai"
         account = self.ACCOUNTS.get(normalized)
         if account is None:
             raise ValueError(f"unsupported credential provider: {provider}")
@@ -53,6 +66,78 @@ class SystemCredentialStore:
             keyring.delete_password(self.SERVICE_NAME, account)
         except PasswordDeleteError:
             return
+
+    def get_custom(self, profile: CustomProviderProfile) -> str | None:
+        return self._get_custom(
+            profile.provider_id, profile.protocol, profile.endpoint_fingerprint
+        )
+
+    def has_custom(self, profile: CustomProviderProfile) -> bool:
+        return bool(self.get_custom(profile))
+
+    def get_custom_for_snapshot(self, snapshot: ProviderSnapshot) -> str | None:
+        if not snapshot.provider_ref.startswith("custom:"):
+            raise ValueError("快照不是自定义 Provider")
+        provider_id = snapshot.provider_ref.removeprefix("custom:")
+        custom_provider_ref(provider_id)
+        return self._get_custom(
+            provider_id, snapshot.protocol, snapshot.endpoint_fingerprint
+        )
+
+    def has_custom_for_snapshot(self, snapshot: ProviderSnapshot) -> bool:
+        return bool(self.get_custom_for_snapshot(snapshot))
+
+    def set_custom(self, profile: CustomProviderProfile, secret: str) -> None:
+        if not secret.strip():
+            raise ValueError("API Key 不能为空")
+        keyring.set_password(
+            self.SERVICE_NAME,
+            self._custom_account(
+                profile.provider_id, profile.protocol, profile.endpoint_fingerprint
+            ),
+            secret.strip(),
+        )
+
+    def delete_custom(self, profile: CustomProviderProfile) -> None:
+        account = self._custom_account(
+            profile.provider_id, profile.protocol, profile.endpoint_fingerprint
+        )
+        try:
+            keyring.delete_password(self.SERVICE_NAME, account)
+        except PasswordDeleteError:
+            return
+
+    def _get_custom(
+        self,
+        provider_id: str,
+        protocol: ModelApiProtocol,
+        endpoint_fingerprint: str,
+    ) -> str | None:
+        account = self._custom_account(provider_id, protocol, endpoint_fingerprint)
+        try:
+            return keyring.get_password(self.SERVICE_NAME, account)
+        except KeyringError:
+            return None
+
+    @staticmethod
+    def _custom_account(
+        provider_id: str,
+        protocol: ModelApiProtocol,
+        endpoint_fingerprint: str,
+    ) -> str:
+        # Revalidate all identity components before they can select a credential.
+        profile = CustomProviderProfile(
+            provider_id=provider_id,
+            display_name="credential",
+            protocol=protocol,
+            base_url="https://credential.invalid",
+            default_model="credential",
+        )
+        if len(endpoint_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in endpoint_fingerprint
+        ):
+            raise ValueError("端点指纹格式无效")
+        return f"custom:{profile.provider_id}:{protocol.value}:{endpoint_fingerprint}"
 
     @classmethod
     def self_test(cls) -> None:

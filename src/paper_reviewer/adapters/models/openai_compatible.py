@@ -32,7 +32,12 @@ class OpenAICompatibleAdapter:
         timeout: float = 120,
     ) -> None:
         self.model = model
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=0,
+        )
 
     @retry(
         retry=retry_if_exception_type(
@@ -43,6 +48,9 @@ class OpenAICompatibleAdapter:
         reraise=True,
     )
     async def complete(self, request: ModelRequest) -> ModelResponse:
+        return await self.complete_once(request)
+
+    async def complete_once(self, request: ModelRequest) -> ModelResponse:
         messages = [_message_payload(message) for message in request.messages]
         tools = [
             {
@@ -63,6 +71,13 @@ class OpenAICompatibleAdapter:
         }
         if tools:
             kwargs["tools"] = tools
+        if request.forced_tool_name:
+            if not any(tool.name == request.forced_tool_name for tool in request.tools):
+                raise ValueError("tool choice must name a declared tool")
+            kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {"name": request.forced_tool_name},
+            }
         response = await self.client.chat.completions.create(**kwargs)
         choice = response.choices[0]
         message = choice.message

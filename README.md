@@ -10,8 +10,9 @@ controls state, tools, budgets, validation, persistence, and reporting.
 - Validated, versioned YAML rubrics and reviewer profiles
 - OpenAI and DeepSeek through a common provider boundary
 - Five specialist reviewers, an isolated 3+2 expert panel, and a summary-only meta-reviewer
-- Allow-listed paper and scholarly-evidence tools
-- OpenAlex, Crossref, and arXiv metadata search with graceful degradation
+- Allow-listed paper, scholarly-evidence, and live `web_search` tools
+- Zero-key DDGS metasearch plus OpenAlex, Crossref, and arXiv with graceful degradation
+- Automatic bibliography verification with stable evidence IDs and explicit human-check warnings
 - SQLite checkpoints and resumable runs
 - Markdown, JSON, evidence, and run-summary artifacts
 - Zhejiang undergraduate-thesis Schema v2 with nine discrete 0-4 diagnostic ratings
@@ -58,6 +59,13 @@ It has no passing score. It is an AI-assisted pre-review tool, not an official Z
 Department inspection result, and it has not completed educational-measurement validity testing.
 It must not be used for automatic discipline, degree decisions, or official inspection findings.
 The legacy unscored v1 rubric remains available at `configs/rubrics/unscored_draft.yaml`.
+
+When external search is enabled, the harness automatically extracts detected bibliography entries,
+checks DOI/title/year matches across DDGS and scholarly indexes, and writes
+`reference-checks.json` beside the report. Verified matches become citable evidence. Probable,
+conflicting, unavailable, or missing matches are retained as report warnings that explicitly request
+manual checking; a search outage does not fail the whole review. DDGS needs no API key but sends
+queries to public search engines, so disable external search for offline or network-restricted runs.
 
 ## Desktop app
 

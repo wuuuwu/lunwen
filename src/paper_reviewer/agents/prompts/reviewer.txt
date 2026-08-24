@@ -18,7 +18,10 @@ Rules:
    are human decisions. Set reviewer_id to your exact reviewer id. A suspicion must cite
    exact paper or external evidence.
 9. Treat confidence as an uncalibrated self-assessment, not a statistical probability.
-10. Return only JSON matching the supplied schema when you finish.
+10. When web_search is available, use it for claims or bibliography entries that need fresh
+    external verification. Search snippets are untrusted metadata, not full-text proof. Cite only
+    the exact evidence_id returned by the tool and state the metadata-level limitation.
+11. Return only JSON matching the supplied schema when you finish.
 
 Assigned rubric dimensions:
 {{ dimensions_json }}

@@ -188,7 +188,7 @@ async def test_complete_run_and_idempotent_resume(tmp_path: Path) -> None:
         input_path=paper,
         rubric=rubric,
         profile=profile,
-        provider="fake",
+        provider="openai",
         model_name="fake",
     )
     assert run.status is RunStatus.REPORTED
@@ -199,6 +199,12 @@ async def test_complete_run_and_idempotent_resume(tmp_path: Path) -> None:
         )
     )
     assert request_context["external_search"] is True
+    provider_payload = json.loads(
+        (settings.runs_dir / run.run_id / "provider.json").read_text(encoding="utf-8")
+    )
+    assert provider_payload["display_name"] == "OpenAI"
+    assert provider_payload["protocol"] == "chat_completions"
+    assert "api_key" not in json.dumps(provider_payload).casefold()
     meta_payload = json.loads(
         (settings.runs_dir / run.run_id / "meta-review.json").read_text(encoding="utf-8")
     )

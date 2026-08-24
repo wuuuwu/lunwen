@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from paper_reviewer.config import load_rubric
+from paper_reviewer.domain.provider import ModelApiProtocol, ProviderSnapshot, endpoint_fingerprint
 from paper_reviewer.domain.review import (
     CriterionAssessment,
     EvaluationReport,
@@ -105,3 +106,50 @@ def test_v2_report_json_contains_the_full_evaluation(tmp_path: Path) -> None:
     assert payload["diagnostic_score"]["total_score"] == 50
     assert payload["panel_decision"]["outcome"] == "risk_not_triggered"
     assert payload["meta_review"]["verdict"] is None
+
+
+def test_report_header_uses_snapshot_name_model_and_protocol_without_endpoint_or_id(
+    tmp_path: Path,
+) -> None:
+    rubric, evaluation = _evaluation()
+    provider_id = "a" * 32
+    base_url = "https://private.example/v1"
+    snapshot = ProviderSnapshot(
+        provider_ref=f"custom:{provider_id}",
+        display_name="校内模型服务",
+        protocol=ModelApiProtocol.RESPONSES,
+        base_url=base_url,
+        endpoint_fingerprint=endpoint_fingerprint(base_url, ModelApiProtocol.RESPONSES),
+        model="review-model-v2",
+    )
+    (tmp_path / "provider.json").write_text(
+        snapshot.model_dump_json(indent=2), encoding="utf-8"
+    )
+    run = RunRecord(
+        run_id="run-v2",
+        status=RunStatus.REPORTED,
+        input_path="paper.pdf",
+        input_hash="a" * 64,
+        config_hash="b" * 64,
+        rubric_id="zhejiang@0.1",
+        provider=snapshot.provider_ref,
+        model=snapshot.model,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    write_report_bundle(
+        run_dir=tmp_path,
+        run=run,
+        rubric=rubric,  # type: ignore[arg-type]
+        evaluation_report=evaluation,
+        audit=AuditReport(),
+        evidence=[],
+    )
+
+    markdown = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "Provider：校内模型服务" in markdown
+    assert "接口协议：Responses API" in markdown
+    assert "模型：review-model-v2" in markdown
+    assert provider_id not in markdown
+    assert "private.example" not in markdown

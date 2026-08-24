@@ -6,14 +6,28 @@ from unittest.mock import AsyncMock
 import pytest
 
 from paper_reviewer.adapters.models.openai_compatible import OpenAICompatibleAdapter
-from paper_reviewer.ports.model import Message, ModelRequest
+from paper_reviewer.ports.model import Message, ModelRequest, ToolSpec
 
 
-def _request(*, max_output_tokens: int = 321) -> ModelRequest:
+def _request(
+    *, max_output_tokens: int = 321, forced_tool_name: str | None = None
+) -> ModelRequest:
     return ModelRequest(
         messages=[Message(role="user", content="Return JSON.")],
+        tools=(
+            [
+                ToolSpec(
+                    name=forced_tool_name,
+                    description="Probe",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ]
+            if forced_tool_name
+            else []
+        ),
         max_output_tokens=max_output_tokens,
         temperature=0.2,
+        forced_tool_name=forced_tool_name,
         trace_id="trace-test",
         idempotency_key="idem-test",
     )
@@ -24,6 +38,12 @@ def _adapter_with_response(response: object) -> tuple[OpenAICompatibleAdapter, A
     create = AsyncMock(return_value=response)
     adapter.client.chat.completions.create = create
     return adapter, create
+
+
+def test_sdk_retries_are_disabled() -> None:
+    adapter = OpenAICompatibleAdapter(api_key="test-key", model="deepseek-chat")
+
+    assert adapter.client.max_retries == 0
 
 
 @pytest.mark.asyncio
@@ -81,3 +101,19 @@ async def test_complete_defaults_optional_metadata_without_reasoning_text() -> N
     assert result.reasoning_content_present is False
     assert result.usage.reasoning_tokens == 0
 
+
+@pytest.mark.asyncio
+async def test_complete_maps_named_tool_choice() -> None:
+    response = SimpleNamespace(
+        id="response-3",
+        choices=[SimpleNamespace(message=SimpleNamespace(content="answer", tool_calls=[]))],
+        usage=None,
+    )
+    adapter, create = _adapter_with_response(response)
+
+    await adapter.complete(_request(forced_tool_name="probe"))
+
+    assert create.await_args.kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "probe"},
+    }

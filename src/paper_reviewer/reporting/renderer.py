@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from paper_reviewer.domain.evidence import EvidenceItem
+from paper_reviewer.domain.provider import ModelApiProtocol, ProviderSnapshot
 from paper_reviewer.domain.review import MetaReview, Severity
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord
@@ -45,7 +46,18 @@ def write_report_bundle(
     evidence_json = run_dir / "evidence.json"
     summary_json = run_dir / "run-summary.json"
     report_json.write_text(_json_text(selected), encoding="utf-8")
-    report_markdown.write_text(render_markdown(rubric, selected, audit), encoding="utf-8")
+    provider_snapshot = _load_provider_snapshot(run_dir)
+    report_markdown.write_text(
+        render_markdown(
+            rubric,
+            selected,
+            audit,
+            provider_snapshot=provider_snapshot,
+            provider_ref=run.provider,
+            model=run.model,
+        ),
+        encoding="utf-8",
+    )
     evidence_json.write_text(
         json.dumps(
             [item.model_dump(mode="json") for item in evidence], ensure_ascii=False, indent=2
@@ -64,22 +76,41 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def render_markdown(rubric: RubricProfile, report: Any, audit: AuditReport) -> str:
+def render_markdown(
+    rubric: RubricProfile,
+    report: Any,
+    audit: AuditReport,
+    *,
+    provider_snapshot: ProviderSnapshot | None = None,
+    provider_ref: str | None = None,
+    model: str | None = None,
+) -> str:
     """Render a legacy MetaReview or the new EvaluationReport."""
+    provider_lines = _provider_report_lines(
+        provider_snapshot=provider_snapshot,
+        provider_ref=provider_ref,
+        model=model,
+    )
     if _is_evaluation_report(report):
-        return _render_evaluation_markdown(rubric, report, audit)
-    return _render_legacy_markdown(rubric, report, audit)
+        return _render_evaluation_markdown(rubric, report, audit, provider_lines)
+    return _render_legacy_markdown(rubric, report, audit, provider_lines)
 
 
 def _render_markdown(rubric: RubricProfile, review: Any, audit: AuditReport) -> str:
     return render_markdown(rubric, review, audit)
 
 
-def _render_legacy_markdown(rubric: RubricProfile, review: Any, audit: AuditReport) -> str:
+def _render_legacy_markdown(
+    rubric: RubricProfile,
+    review: Any,
+    audit: AuditReport,
+    provider_lines: list[str],
+) -> str:
     lines = [
         "# Academic Paper Review",
         "",
         f"- Run ID: {_code(_field(review, 'run_id', default='unknown'))}",
+        *provider_lines,
         f"- Rubric: {_code(f'{rubric.rubric_id}@{rubric.version}')}",
         f"- Scoring: {_code('enabled' if rubric.scoring_enabled else 'disabled')}",
         f"- Evidence audit: {_code('passed' if audit.passed else 'failed')}",
@@ -106,7 +137,12 @@ def _render_legacy_markdown(rubric: RubricProfile, review: Any, audit: AuditRepo
     return "\n".join(lines)
 
 
-def _render_evaluation_markdown(rubric: RubricProfile, report: Any, audit: AuditReport) -> str:
+def _render_evaluation_markdown(
+    rubric: RubricProfile,
+    report: Any,
+    audit: AuditReport,
+    provider_lines: list[str],
+) -> str:
     policy = _field(report, "policy_context", "policy", default=None)
     meta = _field(report, "meta_review", default=None)
     title = _field(report, "paper_title", "title", default="浙江省本科毕业论文 AI 辅助评测报告")
@@ -114,6 +150,7 @@ def _render_evaluation_markdown(rubric: RubricProfile, report: Any, audit: Audit
         f"# {_text(title)}",
         "",
         f"- Run ID: {_code(_field(report, 'run_id', default='unknown'))}",
+        *provider_lines,
         f"- Rubric: {_code(f'{rubric.rubric_id}@{rubric.version}')}",
         f"- Evaluation mode: {_code(_field(report, 'evaluation_mode', default='dual_advisory'))}",
         f"- Evidence audit: {_code('passed' if audit.passed else 'failed')}",
@@ -518,3 +555,48 @@ def _is_evaluation_report(value: Any) -> bool:
             "evaluation_mode",
         )
     )
+
+
+def _load_provider_snapshot(run_dir: Path) -> ProviderSnapshot | None:
+    path = run_dir / "provider.json"
+    if not path.is_file():
+        return None
+    return ProviderSnapshot.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _provider_report_lines(
+    *,
+    provider_snapshot: ProviderSnapshot | None,
+    provider_ref: str | None,
+    model: str | None,
+) -> list[str]:
+    """Render only safe provider identity; never expose an endpoint or custom UUID."""
+
+    selected_model: str | None
+    if provider_snapshot is not None:
+        display_name = provider_snapshot.display_name
+        protocol = provider_snapshot.protocol
+        selected_model = provider_snapshot.model
+    else:
+        builtins = {
+            "openai": ("OpenAI", ModelApiProtocol.CHAT_COMPLETIONS),
+            "openai_responses": ("OpenAI", ModelApiProtocol.RESPONSES),
+            "deepseek": ("DeepSeek", ModelApiProtocol.CHAT_COMPLETIONS),
+        }
+        display_name, protocol = builtins.get(
+            provider_ref or "",
+            ("自定义 Provider", ModelApiProtocol.CHAT_COMPLETIONS),
+        )
+        selected_model = model
+    protocol_name = (
+        "Responses API"
+        if protocol is ModelApiProtocol.RESPONSES
+        else "Chat Completions"
+    )
+    lines = [
+        f"- Provider：{_text(display_name)}",
+        f"- 接口协议：{_text(protocol_name)}",
+    ]
+    if selected_model:
+        lines.append(f"- 模型：{_text(selected_model)}")
+    return lines

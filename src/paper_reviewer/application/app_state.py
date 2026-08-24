@@ -89,6 +89,10 @@ class AppPaths(BaseModel):
     def preferences_path(self) -> Path:
         return self.config_dir / "preferences.json"
 
+    @property
+    def providers_path(self) -> Path:
+        return self.config_dir / "providers.json"
+
     def ensure(self) -> None:
         for path in (self.root, self.data_dir, self.runs_dir, self.logs_dir, self.config_dir):
             path.mkdir(parents=True, exist_ok=True)

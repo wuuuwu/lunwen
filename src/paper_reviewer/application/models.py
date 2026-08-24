@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from paper_reviewer.domain.document import DocumentInfo
 from paper_reviewer.domain.evidence import EvidenceItem
+from paper_reviewer.domain.provider import ModelApiProtocol
 from paper_reviewer.domain.review import (
     EvaluationReport,
     HardRuleAssessment,
@@ -29,6 +30,12 @@ class ReportExportResult(BaseModel):
     format: ReportExportFormat
     size_bytes: int = Field(ge=0)
     reconstructed_from_snapshot: bool = False
+
+
+class ProviderCompatibilityResult(BaseModel):
+    compatible: bool
+    message: str
+    protocol: ModelApiProtocol
 
 
 class ReviewRequest(BaseModel):
@@ -76,6 +83,8 @@ class RunSummary(BaseModel):
     paper_name: str
     rubric_id: str
     provider: str
+    provider_display_name: str | None = None
+    provider_protocol: ModelApiProtocol | None = None
     model: str
     status: RunStatus
     created_at: datetime
@@ -83,12 +92,20 @@ class RunSummary(BaseModel):
     error: str | None = None
 
     @classmethod
-    def from_record(cls, run: RunRecord) -> RunSummary:
+    def from_record(
+        cls,
+        run: RunRecord,
+        *,
+        provider_display_name: str | None = None,
+        provider_protocol: ModelApiProtocol | None = None,
+    ) -> RunSummary:
         return cls(
             run_id=run.run_id,
             paper_name=Path(run.input_path).name,
             rubric_id=run.rubric_id,
             provider=run.provider,
+            provider_display_name=provider_display_name,
+            provider_protocol=provider_protocol,
             model=run.model,
             status=run.status,
             created_at=run.created_at,
@@ -99,6 +116,8 @@ class RunSummary(BaseModel):
 
 class RunDetail(BaseModel):
     run: RunRecord
+    provider_display_name: str | None = None
+    provider_protocol: ModelApiProtocol | None = None
     events: list[RunEvent] = Field(default_factory=list)
     pending_hard_rules: list[HardRuleAssessment] = Field(default_factory=list)
     human_rule_decisions: list[HumanRuleDecision] = Field(default_factory=list)
@@ -106,6 +125,8 @@ class RunDetail(BaseModel):
 
 class ReportView(BaseModel):
     run: RunRecord
+    provider_display_name: str | None = None
+    provider_protocol: ModelApiProtocol | None = None
     document: DocumentInfo | None = None
     rubric: RubricProfile
     review: MetaReview

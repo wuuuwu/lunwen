@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -30,9 +32,11 @@ from paper_reviewer.adapters.persistence.repositories import (
 from paper_reviewer.adapters.scholarly.arxiv import ArxivClient
 from paper_reviewer.adapters.scholarly.crossref import CrossrefClient
 from paper_reviewer.adapters.scholarly.openalex import OpenAlexClient
+from paper_reviewer.adapters.search.ddgs import DdgsWebSearchClient
 from paper_reviewer.adapters.security.keyring_store import SystemCredentialStore
-from paper_reviewer.application.app_state import AppPaths, read_json_lines
+from paper_reviewer.application.app_state import AppPaths, PreferencesStore, read_json_lines
 from paper_reviewer.application.models import (
+    ProviderCompatibilityResult,
     ReportExportFormat,
     ReportExportResult,
     ReportView,
@@ -44,14 +48,27 @@ from paper_reviewer.application.models import (
 )
 from paper_reviewer.application.orchestrator import (
     ReviewOrchestrator,
+    load_provider_snapshot,
     load_run_request_context,
     load_run_snapshots,
+)
+from paper_reviewer.application.providers import (
+    CustomProviderRegistry,
+    ProviderStore,
+    builtin_provider_connections,
 )
 from paper_reviewer.application.review_planner import build_review_plan
 from paper_reviewer.application.state_machine import transition
 from paper_reviewer.config import Settings, load_review_profile, load_rubric
 from paper_reviewer.domain.document import DocumentInfo
 from paper_reviewer.domain.evidence import EvidenceItem
+from paper_reviewer.domain.provider import (
+    CustomProviderProfile,
+    ModelApiProtocol,
+    ProviderConnection,
+    ProviderSnapshot,
+    normalize_base_url,
+)
 from paper_reviewer.domain.review import (
     EvaluationReport,
     HardRuleAssessment,
@@ -61,6 +78,7 @@ from paper_reviewer.domain.review import (
 )
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
+from paper_reviewer.ports.model import Message, ModelRequest, ToolSpec
 from paper_reviewer.reporting.exporter import render_pdf, validate_pdf
 from paper_reviewer.reporting.renderer import render_markdown
 from paper_reviewer.validation.audits import AuditReport
@@ -113,6 +131,188 @@ class ReviewApplicationService:
             database_url=self.paths.database_url,
             runs_dir=self.paths.runs_dir,
         )
+        self.providers = CustomProviderRegistry(
+            ProviderStore(self.paths.providers_path), self.credentials
+        )
+
+    def list_provider_connections(
+        self, *, include_archived: bool = False
+    ) -> list[ProviderConnection]:
+        connections = list(builtin_provider_connections())
+        connections.extend(
+            self.providers.resolve(item.provider_ref)
+            for item in self.providers.list(include_archived=include_archived)
+        )
+        return connections
+
+    def list_custom_providers(
+        self, *, include_archived: bool = False
+    ) -> list[CustomProviderProfile]:
+        return self.providers.list(include_archived=include_archived)
+
+    def create_custom_provider(
+        self,
+        *,
+        display_name: str,
+        protocol: ModelApiProtocol,
+        base_url: str,
+        default_model: str,
+        api_key: str,
+    ) -> CustomProviderProfile:
+        return self.providers.create(
+            display_name=display_name,
+            protocol=protocol,
+            base_url=base_url,
+            default_model=default_model,
+            api_key=api_key,
+        )
+
+    def update_custom_provider(
+        self,
+        provider_ref: str,
+        *,
+        display_name: str | None = None,
+        default_model: str | None = None,
+    ) -> CustomProviderProfile:
+        return self.providers.update(
+            provider_ref, display_name=display_name, default_model=default_model
+        )
+
+    def archive_custom_provider(self, provider_ref: str) -> CustomProviderProfile:
+        preferences = PreferencesStore(self.paths.preferences_path).load()
+        if preferences.default_provider == provider_ref:
+            raise ValueError("请先更换默认 Provider，再归档当前配置。")
+        return self.providers.archive(provider_ref)
+
+    def restore_custom_provider(self, provider_ref: str) -> CustomProviderProfile:
+        return self.providers.restore(provider_ref)
+
+    def replace_custom_provider_endpoint(
+        self,
+        provider_ref: str,
+        *,
+        protocol: ModelApiProtocol,
+        base_url: str,
+        api_key: str,
+        display_name: str | None = None,
+        default_model: str | None = None,
+    ) -> CustomProviderProfile:
+        return self.providers.replace_endpoint(
+            provider_ref,
+            protocol=protocol,
+            base_url=base_url,
+            api_key=api_key,
+            display_name=display_name,
+            default_model=default_model,
+        )
+
+    async def delete_custom_provider(self, provider_ref: str) -> None:
+        if await self._provider_is_referenced(provider_ref):
+            raise ValueError("该 Provider 仍被历史任务引用，不能永久删除")
+        self.providers.delete(provider_ref)
+
+    def rotate_custom_provider_key(self, provider_ref: str, api_key: str) -> None:
+        self.providers.rotate_key(provider_ref, api_key)
+
+    def delete_custom_provider_key(self, provider_ref: str) -> None:
+        self.providers.delete_key(provider_ref)
+
+    def provider_has_key(self, provider_ref: str) -> bool:
+        return self.providers.has_key(provider_ref)
+
+    async def test_provider_compatibility(
+        self,
+        provider_ref: str | None = None,
+        *,
+        protocol: ModelApiProtocol | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        api_key: str | None = None,
+    ) -> ProviderCompatibilityResult:
+        if provider_ref is not None:
+            connection = self.providers.resolve(provider_ref)
+            selected_model = (model or connection.default_model).strip()
+            selected_protocol = connection.protocol
+            selected_base_url = connection.base_url
+            resolved_key = api_key or self.providers.get_api_key(provider_ref)
+            adapter_provider_ref = provider_ref
+        else:
+            if protocol is None or base_url is None or model is None:
+                raise ValueError("未保存的 Provider 测试需要协议、Base URL 和模型。")
+            selected_protocol = protocol
+            selected_base_url = normalize_base_url(base_url)
+            selected_model = model.strip()
+            resolved_key = api_key
+            adapter_provider_ref = f"custom:{'0' * 32}"
+        if not selected_model:
+            raise ValueError("模型名称不能为空。")
+        if not resolved_key:
+            return ProviderCompatibilityResult(
+                compatible=False,
+                message="未配置 API Key。",
+                protocol=selected_protocol,
+            )
+        adapter = create_model_adapter(
+            adapter_provider_ref,
+            selected_model,
+            api_key=resolved_key,
+            protocol=selected_protocol,
+            base_url=selected_base_url,
+            timeout=30,
+        )
+        try:
+            async with asyncio.timeout(30):
+                response = await adapter.complete_once(
+                    ModelRequest(
+                        messages=[
+                            Message(
+                                role="user",
+                                content=(
+                                    "Call the paper_reviewer_compatibility_probe tool "
+                                    "exactly once with ok=true. Do not answer with text."
+                                ),
+                            )
+                        ],
+                        tools=[
+                            ToolSpec(
+                                name="paper_reviewer_compatibility_probe",
+                                description="Verify function-tool compatibility.",
+                                parameters={
+                                    "type": "object",
+                                    "properties": {"ok": {"type": "boolean"}},
+                                    "required": ["ok"],
+                                    "additionalProperties": False,
+                                },
+                            )
+                        ],
+                        max_output_tokens=32,
+                        trace_id="provider-compatibility-test",
+                        idempotency_key="provider-compatibility-test",
+                        forced_tool_name="paper_reviewer_compatibility_probe",
+                    )
+                )
+            compatible = any(
+                call.name == "paper_reviewer_compatibility_probe"
+                and call.arguments.get("ok") is True
+                for call in response.tool_calls
+            )
+            return ProviderCompatibilityResult(
+                compatible=compatible,
+                message=(
+                    "Provider 支持所选协议和 Agent 工具调用。"
+                    if compatible
+                    else "Provider 可响应，但没有产生所需的 Agent 工具调用。"
+                ),
+                protocol=selected_protocol,
+            )
+        except Exception as error:
+            return ProviderCompatibilityResult(
+                compatible=False,
+                message=_sanitize_provider_error(error, secrets=(resolved_key,)),
+                protocol=selected_protocol,
+            )
+        finally:
+            await adapter.close()
 
     def validate_rubric(self, path: Path, *, profile_path: Path) -> RubricValidationResult:
         try:
@@ -171,12 +371,18 @@ class ReviewApplicationService:
         panel_profile = None
         if _is_dual_advisory_rubric(rubric):
             panel_profile = load_review_profile(_resolve_panel_profile_path(request.profile))
-        api_key = self.credentials.get(request.provider)
-        model = create_model_adapter(
-            request.provider,
-            request.model,
-            timeout=self.settings.request_timeout_seconds,
+        if request.provider.startswith("custom:"):
+            profile_entry = self.providers.get(request.provider)
+            if profile_entry.is_archived:
+                raise ValueError("归档的自定义 Provider 不能用于创建新任务。")
+        provider_snapshot = self.providers.snapshot(request.provider, request.model)
+        api_key = self.providers.get_snapshot_api_key(provider_snapshot)
+        if not api_key:
+            raise ValueError("所选 Provider 未配置 API Key。")
+        model = _adapter_from_snapshot(
+            provider_snapshot,
             api_key=api_key,
+            timeout=self.settings.request_timeout_seconds,
         )
         engine = create_engine(self.settings.database_url)
         await initialize_database(engine)
@@ -187,7 +393,10 @@ class ReviewApplicationService:
                 if request.external_search
                 else []
             )
-            orchestrator = self._orchestrator(model, sessions, scholarly, event_sink)
+            web_search = _web_search_client(self.settings) if request.external_search else None
+            orchestrator = self._orchestrator(
+                model, sessions, scholarly, web_search, event_sink
+            )
             try:
                 return await orchestrator.create_and_execute(
                     input_path=request.paper,
@@ -201,6 +410,7 @@ class ReviewApplicationService:
                     cloud_processing_authorized=request.cloud_processing_authorized,
                     contains_classified_material=request.contains_classified_material,
                     external_search=request.external_search,
+                    provider_snapshot=provider_snapshot,
                 )
             finally:
                 await model.close()
@@ -222,14 +432,26 @@ class ReviewApplicationService:
         rubric, profile = load_run_snapshots(self.settings.runs_dir / run_id)
         panel_path = self.settings.runs_dir / run_id / "panel-profile.json"
         panel_profile = load_review_profile(panel_path) if panel_path.is_file() else None
-        api_key = self.credentials.get(run.provider)
-        model = create_model_adapter(
-            run.provider,
-            run.model,
-            timeout=self.settings.request_timeout_seconds,
+        run_dir = self.settings.runs_dir / run_id
+        provider_snapshot = load_provider_snapshot(run_dir)
+        if provider_snapshot is None:
+            if run.provider not in {"openai", "deepseek"}:
+                await engine.dispose()
+                raise ValueError(
+                    "该任务缺少 Provider 快照；自定义 Provider 或 Responses 任务"
+                    "请使用桌面端重新创建。"
+                )
+            provider_snapshot = self.providers.snapshot(run.provider, run.model)
+        api_key = self.providers.get_snapshot_api_key(provider_snapshot)
+        if not api_key:
+            await engine.dispose()
+            raise ValueError("恢复任务所需的 API Key 不存在，请先在设置中重新配置。")
+        model = _adapter_from_snapshot(
+            provider_snapshot,
             api_key=api_key,
+            timeout=self.settings.request_timeout_seconds,
         )
-        request_context = load_run_request_context(self.settings.runs_dir / run_id)
+        request_context = load_run_request_context(run_dir)
         external_search = request_context.get("external_search", True) is not False
         async with httpx.AsyncClient(timeout=self.settings.external_timeout_seconds) as client:
             scholarly: list[Any] = (
@@ -237,7 +459,10 @@ class ReviewApplicationService:
                 if external_search
                 else []
             )
-            orchestrator = self._orchestrator(model, sessions, scholarly, event_sink)
+            web_search = _web_search_client(self.settings) if external_search else None
+            orchestrator = self._orchestrator(
+                model, sessions, scholarly, web_search, event_sink
+            )
             try:
                 return await orchestrator.execute(
                     run,
@@ -326,7 +551,18 @@ class ReviewApplicationService:
         finally:
             await engine.dispose()
         needle = search.casefold().strip()
-        summaries = [RunSummary.from_record(record) for record in records]
+        summaries = []
+        for record in records:
+            snapshot = _provider_snapshot_for_display(
+                self.settings.runs_dir / record.run_id, record
+            )
+            summaries.append(
+                RunSummary.from_record(
+                    record,
+                    provider_display_name=snapshot.display_name if snapshot else None,
+                    provider_protocol=snapshot.protocol if snapshot else None,
+                )
+            )
         if not needle:
             return summaries
         return [item for item in summaries if needle in item.paper_name.casefold()]
@@ -342,8 +578,11 @@ class ReviewApplicationService:
         if run is None:
             raise ValueError(f"未知任务：{run_id}")
         events = _load_trace_events(self.settings.runs_dir / run_id / "trace.jsonl", run_id)
+        snapshot = _provider_snapshot_for_display(self.settings.runs_dir / run_id, run)
         return RunDetail(
             run=run,
+            provider_display_name=snapshot.display_name if snapshot else None,
+            provider_protocol=snapshot.protocol if snapshot else None,
             events=events,
             pending_hard_rules=await self._pending_hard_rules(run_id),
             human_rule_decisions=await self._human_rule_decisions(run_id),
@@ -390,6 +629,8 @@ class ReviewApplicationService:
         )
         return ReportView(
             run=detail.run,
+            provider_display_name=detail.provider_display_name,
+            provider_protocol=detail.provider_protocol,
             document=document,
             rubric=rubric,
             review=review,
@@ -434,6 +675,9 @@ class ReviewApplicationService:
                 rubric,
                 selected_report,
                 audit,
+                provider_snapshot=load_provider_snapshot(run_dir),
+                provider_ref=run.provider,
+                model=run.model,
             ).encode("utf-8")
         else:
             markdown_bytes = source.read_bytes()
@@ -484,6 +728,7 @@ class ReviewApplicationService:
         model: Any,
         sessions: Any,
         scholarly: list[Any],
+        web_search: Any | None,
         event_sink: EventSink | None,
     ) -> ReviewOrchestrator:
         return ReviewOrchestrator(
@@ -495,6 +740,7 @@ class ReviewApplicationService:
             evidence_repository=EvidenceRepository(sessions),
             review_repository=ReviewRepository(sessions),
             scholarly_clients=scholarly,
+            web_search_client=web_search,
             event_sink=event_sink,
         )
 
@@ -508,6 +754,15 @@ class ReviewApplicationService:
         if run is None:
             raise ValueError(f"未知任务：{run_id}")
         return run
+
+    async def _provider_is_referenced(self, provider_ref: str) -> bool:
+        engine = create_engine(self.settings.database_url)
+        await initialize_database(engine)
+        try:
+            records = await RunRepository(create_session_factory(engine)).list()
+        finally:
+            await engine.dispose()
+        return any(record.provider == provider_ref for record in records)
 
     async def _pending_hard_rules(self, run_id: str) -> list[HardRuleAssessment]:
         run_dir = self.settings.runs_dir / run_id
@@ -547,6 +802,16 @@ class ReviewApplicationService:
         return list(by_rule.values())
 
 
+def _web_search_client(settings: Settings) -> DdgsWebSearchClient:
+    return DdgsWebSearchClient(
+        backend=settings.web_search_backend,
+        region=settings.web_search_region,
+        safesearch=settings.web_search_safesearch,
+        min_interval_seconds=settings.web_search_min_interval_seconds,
+        timeout_seconds=settings.external_timeout_seconds,
+    )
+
+
 def _validation_messages(error: Exception) -> list[str]:
     if isinstance(error, ValidationError):
         return [
@@ -554,6 +819,85 @@ def _validation_messages(error: Exception) -> list[str]:
             for item in error.errors()
         ]
     return [str(error)]
+
+
+def _adapter_from_snapshot(
+    snapshot: ProviderSnapshot, *, api_key: str, timeout: float
+) -> Any:
+    return create_model_adapter(
+        snapshot.provider_ref,
+        snapshot.model,
+        timeout=timeout,
+        api_key=api_key,
+        protocol=snapshot.protocol,
+        base_url=snapshot.base_url,
+    )
+
+
+def _provider_snapshot_for_display(
+    run_dir: Path, run: RunRecord
+) -> ProviderSnapshot | None:
+    snapshot = load_provider_snapshot(run_dir)
+    if snapshot is not None:
+        return snapshot
+    for connection in builtin_provider_connections():
+        if connection.provider_ref == run.provider and run.provider in {"openai", "deepseek"}:
+            return ProviderSnapshot(
+                provider_ref=connection.provider_ref,
+                display_name=connection.display_name,
+                protocol=connection.protocol,
+                base_url=connection.base_url,
+                endpoint_fingerprint=connection.endpoint_fingerprint,
+                model=run.model,
+            )
+    return None
+
+
+_AUTHORIZATION_PATTERN = re.compile(
+    r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"
+)
+_BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_LIKELY_KEY_PATTERN = re.compile(r"\b(?:sk|key)-[A-Za-z0-9_-]{12,}\b", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https?://[^\s\]\[(){}<>\"']+", re.IGNORECASE)
+
+
+def _sanitize_provider_error(
+    error: BaseException, *, secrets: tuple[str, ...] = ()
+) -> str:
+    """Return a bounded provider error without credentials, URLs, or response bodies."""
+
+    module = type(error).__module__
+    if module == "openai" or module.startswith("openai."):
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int):
+            reason = {
+                400: "Provider 拒绝了请求；请检查所选协议、模型和请求参数。",
+                401: "Provider 认证失败；请检查 API Key。",
+                403: "Provider 拒绝访问；请检查账号或模型权限。",
+                404: "Provider 未找到接口或模型；请检查 Base URL、协议和模型名称。",
+                408: "Provider 请求超时。",
+                409: "Provider 拒绝了当前请求状态。",
+                422: "Provider 不支持当前协议或工具调用参数。",
+                429: "Provider 已达到速率或额度限制。",
+            }.get(status, "Provider 服务端请求失败。" if status >= 500 else "Provider 请求失败。")
+            return f"{type(error).__name__}: {reason} (HTTP {status})"
+        if "timeout" in type(error).__name__.casefold():
+            return f"{type(error).__name__}: Provider 请求超时。"
+        if "connection" in type(error).__name__.casefold():
+            return f"{type(error).__name__}: 无法连接 Provider，请检查 Base URL 和网络。"
+        return f"{type(error).__name__}: Provider 请求失败。"
+
+    message = " ".join(str(error).split())
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "<api-key>")
+    message = _AUTHORIZATION_PATTERN.sub(r"\1<redacted>", message)
+    message = _BEARER_PATTERN.sub("Bearer <redacted>", message)
+    message = _LIKELY_KEY_PATTERN.sub("<api-key>", message)
+    message = _URL_PATTERN.sub("<provider-url>", message)
+    if not message:
+        message = "Provider 请求失败。"
+    return f"{type(error).__name__}: {message[:400]}"
 
 
 def _validated_run_dir(runs_dir: Path, run_id: str) -> Path:
@@ -690,6 +1034,7 @@ def _stage_from_event(event_type: str) -> str | None:
     for prefix, stage in (
         ("ingest", "ingest"),
         ("evidence", "evidence"),
+        ("reference", "evidence"),
         ("scoring", "scoring"),
         ("review", "reviews"),
         ("audit", "audit"),
@@ -710,6 +1055,8 @@ _TRACE_MESSAGES = {
     "ingest_completed": "论文解析完成",
     "evidence_collection_started": "正在收集外部学术证据",
     "evidence_completed": "外部证据收集完成",
+    "reference_check_started": "正在自动核验参考文献",
+    "reference_check_completed": "参考文献自动核验完成",
     "scoring_started": "专业化 Reviewer 正在执行九项诊断评分",
     "scoring_completed": "九项诊断评分完成",
     "reviews_started": "多位 Reviewer 正在评测",

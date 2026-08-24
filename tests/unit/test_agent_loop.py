@@ -207,6 +207,9 @@ async def test_trace_records_reasoning_presence_without_reasoning_content() -> N
                 finish_reason="stop",
                 reasoning_content_present=True,
                 usage=Usage(output_tokens=12, reasoning_tokens=7),
+                continuation_items=[
+                    {"type": "reasoning", "encrypted_content": "opaque-private-value"}
+                ],
             )
         ]
     )
@@ -228,6 +231,7 @@ async def test_trace_records_reasoning_presence_without_reasoning_content() -> N
     assert completed["reasoning_tokens"] == 7
     assert completed["reasoning_content_present"] is True
     assert "reasoning_content" not in completed
+    assert "opaque-private-value" not in str(events)
 
 
 @pytest.mark.asyncio
@@ -255,6 +259,81 @@ async def test_empty_response_is_not_added_as_an_assistant_message() -> None:
         message.role == "assistant" and not message.content and not message.tool_calls
         for message in model.requests[1].messages
     )
+
+
+@pytest.mark.asyncio
+async def test_responses_continuation_is_forwarded_but_not_serialized() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        name="lookup",
+        description="Lookup",
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=lambda: {"answer": 42},
+    )
+    continuation = [
+        {"type": "reasoning", "encrypted_content": "opaque-private-value"},
+        {
+            "type": "function_call",
+            "call_id": "1",
+            "name": "lookup",
+            "arguments": "{}",
+        },
+    ]
+    model = FakeModel(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="1", name="lookup", arguments={})],
+                continuation_items=continuation,
+            ),
+            ModelResponse(content='{"value":"ok"}'),
+        ]
+    )
+
+    result = await run_bounded_agent(
+        model=model,
+        registry=registry,
+        allowlist=["lookup"],
+        system_prompt="system",
+        user_prompt="user",
+        output_type=Output,
+        trace_id="trace",
+        budget=AgentBudget(max_model_turns=2, max_tool_calls=1, max_repairs=0),
+    )
+
+    assert result.value == "ok"
+    assistant = next(
+        message for message in model.requests[1].messages if message.role == "assistant"
+    )
+    assert assistant.continuation_items == continuation
+    assert "opaque-private-value" not in assistant.model_dump_json()
+    assert "continuation_items" not in assistant.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_invalid_final_continuation_is_excluded_from_repair_context() -> None:
+    model = FakeModel(
+        [
+            ModelResponse(
+                content='{"wrong":"shape"}',
+                continuation_items=[{"type": "reasoning", "encrypted_content": "discard-me"}],
+            ),
+            ModelResponse(content='{"value":"repaired"}'),
+        ]
+    )
+
+    result = await run_bounded_agent(
+        model=model,
+        registry=ToolRegistry(),
+        allowlist=[],
+        system_prompt="system",
+        user_prompt="user",
+        output_type=Output,
+        trace_id="trace",
+        budget=AgentBudget(max_model_turns=1, max_tool_calls=0, max_repairs=1),
+    )
+
+    assert result.value == "repaired"
+    assert not any(message.continuation_items for message in model.requests[1].messages)
 
 
 @pytest.mark.asyncio

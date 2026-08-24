@@ -24,11 +24,19 @@ from paper_reviewer.agents.panel_reviewer import run_panel_reviewer
 from paper_reviewer.agents.reviewer import run_reviewer
 from paper_reviewer.application.evidence_builder import build_external_evidence
 from paper_reviewer.application.models import RunEvent
+from paper_reviewer.application.providers import builtin_provider_connections
+from paper_reviewer.application.reference_checker import (
+    MAX_EXTRACTED_REFERENCES,
+    check_references,
+    extract_references,
+)
 from paper_reviewer.application.review_planner import ReviewPlan, build_review_plan
 from paper_reviewer.application.state_machine import transition
 from paper_reviewer.config import ReviewerProfile, ReviewProfile, Settings
 from paper_reviewer.domain.document import DocumentBlock, DocumentInfo
 from paper_reviewer.domain.evidence import EvidenceItem
+from paper_reviewer.domain.provider import ProviderSnapshot
+from paper_reviewer.domain.reference import ReferenceCheckReport
 from paper_reviewer.domain.review import (
     CriterionAssessment,
     DiagnosticScore,
@@ -49,7 +57,9 @@ from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.ports.document_parser import DocumentParserPort
 from paper_reviewer.ports.model import ModelPort
 from paper_reviewer.ports.scholarly_search import ScholarlySearchPort
+from paper_reviewer.ports.web_search import WebSearchPort
 from paper_reviewer.reporting.renderer import write_report_bundle
+from paper_reviewer.tools.web_search import WebSearchTools
 from paper_reviewer.validation.audits import (
     AuditReport,
     audit_criterion_assessments,
@@ -90,6 +100,7 @@ class ReviewOrchestrator:
         evidence_repository: EvidenceRepository,
         review_repository: ReviewRepository,
         scholarly_clients: list[ScholarlySearchPort] | None = None,
+        web_search_client: WebSearchPort | None = None,
         event_sink: Callable[[RunEvent], None] | None = None,
     ) -> None:
         self.settings = settings
@@ -100,6 +111,7 @@ class ReviewOrchestrator:
         self.evidence = evidence_repository
         self.reviews = review_repository
         self.scholarly_clients = scholarly_clients or []
+        self.web_search_client = web_search_client
         self.event_sink = event_sink
 
     async def create_and_execute(
@@ -116,7 +128,19 @@ class ReviewOrchestrator:
         cloud_processing_authorized: bool | None = None,
         contains_classified_material: bool = False,
         external_search: bool = True,
+        provider_snapshot: ProviderSnapshot | None = None,
     ) -> RunRecord:
+        if provider_snapshot is None:
+            provider_snapshot = _builtin_provider_snapshot(provider, model_name)
+        if provider_snapshot is not None and (
+            provider_snapshot.provider_ref != provider
+            or provider_snapshot.model != model_name
+        ):
+            raise ValueError("Provider 快照与任务 Provider 或模型不一致。")
+        if provider.startswith("custom:") and provider_snapshot is None:
+            raise ValueError(
+                "自定义 Provider 任务必须由桌面端提供不可变 Provider 快照。"
+            )
         if _is_dual_advisory(rubric):
             if cloud_processing_authorized is not True:
                 raise ValueError("cloud processing authorization is required")
@@ -140,6 +164,7 @@ class ReviewOrchestrator:
                 discipline_name=discipline_name,
                 discipline_profile=discipline_profile_text,
                 external_search=external_search,
+                provider_snapshot=provider_snapshot,
             ),
             rubric_id=f"{rubric.rubric_id}@{rubric.version}",
             provider=provider,
@@ -148,6 +173,11 @@ class ReviewOrchestrator:
         await self.runs.create(run)
         run_dir = self.settings.runs_dir / run.run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+        if provider_snapshot is not None:
+            _write_json_atomic(
+                run_dir / "provider.json",
+                provider_snapshot.model_dump(mode="json"),
+            )
         (run_dir / "rubric.json").write_text(rubric.model_dump_json(indent=2), encoding="utf-8")
         (run_dir / "review-profile.json").write_text(
             profile.model_dump_json(indent=2), encoding="utf-8"
@@ -214,6 +244,8 @@ class ReviewOrchestrator:
                 )
             )
             blocks = await self.documents.list_blocks(run.run_id)
+            reference_report_path = run_dir / "reference-checks.json"
+            reference_report = ReferenceCheckReport()
 
             if "evidence" not in run.completed_stages:
                 await self._set_status(
@@ -224,12 +256,74 @@ class ReviewOrchestrator:
                     query=document.title or "academic paper",
                     clients=self.scholarly_clients,
                 )
+                extracted_references = extract_references(
+                    blocks,
+                    max_references=min(
+                        self.settings.max_reference_checks + 1,
+                        MAX_EXTRACTED_REFERENCES,
+                    ),
+                )
+                reference_entries = extracted_references[
+                    : self.settings.max_reference_checks
+                ]
+                if reference_entries and (
+                    self.web_search_client is not None or self.scholarly_clients
+                ):
+                    self._append_trace(
+                        run.run_id,
+                        "reference_check_started",
+                        {"count": len(reference_entries)},
+                    )
+                    reference_report, reference_evidence = await check_references(
+                        run_id=run.run_id,
+                        entries=reference_entries,
+                        web_search=self.web_search_client,
+                        scholarly_clients=self.scholarly_clients,
+                        per_source_limit=self.settings.reference_search_results,
+                        max_concurrency=self.settings.reference_check_concurrency,
+                    )
+                    if len(extracted_references) > len(reference_entries):
+                        reference_report.warnings.insert(
+                            0,
+                            "参考文献超过本次自动核验上限 "
+                            f"{self.settings.max_reference_checks} 条；其余条目建议人工核对。",
+                        )
+                    evidence_by_id = {item.evidence_id: item for item in evidence}
+                    for item in reference_evidence:
+                        evidence_by_id.setdefault(item.evidence_id, item)
+                    evidence = list(evidence_by_id.values())
+                    warnings.extend(reference_report.warnings)
+                    self._append_trace(
+                        run.run_id,
+                        "reference_check_completed",
+                        {
+                            "count": len(reference_report.checks),
+                            "verified": reference_report.verified_count,
+                            "probable": reference_report.probable_count,
+                            "unresolved": reference_report.unresolved_count,
+                        },
+                    )
+                _write_json_atomic(
+                    reference_report_path,
+                    reference_report.model_dump(mode="json"),
+                )
                 await self.evidence.replace(run.run_id, evidence)
                 await self._complete_stage(
                     run,
                     "evidence",
                     RunStatus.EVIDENCE_READY,
-                    payload={"count": len(evidence), "warnings": warnings},
+                    payload={
+                        "count": len(evidence),
+                        "reference_checks": len(reference_report.checks),
+                        "reference_verified": reference_report.verified_count,
+                        "reference_probable": reference_report.probable_count,
+                        "reference_unresolved": reference_report.unresolved_count,
+                        "warnings": warnings,
+                    },
+                )
+            elif reference_report_path.is_file():
+                reference_report = ReferenceCheckReport.model_validate_json(
+                    reference_report_path.read_text(encoding="utf-8")
                 )
             evidence = await self.evidence.list(run.run_id)
 
@@ -349,6 +443,9 @@ class ReviewOrchestrator:
                         blocks=blocks,
                         evidence=evidence,
                     )
+                for warning in reference_report.warnings:
+                    if warning not in audit.warnings:
+                        audit.warnings.append(warning)
                 (run_dir / "audit.json").write_text(
                     audit.model_dump_json(indent=2), encoding="utf-8"
                 )
@@ -703,6 +800,18 @@ class ReviewOrchestrator:
     ) -> list[ReviewerResult]:
         dimensions = {dimension.dimension_id: dimension for dimension in rubric.dimensions}
         semaphore = asyncio.Semaphore(self.settings.reviewer_concurrency)
+        evidence_lock = asyncio.Lock()
+        persistence_lock = asyncio.Lock()
+        web_search_tools = (
+            WebSearchTools(
+                client=self.web_search_client,
+                run_id=run.run_id,
+                evidence=evidence,
+                evidence_lock=evidence_lock,
+            )
+            if self.web_search_client is not None
+            else None
+        )
 
         async def invoke(assignment: object) -> ReviewerResult:
             from paper_reviewer.application.review_planner import ReviewAssignment
@@ -727,6 +836,7 @@ class ReviewOrchestrator:
                     discipline_name=discipline_name,
                     discipline_profile=discipline_profile,
                     max_repairs=self.settings.max_output_repairs,
+                    web_search_tools=web_search_tools,
                     repair_source=(
                         repair_sources.get(assignment.reviewer.reviewer_id)
                         if repair_sources is not None
@@ -737,7 +847,11 @@ class ReviewOrchestrator:
                     ),
                 )
                 if persist_results:
-                    await self.reviews.save_result(run.run_id, result)
+                    async with persistence_lock:
+                        async with evidence_lock:
+                            evidence_snapshot = list(evidence)
+                        await self.evidence.replace(run.run_id, evidence_snapshot)
+                        await self.reviews.save_result(run.run_id, result)
                 return result
 
         assignments = [
@@ -871,6 +985,7 @@ class ReviewOrchestrator:
             discipline_name=discipline_name,
             discipline_profile=discipline_profile,
         )
+        await self.evidence.replace(run.run_id, evidence)
         for result in repaired:
             await self.reviews.save_result(run.run_id, result)
         self._append_trace(
@@ -952,6 +1067,31 @@ def load_run_request_context(run_dir: Path) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def load_provider_snapshot(run_dir: Path) -> ProviderSnapshot | None:
+    """Load the immutable, non-secret provider connection snapshot for a run."""
+
+    path = run_dir / "provider.json"
+    if not path.is_file():
+        return None
+    return ProviderSnapshot.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _builtin_provider_snapshot(
+    provider_ref: str, model: str
+) -> ProviderSnapshot | None:
+    for connection in builtin_provider_connections():
+        if connection.provider_ref == provider_ref:
+            return ProviderSnapshot(
+                provider_ref=connection.provider_ref,
+                display_name=connection.display_name,
+                protocol=connection.protocol,
+                base_url=connection.base_url,
+                endpoint_fingerprint=connection.endpoint_fingerprint,
+                model=model,
+            )
+    return None
+
+
 def _run_config_hash(
     *,
     rubric: RubricProfile,
@@ -960,6 +1100,7 @@ def _run_config_hash(
     discipline_name: str,
     discipline_profile: str | None,
     external_search: bool,
+    provider_snapshot: ProviderSnapshot | None = None,
 ) -> str:
     payload = {
         "rubric": rubric.model_dump(mode="json"),
@@ -970,6 +1111,16 @@ def _run_config_hash(
         "discipline_name": discipline_name,
         "discipline_profile": discipline_profile,
         "external_search": external_search,
+        "provider": (
+            {
+                "provider_ref": provider_snapshot.provider_ref,
+                "protocol": provider_snapshot.protocol.value,
+                "base_url_fingerprint": provider_snapshot.endpoint_fingerprint,
+                "model": provider_snapshot.model,
+            }
+            if provider_snapshot is not None
+            else None
+        ),
     }
     encoded = json.dumps(
         payload,
@@ -978,6 +1129,17 @@ def _run_config_hash(
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_json_atomic(path: Path, payload: object) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _is_dual_advisory(rubric: RubricProfile) -> bool:
@@ -1140,10 +1302,46 @@ def _safe_error_message(error: BaseException) -> str:
     """
 
     if not _is_database_error(error):
-        return str(error)
+        return _safe_external_reason(error)
     original = getattr(error, "orig", error)
     reason = _safe_database_reason(str(original))
     return f"{type(error).__name__}: {reason}"
+
+
+def _safe_external_reason(error: BaseException) -> str:
+    module = type(error).__module__
+    if module == "openai" or module.startswith("openai."):
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int):
+            reason = {
+                400: "provider rejected the request",
+                401: "provider authentication failed",
+                403: "provider access was denied",
+                404: "provider endpoint or model was not found",
+                429: "provider rate limit was reached",
+            }.get(status, "provider request failed")
+            reason = f"{reason} (HTTP {status})"
+        else:
+            reason = "provider request failed"
+        return f"{type(error).__name__}: {reason}"
+    message = " ".join(str(error).split())
+    message = re.sub(
+        r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+",
+        r"\1<redacted>",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", message
+    )
+    message = re.sub(
+        r"(?i)\b(?:sk|key)-[A-Za-z0-9_-]{12,}\b", "<api-key>", message
+    )
+    message = re.sub(
+        r"(?i)https?://[^\s\]\[(){}<>\"']+", "<provider-url>", message
+    )
+    if not message:
+        message = "external provider request failed"
+    return message[:400]
 
 
 def _safe_database_reason(message: str) -> str:
@@ -1219,6 +1417,7 @@ def _stage_from_event(event_type: str) -> str | None:
     for prefix, stage in (
         ("ingest", "ingest"),
         ("evidence", "evidence"),
+        ("reference", "evidence"),
         ("scoring", "scoring"),
         ("review", "reviews"),
         ("audit", "audit"),
@@ -1240,6 +1439,8 @@ def _event_message(event_type: str) -> str:
         "ingest_completed": "论文解析完成",
         "evidence_collection_started": "正在收集外部学术证据",
         "evidence_completed": "外部证据收集完成",
+        "reference_check_started": "正在自动核验参考文献",
+        "reference_check_completed": "参考文献自动核验完成",
         "scoring_started": "专业化 Reviewer 正在执行九项诊断评分",
         "scoring_completed": "九项诊断评分完成",
         "reviews_started": "多位 Reviewer 正在评测",

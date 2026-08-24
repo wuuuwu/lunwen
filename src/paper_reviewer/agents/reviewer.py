@@ -22,6 +22,7 @@ from paper_reviewer.ports.model import ModelPort
 from paper_reviewer.tools.evidence_reader import EvidenceReaderTools, register_evidence_tools
 from paper_reviewer.tools.paper_reader import PaperReaderTools, register_paper_tools
 from paper_reviewer.tools.registry import ToolRegistry
+from paper_reviewer.tools.web_search import WebSearchTools, register_web_search_tools
 from paper_reviewer.validation.audits import reviewer_reference_errors
 
 
@@ -41,11 +42,18 @@ async def run_reviewer(
     hard_rules: list[HardRule] | None = None,
     discipline_name: str | None = None,
     discipline_profile: str | None = None,
+    web_search_tools: WebSearchTools | None = None,
 ) -> ReviewerResult:
     registry = ToolRegistry()
     register_paper_tools(registry, PaperReaderTools(blocks))
     register_evidence_tools(registry, EvidenceReaderTools(evidence))
-    allowed = reviewer.allowed_tools
+    if web_search_tools is not None:
+        register_web_search_tools(registry, web_search_tools)
+    allowed = [
+        name
+        for name in reviewer.allowed_tools
+        if name != "web_search" or web_search_tools is not None
+    ]
     system_prompt = _reviewer_template().render(
         reviewer=reviewer,
         dimensions_json=json.dumps(
@@ -94,7 +102,6 @@ async def run_reviewer(
 
     block_ids = {block.block_id for block in blocks}
     block_pages = {block.block_id: block.page for block in blocks}
-    evidence_ids = {item.evidence_id for item in evidence}
     repair_baseline = (
         ReviewerResult.model_validate(repair_source.model_dump(mode="python"))
         if repair_source is not None
@@ -113,6 +120,7 @@ async def run_reviewer(
 
     def validate_result(result: ReviewerResult) -> None:
         nonlocal repair_baseline
+        evidence_ids = {item.evidence_id for item in evidence}
         errors: list[str] = []
         if result.reviewer_id != reviewer.reviewer_id:
             errors.append("reviewer result identity does not match the assigned reviewer")
@@ -185,6 +193,7 @@ async def run_reviewer(
         output_validator=validate_result,
     )
     if repair_baseline is not None:
+        evidence_ids = {item.evidence_id for item in evidence}
         return _merge_repaired_references(
             baseline=repair_baseline,
             candidate=result,

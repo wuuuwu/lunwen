@@ -102,9 +102,14 @@ async def run_bounded_agent[OutputT: BaseModel](
         # An empty assistant message is invalid in several OpenAI-compatible APIs
         # and provides no useful repair context. Reasoning text is deliberately
         # never represented in our message model or trace.
-        if response.content or response.tool_calls:
+        if response.content or response.tool_calls or response.continuation_items:
             messages.append(
-                Message(role="assistant", content=response.content, tool_calls=response.tool_calls)
+                Message(
+                    role="assistant",
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                    continuation_items=response.continuation_items,
+                )
             )
 
         return response

@@ -142,8 +142,10 @@ async def test_missing_markdown_is_reconstructed_from_report_view(
     expected_report = _write_rebuild_snapshots(run_dir, kind)
     selected: list[object] = []
 
-    def rebuilt_markdown(rubric: object, review: object, audit: object) -> str:
-        del rubric, audit
+    def rebuilt_markdown(
+        rubric: object, review: object, audit: object, **context: object
+    ) -> str:
+        del rubric, audit, context
         selected.append(review)
         return "# Rebuilt\n\n快照报告\n"
 

@@ -35,7 +35,7 @@ from paper_reviewer.application.models import ReportView, RunDetail, RunEvent
 from paper_reviewer.domain.review import ReviewFinding
 from paper_reviewer.domain.run import RunStatus
 from paper_reviewer.gui.icons import FluentIconService
-from paper_reviewer.gui.models import FindingsTableModel
+from paper_reviewer.gui.models import FindingsTableModel, provider_label
 from paper_reviewer.gui.theme import set_fluent_property
 from paper_reviewer.gui.widgets import MessageBar, PageHeader
 
@@ -542,10 +542,16 @@ class RunDetailPage(QWidget):
         self.run_id = detail.run.run_id
         self.run_dir = run_dir
         run = detail.run
+        provider_source = (
+            getattr(detail, "provider_snapshot", None)
+            or getattr(run, "provider_snapshot", None)
+            or detail
+        )
         self.completed_stages = set(run.completed_stages)
         self.stack.setCurrentWidget(self.progress_page)
         self.run_metadata.setText(
-            f"{Path(run.input_path).name} · {run.provider}/{run.model} · "
+            f"{Path(run.input_path).name} · "
+            f"{provider_label(run.provider, run.model, provider_source)} · "
             f"{run.rubric_id} · 状态：{_display_value(run.status)}"
         )
         self._update_stages(sorted(self.completed_stages), run.status)
@@ -608,6 +614,11 @@ class RunDetailPage(QWidget):
         self.run_id = report.run.run_id
         self.run_dir = run_dir
         self._report_input_path = report.run.input_path
+        provider_source = (
+            getattr(report, "provider_snapshot", None)
+            or getattr(report.run, "provider_snapshot", None)
+            or report
+        )
         self._set_export_buttons_enabled(True)
         self.stack.setCurrentWidget(self.report_page)
         title = (
@@ -617,7 +628,7 @@ class RunDetailPage(QWidget):
         )
         self.report_metadata.setText(
             f"{title} · {report.rubric.title} ({report.rubric.version}) · "
-            f"{report.run.provider}/{report.run.model}"
+            f"{provider_label(report.run.provider, report.run.model, provider_source)}"
         )
         self.overall_summary.setText(report.review.overall_summary)
         if report.evaluation is not None:

@@ -6,15 +6,16 @@ reviewers:
     description: Check the research question, reasoning, method selection, assumptions, and technical correctness.
     dimension_ids: []
     dimension_tags: [methods, correctness, reasoning]
-    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence]
+    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence, web_search]
     max_model_turns: 3
     max_tool_calls: 8
+
   - reviewer_id: experiments-reviewer
     title: Experiments and reproducibility reviewer
     description: Check experiment design, baselines, metrics, result support, limitations, and reproducibility.
     dimension_ids: []
     dimension_tags: [experiments, reproducibility, results]
-    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence]
+    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence, web_search]
     max_model_turns: 3
     max_tool_calls: 8
   - reviewer_id: novelty-reviewer
@@ -22,7 +23,6 @@ reviewers:
     description: Check positioning, significance, related work, novelty claims, and missing scholarly context.
     dimension_ids: []
     dimension_tags: [novelty, significance, related_work]
-    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence]
+    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence, web_search]
     max_model_turns: 3
     max_tool_calls: 8
-

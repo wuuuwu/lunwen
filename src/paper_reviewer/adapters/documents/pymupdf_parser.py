@@ -9,6 +9,22 @@ import pymupdf
 from paper_reviewer.domain.document import BlockType, DocumentBlock, DocumentInfo
 from paper_reviewer.ports.document_parser import ParsedDocument
 
+_REFERENCE_HEADING_PATTERN = re.compile(
+    r"^(?:references|bibliography|参考文献|参考资料)\s*$",
+    flags=re.IGNORECASE,
+)
+_NUMBERED_REFERENCE_PATTERN = re.compile(
+    r"^(?:(?:\[\d+\]|\uff3b\d+\uff3d|\d+[.、])\s*|\[?\d+\]?\s+)\S"
+)
+_BRACKETED_REFERENCE_PATTERN = re.compile(r"^(?:\[\d+\]|\uff3b\d+\uff3d)\s*\S")
+_REFERENCE_SIGNAL_PATTERN = re.compile(
+    r"(?<!\d)(?:19|20)\d{2}(?!\d)|\bdoi\b|"
+    r"(?:\[|\uff3b)(?:J|M|D|C|N|R|S|P|A|Z|EB/OL|DB/OL|CP/DK)(?:\]|\uff3d)",
+    flags=re.IGNORECASE,
+)
+_MIN_SHORT_BRACKETED_REFERENCE_LENGTH = 24
+_MIN_NUMBERED_REFERENCE_LENGTH = 61
+
 
 class UnsupportedDocumentError(ValueError):
     pass
@@ -76,15 +92,27 @@ def _sha256(path: Path) -> str:
 
 def _classify(text: str, *, y0: float, page_height: float) -> BlockType:
     stripped = text.strip()
+    if _REFERENCE_HEADING_PATTERN.fullmatch(stripped):
+        return BlockType.HEADING
+    if _is_numbered_reference(stripped):
+        return BlockType.REFERENCE
     if y0 < page_height * 0.18 and len(stripped) < 180 and "\n" not in stripped:
         return BlockType.TITLE
     if re.match(r"^(\d+(?:\.\d+)*)?\s*[A-Z][A-Za-z\s:&-]{2,80}$", stripped):
         return BlockType.HEADING
-    if re.match(r"^references\s*$", stripped, flags=re.IGNORECASE):
-        return BlockType.HEADING
-    if re.match(r"^\[?\d+\]?\s+", stripped) and len(stripped) > 60:
-        return BlockType.REFERENCE
     return BlockType.PARAGRAPH
+
+
+def _is_numbered_reference(text: str) -> bool:
+    if not _NUMBERED_REFERENCE_PATTERN.match(text):
+        return False
+    if len(text) >= _MIN_NUMBERED_REFERENCE_LENGTH:
+        return True
+    return (
+        len(text) >= _MIN_SHORT_BRACKETED_REFERENCE_LENGTH
+        and _BRACKETED_REFERENCE_PATTERN.match(text) is not None
+        and _REFERENCE_SIGNAL_PATTERN.search(text) is not None
+    )
 
 
 def _guess_title(blocks: list[DocumentBlock]) -> str | None:
