@@ -1,0 +1,43 @@
+profile_id: zhejiang-undergraduate-specialists
+version: "0.1.0-experimental"
+reviewers:
+  - reviewer_id: topic-specialist
+    title: 选题意义专项 Reviewer
+    description: 评价选题目的、专业培养目标适配和研究意义。
+    dimension_ids: [topic_purpose, research_significance]
+    dimension_tags: [topic]
+    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence]
+    max_model_turns: 3
+    max_tool_calls: 8
+  - reviewer_id: logic-specialist
+    title: 逻辑构建专项 Reviewer
+    description: 评价层次体系、论证结构以及论点与证据的衔接。
+    dimension_ids: [hierarchy_system, logical_structure]
+    dimension_tags: [logic]
+    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence]
+    max_model_turns: 3
+    max_tool_calls: 8
+  - reviewer_id: professional-specialist
+    title: 专业能力专项 Reviewer
+    description: 评价知识综合运用、分析解决问题能力和创新能力。
+    dimension_ids: [knowledge_application, problem_solving, innovation]
+    dimension_tags: [professional]
+    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence]
+    max_model_turns: 3
+    max_tool_calls: 8
+  - reviewer_id: academic-norms-specialist
+    title: 学术规范专项 Reviewer
+    description: 评价行文规范与引用规范。
+    dimension_ids: [writing_norms, citation_norms]
+    dimension_tags: [academic_norms]
+    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence]
+    max_model_turns: 3
+    max_tool_calls: 8
+  - reviewer_id: compliance-integrity-specialist
+    title: 合规与诚信专项 Reviewer
+    description: 只依据现有论文和外部证据筛查政治方向与学术诚信嫌疑，不作最终确认。
+    dimension_ids: []
+    dimension_tags: [compliance, integrity, hard_rule]
+    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence]
+    max_model_turns: 3
+    max_tool_calls: 8

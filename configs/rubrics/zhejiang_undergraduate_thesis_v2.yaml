@@ -1,0 +1,213 @@
+schema_version: "2"
+rubric_id: zhejiang-undergraduate-thesis-dual-advisory
+version: "0.1.0-experimental"
+title: 浙江省本科毕业论文 AI 辅助诊断与抽检风险评议（实验版）
+applicable_levels: [undergraduate]
+applicable_paper_types: [ordinary_thesis_pdf]
+evaluation_mode: dual_advisory
+experimental: true
+validation_notice: 未完成教育测量效度验证，不得用于自动处分、学位决定或正式抽检认定。
+
+policy_context:
+  source: 浙江省教育厅关于印发《浙江省本科毕业论文（设计）抽检实施细则（试行）》的通知
+  document_number: 浙教高教〔2023〕5号
+  effective_date: 2023-04-01
+  source_sha256: 1D493212DA108CB469D452B99D058ACE1F06C9767CC3CE011209C79F6F997794
+
+rating_scale:
+  minimum: 0
+  maximum: 4
+  integer_only: true
+  anchors: &rating_anchors
+    - label: 核心要求缺失
+      minimum: 0
+      maximum: 0
+      description: 核心要求缺失、严重不符合或没有可验证证据。
+    - label: 明显不足
+      minimum: 1
+      maximum: 1
+      description: 存在实质性缺陷，明显未达到相应要求。
+    - label: 基本达到
+      minimum: 2
+      maximum: 2
+      description: 基本达到本科最低要求，但仍有较明显不足。
+    - label: 充分达到
+      minimum: 3
+      maximum: 3
+      description: 充分达到要求，论证和证据较完整。
+    - label: 表现突出
+      minimum: 4
+      maximum: 4
+      description: 表现突出，明显高于一般本科要求。
+
+groups:
+  - group_id: topic_significance
+    title: 选题意义
+    description: 评价选题目的与研究意义。
+    weight: 20
+    dimensions: [topic_purpose, research_significance]
+  - group_id: logical_construction
+    title: 逻辑构建
+    description: 评价论文层次体系与逻辑结构。
+    weight: 20
+    dimensions: [hierarchy_system, logical_structure]
+  - group_id: professional_level
+    title: 专业水平
+    description: 评价知识综合运用、分析解决问题与创新能力。
+    weight: 40
+    dimensions: [knowledge_application, problem_solving, innovation]
+  - group_id: academic_norms
+    title: 学术规范
+    description: 评价行文和引用规范。
+    weight: 20
+    dimensions: [writing_norms, citation_norms]
+
+dimensions:
+  - dimension_id: topic_purpose
+    group_id: topic_significance
+    title: 选题目的
+    description: 符合专业培养目标，体现综合训练基本要求。
+    weight: 10
+    minimum_score: 0
+    maximum_score: 4
+    checks:
+      - 选题与所填专业名称及可选培养目标是否一致。
+      - 论文是否体现本科阶段综合训练的基本要求。
+    anchors: *rating_anchors
+    evidence_policy: &paper_evidence
+      paper_evidence_required: true
+      external_evidence_required: false
+      minimum_references: 1
+    reviewer_tags: [topic]
+  - dimension_id: research_significance
+    group_id: topic_significance
+    title: 研究意义
+    description: 面向专业、相关或交叉领域问题，或行业社会实际问题，具有一定理论或实用价值。
+    weight: 10
+    minimum_score: 0
+    maximum_score: 4
+    checks:
+      - 研究问题是否明确并具有专业关联。
+      - 理论价值或实际应用价值是否有可信论证。
+    anchors: *rating_anchors
+    evidence_policy: *paper_evidence
+    reviewer_tags: [topic]
+  - dimension_id: hierarchy_system
+    group_id: logical_construction
+    title: 层次体系
+    description: 体系完整、层次分明、重点突出。
+    weight: 10
+    minimum_score: 0
+    maximum_score: 4
+    checks:
+      - 章节体系是否完整并覆盖研究目标。
+      - 内容层次和重点安排是否清晰。
+    anchors: *rating_anchors
+    evidence_policy: *paper_evidence
+    reviewer_tags: [logic]
+  - dimension_id: logical_structure
+    group_id: logical_construction
+    title: 逻辑结构
+    description: 论点鲜明、论据确凿、论证充分，达到所在专业领域要求。
+    weight: 10
+    minimum_score: 0
+    maximum_score: 4
+    checks:
+      - 论点、论据与结论之间是否形成可追踪的论证链。
+      - 关键结论是否由充分证据支持。
+    anchors: *rating_anchors
+    evidence_policy: *paper_evidence
+    reviewer_tags: [logic]
+  - dimension_id: knowledge_application
+    group_id: professional_level
+    title: 综合应用知识能力
+    description: 合理运用相关领域基础理论、专业知识，体现所在专业领域的能力和素养。
+    weight: 10
+    minimum_score: 0
+    maximum_score: 4
+    checks:
+      - 基础理论和专业知识的选取与运用是否正确。
+      - 是否体现跨章节综合运用知识的能力。
+    anchors: *rating_anchors
+    evidence_policy: *paper_evidence
+    reviewer_tags: [professional]
+  - dimension_id: problem_solving
+    group_id: professional_level
+    title: 分析解决问题能力
+    description: 研究方法合理、论证分析严谨、数据记录规范，体现分析解决专业问题的能力。
+    weight: 20
+    minimum_score: 0
+    maximum_score: 4
+    checks:
+      - 研究方法与问题是否匹配且执行合理。
+      - 论证分析、数据记录与结论是否严谨一致。
+    anchors: *rating_anchors
+    evidence_policy: *paper_evidence
+    reviewer_tags: [professional]
+  - dimension_id: innovation
+    group_id: professional_level
+    title: 创新能力
+    description: 发现新问题、阐明新观点、创新应用经典理论，或阐释对实践的指导意义。
+    weight: 10
+    minimum_score: 0
+    maximum_score: 4
+    checks:
+      - 创新或实践贡献的边界是否陈述清楚。
+      - 创新主张是否有论文证据且不过度外推。
+    anchors: *rating_anchors
+    evidence_policy: *paper_evidence
+    reviewer_tags: [professional]
+  - dimension_id: writing_norms
+    group_id: academic_norms
+    title: 行文规范
+    description: 文字表达、书写格式、图表、公式符号、缩略词等符合通行学术规范。
+    weight: 10
+    minimum_score: 0
+    maximum_score: 4
+    checks:
+      - 文字、图表、公式、符号和缩略词是否规范一致。
+      - 摘要、正文、附录等结构是否符合一般学术写作要求。
+    anchors: *rating_anchors
+    evidence_policy: *paper_evidence
+    reviewer_tags: [academic_norms]
+  - dimension_id: citation_norms
+    group_id: academic_norms
+    title: 引用规范
+    description: 资料引证、参考文献符合通行学术规范及知识产权规定。
+    weight: 10
+    minimum_score: 0
+    maximum_score: 4
+    checks:
+      - 正文引文与参考文献是否对应且格式一致。
+      - 他人成果、数据和材料是否有明确来源标注。
+    anchors: *rating_anchors
+    evidence_policy: *paper_evidence
+    reviewer_tags: [academic_norms]
+
+hard_rules:
+  - rule_id: political_direction
+    description: 疑似存在违背政策法规、社会主义核心价值观、立德树人要求或社会公序良俗的内容。
+    outcome: 人工确认后触发存在问题风险
+    evidence_required: true
+    requires_human_confirmation: true
+    ai_allowed_statuses: [not_detected, suspected, not_assessable]
+  - rule_id: academic_integrity
+    description: 疑似存在抄袭、剽窃、伪造、篡改、买卖、代写等学术不端行为。
+    outcome: 人工确认后触发存在问题风险
+    evidence_required: true
+    requires_human_confirmation: true
+    ai_allowed_statuses: [not_detected, suspected, not_assessable]
+
+panel_strategy:
+  initial_reviewers: 3
+  initial_unqualified_threshold: 2
+  supplemental_reviewers: 2
+  supplemental_unqualified_threshold: 1
+  supplemental_trigger: 首轮恰好 1 人不合格时追加 2 名独立复评专家
+  unable_to_assess: 转入人工面板复核
+
+aggregation:
+  method: weighted_rating
+  passing_score: null
+  maximum_total: 100
+scoring_enabled: true

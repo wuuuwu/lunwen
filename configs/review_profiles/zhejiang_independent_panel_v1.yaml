@@ -1,0 +1,24 @@
+profile_id: zhejiang-independent-panel
+version: "0.1.0-experimental"
+reviewers:
+  - &panel_expert
+    reviewer_id: initial-panel-expert-1
+    title: 初评独立专家一
+    description: 独立完整评阅论文全部指标并给出合格、不合格或无法判断意见。
+    dimension_ids: [topic_purpose, research_significance, hierarchy_system, logical_structure, knowledge_application, problem_solving, innovation, writing_norms, citation_norms]
+    dimension_tags: []
+    allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence]
+    max_model_turns: 3
+    max_tool_calls: 8
+  - <<: *panel_expert
+    reviewer_id: initial-panel-expert-2
+    title: 初评独立专家二
+  - <<: *panel_expert
+    reviewer_id: initial-panel-expert-3
+    title: 初评独立专家三
+  - <<: *panel_expert
+    reviewer_id: supplemental-panel-expert-1
+    title: 复评独立专家一
+  - <<: *panel_expert
+    reviewer_id: supplemental-panel-expert-2
+    title: 复评独立专家二

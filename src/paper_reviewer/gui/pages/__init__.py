@@ -1,0 +1,2 @@
+"""Desktop application pages."""
+

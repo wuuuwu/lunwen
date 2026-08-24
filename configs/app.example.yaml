@@ -1,0 +1,10 @@
+database_url: sqlite+aiosqlite:///./paper-reviewer.db
+runs_dir: ./runs
+request_timeout_seconds: 120
+external_timeout_seconds: 20
+max_model_turns: 3
+max_tool_calls: 8
+max_output_repairs: 2
+reviewer_concurrency: 3
+trace_content: false
+
