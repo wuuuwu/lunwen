@@ -357,9 +357,35 @@ def test_hard_rule_review_requires_reviewer_and_reason_and_emits_resolve_then_re
     assert resolved[0][0] == "rule-run"
     assert resolved[0][1]["rule_id"] == "integrity-1"
     assert resolved[0][1]["confirmed"] is False
-    assert resumed == ["rule-run"]
-    assert "已提交" in page.hard_rule_list.item(0).text()
+    assert resumed == []
+    assert page._review_busy
     assert "第 3 页" in page.hard_rule_detail.toPlainText()
+
+
+def test_report_page_shows_post_review_panel_task(
+    qapp: QApplication, qtbot: object
+) -> None:
+    theme = FluentThemeManager(qapp)
+    page = RunDetailPage(FluentIconService(theme))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    submitted: list[tuple[str, object]] = []
+    page.panel_review_resolution_requested.connect(
+        lambda run_id, decision: submitted.append((run_id, decision))
+    )
+    page.prepare_run("panel-run")
+    page.stack.setCurrentWidget(page.report_page)
+    page._show_hard_rule_review(
+        [],
+        panel_review_required=True,
+        panel_review_detail="专家一无法判断，需要人工面板复核。",
+    )
+    page.hard_rule_reviewer_input.setText("教师甲")
+    page.hard_rule_reason_input.setPlainText("已结合完整报告进行人工面板评议。")
+    page.confirm_rule_button.click()
+
+    assert submitted[0][0] == "panel-run"
+    assert submitted[0][1]["outcome"] == "risk_triggered"
+    assert page.hard_rule_review_frame.parent() is page.report_content
 
 
 def test_hard_rule_busy_state_blocks_duplicate_submission(

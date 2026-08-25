@@ -39,3 +39,12 @@ def test_dual_advisory_happy_path_transitions() -> None:
 def test_hard_rule_gate_cannot_skip_directly_to_report() -> None:
     with pytest.raises(InvalidTransitionError):
         transition(RunStatus.AWAITING_HARD_RULE_CONFIRMATION, RunStatus.REPORTED)
+
+
+def test_generated_report_can_wait_for_human_review_then_finalize() -> None:
+    pending = transition(
+        RunStatus.VALIDATING,
+        RunStatus.REPORTED_PENDING_HUMAN_REVIEW,
+    )
+    assert pending is RunStatus.REPORTED_PENDING_HUMAN_REVIEW
+    assert transition(pending, RunStatus.REPORTED) is RunStatus.REPORTED

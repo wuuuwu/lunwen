@@ -36,7 +36,7 @@ from paper_reviewer.application.models import (
     RunEvent,
 )
 from paper_reviewer.application.service import ReviewApplicationService
-from paper_reviewer.domain.review import HumanRuleDecision
+from paper_reviewer.domain.review import HumanPanelDecision, HumanRuleDecision
 from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.gui.icons import FluentIconService
 from paper_reviewer.gui.models import (
@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
         "synthesizing": "正在汇总评测结果",
         "meta_reviewing": "正在生成 Meta 评语",
         "validating": "正在验证并生成报告",
+        "reported_pending_human_review": "评测完成 · 待人工复核",
         "reported": "评测已完成",
         "retryable_failure": "评测失败，可恢复",
         "fatal_failure": "评测失败，需要处理",
@@ -216,6 +217,9 @@ class MainWindow(QMainWindow):
         self.run_detail_page.hard_rule_resolution_requested.connect(
             self.resolve_hard_rule_and_resume
         )
+        self.run_detail_page.panel_review_resolution_requested.connect(
+            self.resolve_panel_review_and_refresh
+        )
 
         status = QStatusBar()
         self.global_status = QLabel("就绪")
@@ -300,7 +304,7 @@ class MainWindow(QMainWindow):
         self.global_status.setText("正在恢复评测")
 
     def resolve_hard_rule_and_resume(self, run_id: str, value: object) -> None:
-        """Persist one human decision, then resume only after every rule is resolved."""
+        """Persist one post-report decision and refresh deterministic artifacts."""
 
         if self._review_worker is not None and self._review_worker.isRunning():
             return
@@ -310,18 +314,36 @@ class MainWindow(QMainWindow):
             self.run_detail_page.message.show_message(str(error), severity="danger")
             return
 
-        async def operation(emit: EventEmitter) -> RunRecord:
+        async def operation(_emit: EventEmitter) -> RunRecord:
             await self.service.resolve_hard_rule(run_id, decision)
-            if await self.service.get_pending_hard_rules(run_id):
-                return (await self.service.get_run(run_id)).run
-            return await self.service.resume_after_human_review(run_id, event_sink=emit)
+            return (await self.service.get_run(run_id)).run
 
         self._active_run_id = run_id
-        self._active_run_status = "awaiting_hard_rule_confirmation"
+        self._active_run_status = "reported_pending_human_review"
         self.preferences.active_run_id = run_id
         self._save_preferences()
         self._start_review_worker(operation)
-        self.global_status.setText("正在保存人工复核决定")
+        self.global_status.setText("正在保存人工复核决定并更新报告")
+
+    def resolve_panel_review_and_refresh(self, run_id: str, value: object) -> None:
+        if self._review_worker is not None and self._review_worker.isRunning():
+            return
+        try:
+            decision = HumanPanelDecision.model_validate(value)
+        except ValueError as error:
+            self.run_detail_page.message.show_message(str(error), severity="danger")
+            return
+
+        async def operation(_emit: EventEmitter) -> RunRecord:
+            await self.service.resolve_panel_review(run_id, decision)
+            return (await self.service.get_run(run_id)).run
+
+        self._active_run_id = run_id
+        self._active_run_status = "reported_pending_human_review"
+        self.preferences.active_run_id = run_id
+        self._save_preferences()
+        self._start_review_worker(operation)
+        self.global_status.setText("正在保存人工面板结论并更新报告")
 
     def _start_review_worker(self, operation: AsyncOperation) -> None:
         worker = AsyncTaskThread(operation)
@@ -385,7 +407,10 @@ class MainWindow(QMainWindow):
 
         async def operation(_emit: EventEmitter) -> object:
             detail = await self.service.get_run(run_id)
-            if detail.run.status is RunStatus.REPORTED:
+            if detail.run.status in {
+                RunStatus.REPORTED,
+                RunStatus.REPORTED_PENDING_HUMAN_REVIEW,
+            }:
                 return await self.service.load_report(run_id)
             return detail
 
@@ -515,6 +540,13 @@ class MainWindow(QMainWindow):
         self.refresh_runs()
 
     def _review_failed(self, message: str, _trace: str) -> None:
+        if self._active_run_status == "reported_pending_human_review":
+            self.run_detail_page.show_human_review_error(self._active_run_id, message)
+            self._set_global_status(
+                "reported_pending_human_review",
+                fallback="人工复核保存失败，需要处理",
+            )
+            return
         self.new_review_page.show_run_error(message)
         self._set_global_status("retryable_failure", fallback="评测失败，需要处理")
         if self._active_run_id:

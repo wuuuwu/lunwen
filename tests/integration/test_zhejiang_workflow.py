@@ -18,9 +18,10 @@ from paper_reviewer.adapters.persistence.repositories import (
     RunRepository,
 )
 from paper_reviewer.application.orchestrator import ReviewOrchestrator
+from paper_reviewer.application.service import ReviewApplicationService
 from paper_reviewer.config import Settings, load_review_profile, load_rubric
 from paper_reviewer.domain.document import DocumentBlock, DocumentInfo
-from paper_reviewer.domain.review import HumanRuleDecision
+from paper_reviewer.domain.review import HumanPanelDecision, HumanRuleDecision
 from paper_reviewer.domain.run import RunStatus
 from paper_reviewer.ports.document_parser import ParsedDocument
 from paper_reviewer.ports.model import ModelRequest, ModelResponse
@@ -62,9 +63,15 @@ class ZhejiangFixtureModel:
         "compliance-integrity-specialist": [],
     }
 
-    def __init__(self, *, suspect_integrity: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        suspect_integrity: bool = False,
+        panel_unable: bool = False,
+    ) -> None:
         self.trace_ids: list[str] = []
         self.suspect_integrity = suspect_integrity
+        self.panel_unable = panel_unable
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         self.trace_ids.append(request.trace_id)
@@ -88,8 +95,16 @@ class ZhejiangFixtureModel:
                     {
                         "expert_id": expert_id,
                         "round": round_name,
-                        "verdict": "qualified",
-                        "rationale": "未发现已有重大问题足以支持不合格意见。",
+                        "verdict": (
+                            "unable_to_assess"
+                            if self.panel_unable and expert_id.endswith("1")
+                            else "qualified"
+                        ),
+                        "rationale": (
+                            "现有专业材料不足，无法可靠判断。"
+                            if self.panel_unable and expert_id.endswith("1")
+                            else "未发现已有重大问题足以支持不合格意见。"
+                        ),
                         "finding_ids": [],
                         "confidence": 0.5,
                     },
@@ -233,7 +248,9 @@ async def test_bundled_zhejiang_v2_completes_full_dual_advisory_flow(
 
 
 @pytest.mark.asyncio
-async def test_confirmed_hard_rule_pauses_then_overrides_panel_votes(tmp_path: Path) -> None:
+async def test_hard_rule_review_is_deferred_until_report_then_overrides_votes(
+    tmp_path: Path,
+) -> None:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{(tmp_path / 'review.db').as_posix()}",
         runs_dir=tmp_path / "runs",
@@ -272,8 +289,13 @@ async def test_confirmed_hard_rule_pauses_then_overrides_panel_votes(tmp_path: P
         discipline_name="计算机科学与技术",
         cloud_processing_authorized=True,
     )
-    assert run.status is RunStatus.AWAITING_HARD_RULE_CONFIRMATION
-    assert not any(":panel:" in trace_id for trace_id in model.trace_ids)
+    assert run.status is RunStatus.REPORTED_PENDING_HUMAN_REVIEW
+    assert len([trace_id for trace_id in model.trace_ids if ":panel:" in trace_id]) == 3
+    pending_markdown = (settings.runs_dir / run.run_id / "report.md").read_text(
+        encoding="utf-8"
+    )
+    assert "AI 评测已完成" in pending_markdown
+    assert "人工复核尚未完成，当前风险结论待定" in pending_markdown
 
     decision = HumanRuleDecision(
         rule_id="academic_integrity",
@@ -283,15 +305,13 @@ async def test_confirmed_hard_rule_pauses_then_overrides_panel_votes(tmp_path: P
         decided_at="2026-08-23T10:00:00+08:00",
     )
     await reviews.hard_rules.save_human_rule_decision(run.run_id, decision)
-    resumed = await orchestrator.execute(
-        run,
-        rubric=rubric,
-        profile=profile,
-        panel_profile=panel_profile,
-    )
+    calls = len(model.trace_ids)
+    service = ReviewApplicationService.__new__(ReviewApplicationService)
+    service.settings = settings
+    resumed = await service.refresh_after_human_review(run.run_id)
 
     assert resumed.status is RunStatus.REPORTED
-    assert not any(":panel:" in trace_id for trace_id in model.trace_ids)
+    assert len(model.trace_ids) == calls
     evaluation = json.loads(
         (settings.runs_dir / run.run_id / "evaluation-report.json").read_text(
             encoding="utf-8"
@@ -300,4 +320,75 @@ async def test_confirmed_hard_rule_pauses_then_overrides_panel_votes(tmp_path: P
     assert evaluation["diagnostic_score"]["total_score"] == 50
     assert evaluation["panel_decision"]["outcome"] == "risk_triggered"
     assert evaluation["panel_decision"]["decisive_rule_ids"] == ["academic_integrity"]
+    final_markdown = (settings.runs_dir / run.run_id / "report.md").read_text(
+        encoding="utf-8"
+    )
+    assert "人工复核尚未完成，当前风险结论待定" not in final_markdown
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unable_panel_is_deferred_until_report_and_resolved_locally(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{(tmp_path / 'review.db').as_posix()}",
+        runs_dir=tmp_path / "runs",
+    )
+    engine = create_engine(settings.database_url)
+    await initialize_database(engine)
+    sessions = create_session_factory(engine)
+    model = ZhejiangFixtureModel(panel_unable=True)
+    orchestrator = ReviewOrchestrator(
+        settings=settings,
+        model=model,
+        parser=ZhejiangFixtureParser(),
+        run_repository=RunRepository(sessions),
+        document_repository=DocumentRepository(sessions),
+        evidence_repository=EvidenceRepository(sessions),
+        review_repository=ReviewRepository(sessions),
+    )
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(b"fixture")
+    rubric = load_rubric(Path("configs/rubrics/zhejiang_undergraduate_thesis_v2.yaml"))
+    profile = load_review_profile(
+        Path("configs/review_profiles/zhejiang_undergraduate_specialists_v1.yaml")
+    )
+    panel_profile = load_review_profile(
+        Path("configs/review_profiles/zhejiang_independent_panel_v1.yaml")
+    )
+
+    run = await orchestrator.create_and_execute(
+        input_path=paper,
+        rubric=rubric,
+        profile=profile,
+        panel_profile=panel_profile,
+        provider="fake",
+        model_name="fake",
+        discipline_name="计算机科学与技术",
+        cloud_processing_authorized=True,
+    )
+
+    assert run.status is RunStatus.REPORTED_PENDING_HUMAN_REVIEW
+    assert "meta" in run.completed_stages
+    assert "report" in run.completed_stages
+    calls = len(model.trace_ids)
+    service = ReviewApplicationService.__new__(ReviewApplicationService)
+    service.settings = settings
+    summary = await service.get_pending_human_reviews(run.run_id)
+    assert summary.panel_review_required
+    await service.resolve_panel_review(
+        run.run_id,
+        HumanPanelDecision(
+            outcome="risk_not_triggered",
+            reviewer="人工专家组",
+            rationale="专家组结合论文和完整 AI 报告后认为未触发风险。",
+            decided_at="2026-08-25T12:00:00+08:00",
+        ),
+    )
+
+    resolved = await RunRepository(sessions).get(run.run_id)
+    assert resolved is not None
+    assert resolved.status is RunStatus.REPORTED
+    assert len(model.trace_ids) == calls
     await engine.dispose()

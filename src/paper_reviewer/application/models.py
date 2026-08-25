@@ -12,6 +12,8 @@ from paper_reviewer.domain.provider import ModelApiProtocol
 from paper_reviewer.domain.review import (
     EvaluationReport,
     HardRuleAssessment,
+    HumanPanelDecision,
+    HumanReviewSummary,
     HumanRuleDecision,
     MetaReview,
 )
@@ -141,6 +143,8 @@ class RunDetail(BaseModel):
     events: list[RunEvent] = Field(default_factory=list)
     pending_hard_rules: list[HardRuleAssessment] = Field(default_factory=list)
     human_rule_decisions: list[HumanRuleDecision] = Field(default_factory=list)
+    human_review_summary: HumanReviewSummary = Field(default_factory=HumanReviewSummary)
+    human_panel_decision: HumanPanelDecision | None = None
 
 
 class ReportView(BaseModel):
@@ -156,3 +160,6 @@ class ReportView(BaseModel):
     report_markdown: Path
     report_json: Path
     evaluation: EvaluationReport | None = None
+    human_review_summary: HumanReviewSummary = Field(default_factory=HumanReviewSummary)
+    pending_hard_rules: list[HardRuleAssessment] = Field(default_factory=list)
+    human_panel_decision: HumanPanelDecision | None = None

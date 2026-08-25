@@ -52,6 +52,7 @@ class RunDetailPage(QWidget):
     cancel_requested = Signal(str)
     resume_requested = Signal(str)
     hard_rule_resolution_requested = Signal(str, object)
+    panel_review_resolution_requested = Signal(str, object)
     resume_after_human_review_requested = Signal(str)
     report_export_requested = Signal(str, str, str, bool)
 
@@ -60,7 +61,6 @@ class RunDetailPage(QWidget):
         ("evidence", "收集外部证据"),
         ("scoring", "专业化评分"),
         ("audit", "确定性审计"),
-        ("hard_rules", "否决项人工复核"),
         ("panel", "独立专家面板"),
         ("meta", "Meta 评语"),
         ("report", "报告验证与生成"),
@@ -102,6 +102,8 @@ class RunDetailPage(QWidget):
         self.run_dir: Path | None = None
         self.completed_stages: set[str] = set()
         self._pending_hard_rules: list[Any] = []
+        self._panel_review_required = False
+        self._panel_review_detail = ""
         self._submitted_hard_rules: set[str] = set()
         self._operation_threads: list[Any] = []
         self._review_busy = False
@@ -183,6 +185,8 @@ class RunDetailPage(QWidget):
         self.run_dir = run_dir
         self.completed_stages.clear()
         self._pending_hard_rules = []
+        self._panel_review_required = False
+        self._panel_review_detail = ""
         self._submitted_hard_rules.clear()
         self.stack.setCurrentWidget(self.progress_page)
         self.run_metadata.setText(
@@ -225,32 +229,35 @@ class RunDetailPage(QWidget):
         review_layout = QVBoxLayout(self.hard_rule_review_frame)
         review_layout.setContentsMargins(16, 16, 16, 16)
         review_layout.setSpacing(12)
-        title = QLabel("否决项人工复核")
+        title = QLabel("评测完成后的人工复核")
         title.setProperty("fluentType", "sectionTitle")
-        hint = QLabel("AI 只能提出嫌疑，不能自动确认。逐项填写复核人和理由后提交。")
+        hint = QLabel(
+            "AI 评测和报告已经完成。请逐项核对否决项或人工面板待办，"
+            "填写复核人和理由后提交；保存过程不会再次调用模型。"
+        )
         hint.setProperty("fluentType", "secondary")
         hint.setWordWrap(True)
         self.hard_rule_list = QListWidget()
         self.hard_rule_list.setObjectName("pendingHardRules")
-        self.hard_rule_list.setAccessibleName("待人工复核的否决项")
+        self.hard_rule_list.setAccessibleName("评测完成后的人工复核待办")
         self._show_list_rows(self.hard_rule_list, 3)
         self.hard_rule_list.currentRowChanged.connect(self._hard_rule_selected)
         self.hard_rule_detail = QPlainTextEdit()
         self.hard_rule_detail.setObjectName("hardRuleEvidenceDetail")
         self.hard_rule_detail.setReadOnly(True)
-        self.hard_rule_detail.setAccessibleName("否决项规则和证据详情")
+        self.hard_rule_detail.setAccessibleName("人工复核规则、专家意见和证据详情")
         self._show_text_lines(self.hard_rule_detail, 9)
         self.hard_rule_reviewer_input = QLineEdit()
         self.reviewer_input = self.hard_rule_reviewer_input
         self.hard_rule_reviewer_input.setObjectName("hardRuleReviewer")
         self.hard_rule_reviewer_input.setPlaceholderText("复核人（必填）")
-        self.hard_rule_reviewer_input.setAccessibleName("否决项复核人，必填")
+        self.hard_rule_reviewer_input.setAccessibleName("人工复核人，必填")
         self.hard_rule_reviewer_input.textChanged.connect(self._update_review_actions)
         self.hard_rule_reason_input = QPlainTextEdit()
         self.reason_input = self.hard_rule_reason_input
         self.hard_rule_reason_input.setObjectName("hardRuleReviewReason")
         self.hard_rule_reason_input.setPlaceholderText("复核理由（必填，可记录线下检测报告结论）")
-        self.hard_rule_reason_input.setAccessibleName("否决项复核理由，必填")
+        self.hard_rule_reason_input.setAccessibleName("人工复核理由，必填")
         self._show_text_lines(self.hard_rule_reason_input, 5)
         self.hard_rule_reason_input.textChanged.connect(self._update_review_actions)
         self.hard_rule_error = QLabel()
@@ -310,7 +317,6 @@ class RunDetailPage(QWidget):
             self.run_metadata,
             self.stage_progress,
             self.stage_list,
-            self.hard_rule_review_frame,
             self.events,
         )
         for progress_widget in progress_widgets:
@@ -514,6 +520,7 @@ class RunDetailPage(QWidget):
         actions.addStretch(1)
         report_widgets: tuple[QWidget, ...] = (
             self.report_metadata,
+            self.hard_rule_review_frame,
             self.overall_summary,
             self.score_frame,
             self.unscored_message,
@@ -561,14 +568,28 @@ class RunDetailPage(QWidget):
         self.events.setPlainText("\n".join(event.message for event in detail.events))
         self.cancel_button.setVisible(self._is_active_status(run.status))
         self.resume_button.setVisible(
-            _status_value(run.status) in {"retryable_failure", "cancelled"}
+            _status_value(run.status)
+            in {
+                "retryable_failure",
+                "cancelled",
+                "awaiting_hard_rule_confirmation",
+                "awaiting_panel_review",
+            }
         )
         pending = _first(detail, "pending_hard_rules", "hard_rule_assessments", "hard_rules")
         self._show_hard_rule_review(_pending_items(pending))
         status = _status_value(run.status)
         if status == "awaiting_hard_rule_confirmation":
             self.message.show_message(
-                "评分和审计已完成，等待逐项人工处理否决项后继续。", severity="warning"
+                "这是旧版流程留下的中间门禁。点击“恢复评测”可先完成专家面板、"
+                "Meta Review 和报告，人工复核将在报告页处理。",
+                severity="warning",
+            )
+        elif status == "awaiting_panel_review":
+            self.message.show_message(
+                "这是旧版流程留下的人工面板门禁。点击“恢复评测”可先生成完整报告，"
+                "随后在报告页处理人工复核。",
+                severity="warning",
             )
         elif status in {"retryable_failure", "fatal_failure"}:
             recovery = (
@@ -614,6 +635,7 @@ class RunDetailPage(QWidget):
 
     def show_report(self, report: ReportView, *, run_dir: Path) -> None:
         self._reset_report_context(True)
+        self._set_review_busy(False)
         self.run_id = report.run.run_id
         self.run_dir = run_dir
         self._report_input_path = report.run.input_path
@@ -658,6 +680,19 @@ class RunDetailPage(QWidget):
                 "当前 Rubric 仅提供评语，不生成分数。", severity="info"
             )
         self._render_policy_report(report)
+        review_summary = _first(report, "human_review_summary")
+        panel_review_required = bool(
+            _first(review_summary, "panel_review_required", default=False)
+        )
+        pending_rules = _pending_items(
+            _first(report, "pending_hard_rules", default=[])
+        )
+        evaluation_source = _first(report, "evaluation", default=report)
+        self._show_hard_rule_review(
+            pending_rules,
+            panel_review_required=panel_review_required,
+            panel_review_detail=_format_panel_review_detail(evaluation_source),
+        )
         self.findings_model.set_items(report.review.findings)
         self.findings.resizeColumnsToContents()
         if report.review.findings:
@@ -684,7 +719,15 @@ class RunDetailPage(QWidget):
             )
         self.notes.setPlainText("\n\n".join(notes) or "没有额外的分歧、人工核查或审计说明。")
         self._scroll_to_top(self.report_scroll)
-        self.message.clear()
+        if pending_rules or panel_review_required:
+            pending_count = len(pending_rules) + int(panel_review_required)
+            self.message.show_message(
+                f"AI 评测和报告已完成，仍有 {pending_count} 项人工复核。"
+                "当前风险结论待定，但可以导出带待定标记的报告。",
+                severity="warning",
+            )
+        else:
+            self.message.clear()
 
     def _icon_or_null(self, name: str) -> QIcon:
         """Return a theme icon while allowing optional packaged icons to lag."""
@@ -1025,7 +1068,7 @@ class RunDetailPage(QWidget):
             "scoring": "scoring",
             "reviewing": "scoring",
             "auditing": "audit",
-            "awaiting_hard_rule_confirmation": "hard_rules",
+            "awaiting_hard_rule_confirmation": "panel",
             "panel_reviewing": "panel",
             "supplemental_reviewing": "panel",
             "awaiting_panel_review": "panel",
@@ -1061,8 +1104,16 @@ class RunDetailPage(QWidget):
             len(set(completed).intersection({stage for stage, _ in self.STAGES}))
         )
 
-    def _show_hard_rule_review(self, rules: list[Any]) -> None:
+    def _show_hard_rule_review(
+        self,
+        rules: list[Any],
+        *,
+        panel_review_required: bool = False,
+        panel_review_detail: str = "",
+    ) -> None:
         self._pending_hard_rules = rules
+        self._panel_review_required = panel_review_required
+        self._panel_review_detail = panel_review_detail
         self.hard_rule_list.blockSignals(True)
         self.hard_rule_list.clear()
         for rule in rules:
@@ -1086,9 +1137,20 @@ class RunDetailPage(QWidget):
                 )
             )
             self.hard_rule_list.addItem(item)
+        if panel_review_required:
+            item = QListWidgetItem("待复核 · 专家面板无法判断")
+            item.setData(Qt.ItemDataRole.UserRole, {"kind": "panel_review"})
+            item.setToolTip("专家面板无法判断，需要人工给出最终风险结论")
+            item.setData(
+                Qt.ItemDataRole.AccessibleTextRole,
+                "专家面板无法判断，状态：待人工复核",
+            )
+            item.setIcon(self.icons.icon("warning", color_role="warning_foreground"))
+            self.hard_rule_list.addItem(item)
         self.hard_rule_list.blockSignals(False)
-        self.hard_rule_review_frame.setVisible(bool(rules))
-        if rules:
+        has_reviews = bool(rules) or panel_review_required
+        self.hard_rule_review_frame.setVisible(has_reviews)
+        if has_reviews:
             self.hard_rule_list.setCurrentRow(0)
         else:
             self.hard_rule_detail.clear()
@@ -1098,6 +1160,20 @@ class RunDetailPage(QWidget):
         if 0 <= row < len(self._pending_hard_rules):
             self.hard_rule_detail.setPlainText(_format_hard_detail(self._pending_hard_rules[row]))
             self.hard_rule_error.clear()
+            self.confirm_rule_button.setText("确认成立")
+            self.dismiss_rule_button.setText("确认不成立")
+            self.confirm_rule_button.setAccessibleName("确认否决项成立")
+            self.dismiss_rule_button.setAccessibleName("确认否决项不成立")
+        elif self._panel_review_required and row == len(self._pending_hard_rules):
+            self.hard_rule_detail.setPlainText(
+                self._panel_review_detail
+                or "至少一名 AI 专家无法完成判断，请人工面板结合完整报告给出结论。"
+            )
+            self.hard_rule_error.clear()
+            self.confirm_rule_button.setText("触发风险")
+            self.dismiss_rule_button.setText("未触发风险")
+            self.confirm_rule_button.setAccessibleName("人工面板确认触发风险")
+            self.dismiss_rule_button.setAccessibleName("人工面板确认未触发风险")
         else:
             self.hard_rule_detail.clear()
         self._update_review_actions()
@@ -1118,8 +1194,9 @@ class RunDetailPage(QWidget):
         row = self.hard_rule_list.currentRow()
         reviewer = self.hard_rule_reviewer_input.text().strip()
         reason = self.hard_rule_reason_input.toPlainText().strip()
-        if row < 0 or row >= len(self._pending_hard_rules):
-            self.hard_rule_error.setText("请选择需要处理的否决项。")
+        item_count = len(self._pending_hard_rules) + int(self._panel_review_required)
+        if row < 0 or row >= item_count:
+            self.hard_rule_error.setText("请选择需要处理的人工复核待办。")
             return
         if not reviewer:
             self.hard_rule_error.setText("请填写复核人。")
@@ -1129,6 +1206,26 @@ class RunDetailPage(QWidget):
             self.hard_rule_error.setText("请填写复核理由。")
             self.hard_rule_reason_input.setFocus()
             return
+        if row == len(self._pending_hard_rules) and self._panel_review_required:
+            panel_decision_payload: dict[str, object] = {
+                "outcome": "risk_triggered" if confirmed else "risk_not_triggered",
+                "reviewer": reviewer,
+                "rationale": reason,
+                "decided_at": datetime.now(UTC),
+            }
+            self._set_review_busy(True)
+            self.hard_rule_error.setText("正在保存人工面板结论并更新报告…")
+            self.panel_review_resolution_requested.emit(
+                self.run_id, panel_decision_payload
+            )
+            if self.service is not None:
+                self._invoke_service(
+                    "resolve_panel_review",
+                    (self.run_id, panel_decision_payload),
+                    lambda _value: self._mark_panel_submitted(confirmed),
+                )
+            return
+
         rule = self._pending_hard_rules[row]
         rule_id = str(_first(rule, "rule_id", "id", default=f"rule-{row}"))
         decision: dict[str, object] = {
@@ -1144,11 +1241,9 @@ class RunDetailPage(QWidget):
         }
         self._submitted_hard_rules.add(rule_id)
         self._set_review_busy(True)
-        self.hard_rule_error.setText("正在保存人工决定并恢复评测…")
+        self.hard_rule_error.setText("正在保存人工决定并更新报告…")
         self.hard_rule_resolution_requested.emit(self.run_id, decision)
         if self.service is None:
-            self.resume_after_human_review_requested.emit(self.run_id)
-            self._mark_rule_submitted(rule_id, confirmed)
             return
         self._invoke_service(
             "resolve_hard_rule",
@@ -1157,16 +1252,12 @@ class RunDetailPage(QWidget):
         )
 
     def _after_resolved(self, rule_id: str, confirmed: bool) -> None:
-        self._invoke_service(
-            "resume_after_human_review",
-            (self.run_id,),
-            lambda _value: self._mark_rule_submitted(rule_id, confirmed),
-        )
+        self._mark_rule_submitted(rule_id, confirmed)
 
     def _mark_rule_submitted(self, rule_id: str, confirmed: bool) -> None:
         self._set_review_busy(False)
         self.hard_rule_error.setText(
-            f"已保存：{rule_id} · {'确认成立' if confirmed else '确认不成立'}。评测将从检查点继续。"
+            f"已保存：{rule_id} · {'确认成立' if confirmed else '确认不成立'}。报告已更新。"
         )
         item = self.hard_rule_list.currentItem()
         if item is not None:
@@ -1176,6 +1267,15 @@ class RunDetailPage(QWidget):
                 Qt.ItemDataRole.AccessibleTextRole,
                 f"{item.toolTip()}，状态：已提交",
             )
+
+    def _mark_panel_submitted(self, triggered: bool) -> None:
+        self._set_review_busy(False)
+        conclusion = "触发风险" if triggered else "未触发风险"
+        self.hard_rule_error.setText(f"已保存人工面板结论：{conclusion}。报告已更新。")
+        item = self.hard_rule_list.currentItem()
+        if item is not None:
+            item.setText(f"已提交 · 人工面板结论：{conclusion}")
+            item.setIcon(self.icons.icon("check", color_role="success_foreground"))
 
     def _set_review_busy(self, busy: bool) -> None:
         self._review_busy = busy
@@ -1224,6 +1324,10 @@ class RunDetailPage(QWidget):
         self._set_review_busy(False)
         self.hard_rule_error.setText(f"保存人工决定失败：{message}")
         self.message.show_message(f"人工复核未保存：{message}", severity="danger")
+
+    def show_human_review_error(self, run_id: str, message: str) -> None:
+        if run_id == self.run_id:
+            self._service_failed(message)
 
     def _forget_operation(self, worker: Any) -> None:
         if worker in self._operation_threads:
@@ -1464,6 +1568,28 @@ def _format_hard_report(assessments: Any, decisions: Any) -> str:
                 + (f" · 时间：{decided_at}" if decided_at else "")
             )
     return "\n".join(lines) or "暂无结构化否决项数据。"
+
+
+def _format_panel_review_detail(source: Any) -> str:
+    opinions = _first(source, "expert_opinions", "opinions", default=[])
+    if not isinstance(opinions, Sequence) or isinstance(opinions, (str, bytes)):
+        opinions = [opinions] if opinions else []
+    unable = [
+        item
+        for item in opinions
+        if _status_value(_first(item, "verdict", "status", default=""))
+        == "unable_to_assess"
+    ]
+    lines = ["人工面板复核原因：至少一名 AI 专家无法完成判断。"]
+    lines.extend(
+        _format_opinion(
+            item,
+            _display_value(_first(item, "round", default="专家")),
+        )
+        for item in unable
+    )
+    lines.append("请结合完整评分、Findings、论文证据和专家意见给出最终风险结论。")
+    return "\n".join(lines)
 
 
 def _format_panel(panel: Any, source: Any) -> str:

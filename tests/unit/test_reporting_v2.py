@@ -12,6 +12,7 @@ from paper_reviewer.domain.review import (
     ExpertOpinion,
     HardRuleAssessment,
     HardRuleStatus,
+    HumanReviewSummary,
     MetaReview,
 )
 from paper_reviewer.domain.run import RunRecord, RunStatus
@@ -78,6 +79,23 @@ def test_actual_evaluation_report_renders_scores_panel_path_and_disclaimers() ->
     assert "initial_unqualified_zero" in markdown
     assert "本结果不是浙江省教育厅正式抽检结论" in markdown
     assert "学术不端检测报告未由系统自动读取" in markdown
+
+
+def test_pending_human_review_marker_is_at_top_of_markdown() -> None:
+    rubric, evaluation = _evaluation()
+    pending = evaluation.model_copy(
+        update={
+            "human_review_summary": HumanReviewSummary(
+                pending_hard_rule_ids=["academic_integrity"]
+            )
+        },
+        deep=True,
+    )
+
+    markdown = render_markdown(rubric, pending, AuditReport())  # type: ignore[arg-type]
+
+    assert "**AI 评测已完成。**" in markdown.split("## 总体评价", 1)[0]
+    assert "**人工复核尚未完成，当前风险结论待定。**" in markdown
 
 
 def test_v2_report_json_contains_the_full_evaluation(tmp_path: Path) -> None:

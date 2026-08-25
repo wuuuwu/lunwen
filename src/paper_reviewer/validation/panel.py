@@ -7,6 +7,8 @@ from paper_reviewer.domain.review import (
     ExpertVerdict,
     HardRuleAssessment,
     HardRuleStatus,
+    HumanPanelDecision,
+    HumanReviewSummary,
     HumanRuleDecision,
     HumanRuleDecisionValue,
     PanelDecision,
@@ -20,6 +22,7 @@ def decide_panel(
     supplemental: Sequence[ExpertOpinion] = (),
     hard_rules: Sequence[HardRuleAssessment] = (),
     human_decisions: Sequence[HumanRuleDecision] = (),
+    human_panel_decision: HumanPanelDecision | None = None,
 ) -> PanelDecision:
     """Apply the deterministic hard-rule and 3+2 panel policy.
 
@@ -27,7 +30,11 @@ def decide_panel(
     duplicate experts, excess votes, or decisions for unknown rules are rejected.
     """
 
-    _validate_panel_members(initial, supplemental)
+    expert_decision = decide_expert_panel(
+        initial=initial,
+        supplemental=supplemental,
+        human_panel_decision=human_panel_decision,
+    )
     rule_ids = {item.rule_id for item in hard_rules}
     decisions = _decision_map(human_decisions, rule_ids)
 
@@ -62,6 +69,39 @@ def decide_panel(
             reason="One or more hard rules require a human decision.",
             decisive_rule_ids=sorted(unresolved),
             decision_path=["hard_rule_human_confirmation_required"],
+        )
+
+    return expert_decision
+
+
+def decide_expert_panel(
+    *,
+    initial: Sequence[ExpertOpinion],
+    supplemental: Sequence[ExpertOpinion] = (),
+    human_panel_decision: HumanPanelDecision | None = None,
+) -> PanelDecision:
+    """Apply only the independent 3+2 panel policy.
+
+    A human panel decision is accepted only when at least one AI expert was
+    unable to assess.  It resolves the complete panel rather than fabricating
+    a replacement AI vote.
+    """
+
+    _validate_panel_members(initial, supplemental)
+    unable_to_assess = any(
+        item.verdict is ExpertVerdict.UNABLE_TO_ASSESS
+        for item in (*initial, *supplemental)
+    )
+    if human_panel_decision is not None:
+        if not unable_to_assess:
+            raise ValueError("human panel decision is not allowed without unable_to_assess")
+        return PanelDecision(
+            outcome=PanelOutcome(human_panel_decision.outcome),
+            reason="A human panel resolved the AI experts' inability to assess.",
+            decision_path=[
+                "expert_panel_unable_to_assess",
+                f"human_panel_{human_panel_decision.outcome}",
+            ],
         )
 
     if any(item.verdict is ExpertVerdict.UNABLE_TO_ASSESS for item in initial):
@@ -154,6 +194,29 @@ def decide_panel(
                 else "risk_not_triggered"
             ),
         ],
+    )
+
+
+def build_human_review_summary(
+    *,
+    hard_rules: Sequence[HardRuleAssessment],
+    human_decisions: Sequence[HumanRuleDecision],
+    expert_panel_decision: PanelDecision,
+    human_panel_decision: HumanPanelDecision | None = None,
+) -> HumanReviewSummary:
+    decided_rule_ids = {item.rule_id for item in human_decisions}
+    pending_rule_ids = sorted(
+        item.rule_id
+        for item in hard_rules
+        if item.status in {HardRuleStatus.SUSPECTED, HardRuleStatus.NOT_ASSESSABLE}
+        and item.rule_id not in decided_rule_ids
+    )
+    return HumanReviewSummary(
+        pending_hard_rule_ids=pending_rule_ids,
+        panel_review_required=(
+            expert_panel_decision.outcome is PanelOutcome.AWAITING_PANEL_REVIEW
+            and human_panel_decision is None
+        ),
     )
 
 

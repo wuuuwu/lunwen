@@ -124,7 +124,9 @@ def test_runs_table_model_exposes_v2_status_text_and_accessible_icon(qapp: QAppl
 def test_runs_filter_includes_v2_scoring_and_panel_states() -> None:
     assert "scoring" in RunsFilterProxyModel.STATUS_GROUPS["active"]
     assert RunsFilterProxyModel.STATUS_GROUPS["hard_rule"] == {
-        "awaiting_hard_rule_confirmation"
+        "awaiting_hard_rule_confirmation",
+        "awaiting_panel_review",
+        "reported_pending_human_review",
     }
     assert RunsFilterProxyModel.STATUS_GROUPS["panel"] == {
         "panel_reviewing",

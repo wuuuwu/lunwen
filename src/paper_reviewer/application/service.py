@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from yaml import YAMLError
 
 from paper_reviewer.adapters.documents.pymupdf_parser import PyMuPDFParser
@@ -75,15 +75,24 @@ from paper_reviewer.domain.review import (
     EvaluationReport,
     HardRuleAssessment,
     HardRuleStatus,
+    HumanPanelDecision,
+    HumanReviewSummary,
     HumanRuleDecision,
     MetaReview,
+    PanelDecision,
+    PanelOutcome,
 )
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.ports.model import Message, ModelRequest, ToolSpec
 from paper_reviewer.reporting.exporter import render_pdf, validate_pdf
-from paper_reviewer.reporting.renderer import render_markdown
-from paper_reviewer.validation.audits import AuditReport
+from paper_reviewer.reporting.renderer import render_markdown, write_report_bundle
+from paper_reviewer.validation.audits import AuditReport, audit_evaluation_report
+from paper_reviewer.validation.panel import (
+    build_human_review_summary,
+    decide_expert_panel,
+    decide_panel,
+)
 from paper_reviewer.validation.scoring import aggregate_scores
 
 EventSink = Callable[[RunEvent], None]
@@ -431,14 +440,6 @@ class ReviewApplicationService:
         if run is None:
             await engine.dispose()
             raise ValueError(f"未知任务：{run_id}")
-        pending = await self._pending_hard_rules(run_id)
-        # Audit inputs are checkpointed before the deterministic audit is
-        # declared complete.  A failed audit may therefore leave provisional
-        # hard-rule artifacts behind; those must not masquerade as an active
-        # human-review gate when the run is resumed and repaired.
-        if pending and "audit" in run.completed_stages:
-            await engine.dispose()
-            raise ValueError("仍有否决项等待人工确认，不能恢复评测。")
         rubric, profile = load_run_snapshots(self.settings.runs_dir / run_id)
         panel_path = self.settings.runs_dir / run_id / "panel-profile.json"
         panel_profile = load_review_profile(panel_path) if panel_path.is_file() else None
@@ -495,6 +496,10 @@ class ReviewApplicationService:
         await self._require_run(run_id)
         return await self._pending_hard_rules(run_id)
 
+    async def get_pending_human_reviews(self, run_id: str) -> HumanReviewSummary:
+        await self._require_run(run_id)
+        return await self._human_review_summary(run_id)
+
     async def resolve_hard_rule(
         self, run_id: str, decision: HumanRuleDecision
     ) -> HumanRuleDecision:
@@ -523,14 +528,128 @@ class ReviewApplicationService:
         finally:
             await engine.dispose()
         _write_model_list(path, decisions)
+        if (self.settings.runs_dir / run_id / "evaluation-report.json").is_file():
+            await self.refresh_after_human_review(run_id)
         return normalized
+
+    async def resolve_panel_review(
+        self, run_id: str, decision: HumanPanelDecision
+    ) -> HumanPanelDecision:
+        await self._require_run(run_id)
+        normalized = HumanPanelDecision.model_validate(decision)
+        summary = await self._human_review_summary(run_id)
+        if not summary.panel_review_required:
+            raise ValueError("当前任务没有待处理的人工面板复核。")
+        path = self.settings.runs_dir / run_id / "human-panel-decision.json"
+        if path.is_file():
+            raise ValueError("人工面板复核已经处理。")
+        _write_model_atomic(path, normalized)
+        if (self.settings.runs_dir / run_id / "evaluation-report.json").is_file():
+            await self.refresh_after_human_review(run_id)
+        return normalized
+
+    async def refresh_after_human_review(self, run_id: str) -> RunRecord:
+        """Recompute deterministic conclusions and reports without any model call."""
+
+        run = await self._require_run(run_id)
+        run_dir = self.settings.runs_dir / run_id
+        rubric, selected_report, audit = _load_export_report_snapshot(run_dir)
+        if not isinstance(selected_report, EvaluationReport):
+            raise ValueError("该任务不是可刷新人工复核的双层评测报告。")
+        decisions = await self._human_rule_decisions(run_id)
+        human_panel_decision = _load_optional_model(
+            run_dir / "human-panel-decision.json", HumanPanelDecision
+        )
+        opinions = selected_report.expert_opinions
+        initial = [item for item in opinions if item.round == "initial"]
+        supplemental = [item for item in opinions if item.round == "supplemental"]
+        expert_panel_decision = decide_expert_panel(
+            initial=initial,
+            supplemental=supplemental,
+        )
+        panel_decision = decide_panel(
+            initial=initial,
+            supplemental=supplemental,
+            hard_rules=selected_report.hard_rule_assessments,
+            human_decisions=decisions,
+            human_panel_decision=human_panel_decision,
+        )
+        summary = build_human_review_summary(
+            hard_rules=selected_report.hard_rule_assessments,
+            human_decisions=decisions,
+            expert_panel_decision=expert_panel_decision,
+            human_panel_decision=human_panel_decision,
+        )
+        updated = selected_report.model_copy(
+            update={
+                "human_rule_decisions": decisions,
+                "expert_panel_decision": expert_panel_decision,
+                "human_panel_decision": human_panel_decision,
+                "human_review_summary": summary,
+                "panel_decision": panel_decision,
+            },
+            deep=True,
+        )
+        report_audit = audit_evaluation_report(report=updated)
+        if not report_audit.passed:
+            raise ValueError(
+                "人工复核后的确定性审计失败：" + "; ".join(report_audit.errors)
+            )
+
+        target_status = (
+            RunStatus.REPORTED if summary.complete else RunStatus.REPORTED_PENDING_HUMAN_REVIEW
+        )
+        if run.status is RunStatus.REPORTED_PENDING_HUMAN_REVIEW and summary.complete:
+            run.status = transition(run.status, target_status)
+        elif run.status in {
+            RunStatus.REPORTED,
+            RunStatus.REPORTED_PENDING_HUMAN_REVIEW,
+        }:
+            run.status = target_status
+        else:
+            raise ValueError("仅已生成报告的任务可以刷新人工复核结论。")
+        run.error = None
+
+        evidence_path = run_dir / "evidence.json"
+        evidence = (
+            [
+                EvidenceItem.model_validate(item)
+                for item in json.loads(evidence_path.read_text(encoding="utf-8"))
+            ]
+            if evidence_path.is_file()
+            else []
+        )
+        _write_model_atomic(run_dir / "evaluation-report.json", updated)
+        write_report_bundle(
+            run_dir=run_dir,
+            run=run,
+            rubric=rubric,
+            review=updated,
+            audit=audit,
+            evidence=evidence,
+        )
+        engine = create_engine(self.settings.database_url)
+        await initialize_database(engine)
+        sessions = create_session_factory(engine)
+        try:
+            repository = ReviewRepository(sessions)
+            await repository.save_panel_decision(run_id, panel_decision)
+            await repository.save_evaluation_report(run_id, updated)
+            await RunRepository(sessions).save(
+                run,
+                event_type="human_review_report_refreshed",
+                payload={"status": run.status.value, "pending_count": summary.pending_count},
+            )
+        finally:
+            await engine.dispose()
+        return run
 
     async def resume_after_human_review(
         self, run_id: str, *, event_sink: EventSink | None = None
     ) -> RunRecord:
         await self._require_run(run_id)
-        if await self._pending_hard_rules(run_id):
-            raise ValueError("必须处理全部否决项嫌疑后才能继续评测。")
+        if (self.settings.runs_dir / run_id / "evaluation-report.json").is_file():
+            return await self.refresh_after_human_review(run_id)
         return await self.resume_review(run_id, event_sink=event_sink)
 
     async def cancel_review(self, run_id: str) -> RunRecord:
@@ -541,7 +660,12 @@ class ReviewApplicationService:
             run = await repository.get(run_id)
             if run is None:
                 raise ValueError(f"未知任务：{run_id}")
-            if run.status in {RunStatus.REPORTED, RunStatus.FATAL_FAILURE, RunStatus.CANCELLED}:
+            if run.status in {
+                RunStatus.REPORTED,
+                RunStatus.REPORTED_PENDING_HUMAN_REVIEW,
+                RunStatus.FATAL_FAILURE,
+                RunStatus.CANCELLED,
+            }:
                 return run
             run.status = transition(run.status, RunStatus.CANCELLED)
             run.error = None
@@ -589,6 +713,11 @@ class ReviewApplicationService:
             raise ValueError(f"未知任务：{run_id}")
         events = _load_trace_events(self.settings.runs_dir / run_id / "trace.jsonl", run_id)
         snapshot = _provider_snapshot_for_display(self.settings.runs_dir / run_id, run)
+        human_review_summary = await self._human_review_summary(run_id)
+        human_panel_decision = _load_optional_model(
+            self.settings.runs_dir / run_id / "human-panel-decision.json",
+            HumanPanelDecision,
+        )
         return RunDetail(
             run=run,
             provider_display_name=snapshot.display_name if snapshot else None,
@@ -596,6 +725,8 @@ class ReviewApplicationService:
             events=events,
             pending_hard_rules=await self._pending_hard_rules(run_id),
             human_rule_decisions=await self._human_rule_decisions(run_id),
+            human_review_summary=human_review_summary,
+            human_panel_decision=human_panel_decision,
         )
 
     async def load_report(self, run_id: str) -> ReportView:
@@ -650,6 +781,9 @@ class ReviewApplicationService:
             report_markdown=run_dir / "report.md",
             report_json=run_dir / "report.json",
             evaluation=evaluation,
+            human_review_summary=detail.human_review_summary,
+            pending_hard_rules=detail.pending_hard_rules,
+            human_panel_decision=detail.human_panel_decision,
         )
 
     async def export_report(
@@ -668,7 +802,10 @@ class ReviewApplicationService:
             raise ValueError(f"不支持的报告导出格式：{export_format}") from error
         run_dir = _validated_run_dir(self.settings.runs_dir, run_id)
         run = await self._read_run_for_export(run_id)
-        if run.status is not RunStatus.REPORTED:
+        if run.status not in {
+            RunStatus.REPORTED,
+            RunStatus.REPORTED_PENDING_HUMAN_REVIEW,
+        }:
             raise ValueError("仅已生成报告的任务可以导出。")
 
         output = _validated_export_destination(
@@ -810,6 +947,30 @@ class ReviewApplicationService:
             )
             by_rule[decision.rule_id] = decision
         return list(by_rule.values())
+
+    async def _human_review_summary(self, run_id: str) -> HumanReviewSummary:
+        run_dir = self.settings.runs_dir / run_id
+        pending_rules = await self._pending_hard_rules(run_id)
+        human_panel_decision = _load_optional_model(
+            run_dir / "human-panel-decision.json", HumanPanelDecision
+        )
+        expert_panel_decision = _load_optional_model(
+            run_dir / "expert-panel-decision.json", PanelDecision
+        )
+        if expert_panel_decision is None:
+            evaluation = _load_optional_model(
+                run_dir / "evaluation-report.json", EvaluationReport
+            )
+            if evaluation is not None:
+                expert_panel_decision = evaluation.expert_panel_decision
+        return HumanReviewSummary(
+            pending_hard_rule_ids=[item.rule_id for item in pending_rules],
+            panel_review_required=(
+                expert_panel_decision is not None
+                and expert_panel_decision.outcome is PanelOutcome.AWAITING_PANEL_REVIEW
+                and human_panel_decision is None
+            ),
+        )
 
 
 def _web_search_client(settings: Settings) -> DdgsWebSearchClient:
@@ -1229,3 +1390,18 @@ def _write_model_list(path: Path, items: list[HumanRuleDecision]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _write_model_atomic(path: Path, model: BaseModel) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(model.model_dump_json(indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _load_optional_model[ModelT: BaseModel](
+    path: Path, model_type: type[ModelT]
+) -> ModelT | None:
+    if not path.is_file():
+        return None
+    return model_type.model_validate_json(path.read_text(encoding="utf-8"))

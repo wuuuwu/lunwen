@@ -7,10 +7,15 @@ import pytest
 from paper_reviewer.domain.review import (
     ExpertOpinion,
     HardRuleAssessment,
+    HumanPanelDecision,
     HumanRuleDecision,
     PanelOutcome,
 )
-from paper_reviewer.validation.panel import decide_panel
+from paper_reviewer.validation.panel import (
+    build_human_review_summary,
+    decide_expert_panel,
+    decide_panel,
+)
 
 
 def _opinion(expert_id: str, verdict: str, round_: str = "initial") -> ExpertOpinion:
@@ -90,6 +95,53 @@ def test_incomplete_initial_panel_with_unable_vote_immediately_requires_human_re
         "initial_unable_to_assess",
         "human_panel_review_required",
     ]
+
+
+def test_human_panel_directly_resolves_unable_to_assess() -> None:
+    initial = [
+        _opinion("i-1", "unable_to_assess"),
+        _opinion("i-2", "qualified"),
+        _opinion("i-3", "qualified"),
+    ]
+    human = HumanPanelDecision(
+        outcome="risk_not_triggered",
+        reviewer="Teacher Panel",
+        rationale="The panel reviewed the complete report and paper.",
+        decided_at=datetime.now(UTC),
+    )
+
+    expert = decide_expert_panel(initial=initial)
+    final = decide_panel(initial=initial, human_panel_decision=human)
+    summary = build_human_review_summary(
+        hard_rules=[],
+        human_decisions=[],
+        expert_panel_decision=expert,
+        human_panel_decision=human,
+    )
+
+    assert expert.outcome is PanelOutcome.AWAITING_PANEL_REVIEW
+    assert final.outcome is PanelOutcome.RISK_NOT_TRIGGERED
+    assert summary.complete
+
+
+def test_pending_summary_can_include_hard_rule_and_panel_review() -> None:
+    hard_rule = HardRuleAssessment(
+        rule_id="integrity",
+        status="not_assessable",
+        rationale="Offline verification is required.",
+    )
+    expert = decide_expert_panel(initial=[_opinion("i-1", "unable_to_assess")])
+
+    summary = build_human_review_summary(
+        hard_rules=[hard_rule],
+        human_decisions=[],
+        expert_panel_decision=expert,
+    )
+
+    assert summary.pending_hard_rule_ids == ["integrity"]
+    assert summary.panel_review_required
+    assert summary.pending_count == 2
+    assert not summary.complete
 
 
 def test_confirmed_hard_rule_overrides_expert_votes() -> None:

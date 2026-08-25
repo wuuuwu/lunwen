@@ -189,6 +189,33 @@ class PanelDecision(BaseModel):
     decision_path: list[str] = Field(default_factory=list)
 
 
+class HumanPanelDecision(BaseModel):
+    """A human panel's direct resolution when AI experts cannot assess."""
+
+    outcome: Literal["risk_triggered", "risk_not_triggered"]
+    reviewer: str = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+    decided_at: datetime
+
+
+class HumanReviewSummary(BaseModel):
+    """Pending post-report review work, independent from model execution."""
+
+    pending_hard_rule_ids: list[str] = Field(default_factory=list)
+    panel_review_required: bool = False
+    pending_count: int = Field(default=0, ge=0)
+    complete: bool = True
+
+    @model_validator(mode="after")
+    def normalize_summary(self) -> HumanReviewSummary:
+        unique_rule_ids = list(dict.fromkeys(self.pending_hard_rule_ids))
+        count = len(unique_rule_ids) + int(self.panel_review_required)
+        self.pending_hard_rule_ids = unique_rule_ids
+        self.pending_count = count
+        self.complete = count == 0
+        return self
+
+
 class EvaluationReport(BaseModel):
     """New dual-advisory report; legacy MetaReview remains independently readable."""
 
@@ -198,6 +225,9 @@ class EvaluationReport(BaseModel):
     hard_rule_assessments: list[HardRuleAssessment] = Field(default_factory=list)
     human_rule_decisions: list[HumanRuleDecision] = Field(default_factory=list)
     expert_opinions: list[ExpertOpinion] = Field(default_factory=list)
+    expert_panel_decision: PanelDecision | None = None
+    human_panel_decision: HumanPanelDecision | None = None
+    human_review_summary: HumanReviewSummary = Field(default_factory=HumanReviewSummary)
     panel_decision: PanelDecision
     meta_review: MetaReview
     experimental: bool = True

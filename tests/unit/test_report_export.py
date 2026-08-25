@@ -132,6 +132,21 @@ async def test_markdown_export_is_exact_atomic_copy(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pending_human_review_report_can_be_exported(tmp_path: Path) -> None:
+    service, run_dir = _service(
+        tmp_path,
+        _run(status=RunStatus.REPORTED_PENDING_HUMAN_REVIEW),
+    )
+    canonical = "# Report\n\n人工复核尚未完成，当前风险结论待定。\n".encode()
+    (run_dir / "report.md").write_bytes(canonical)
+    destination = tmp_path / "pending-report.md"
+
+    await service.export_report("run-1", ReportExportFormat.MARKDOWN, destination)
+
+    assert destination.read_bytes() == canonical
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["v1", "v2_evaluation", "v2_report"])
 async def test_missing_markdown_is_reconstructed_from_report_view(
     tmp_path: Path,

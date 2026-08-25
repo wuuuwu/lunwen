@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -45,9 +47,10 @@ def write_report_bundle(
     report_markdown = run_dir / "report.md"
     evidence_json = run_dir / "evidence.json"
     summary_json = run_dir / "run-summary.json"
-    report_json.write_text(_json_text(selected), encoding="utf-8")
+    _write_text_atomic(report_json, _json_text(selected))
     provider_snapshot = _load_provider_snapshot(run_dir)
-    report_markdown.write_text(
+    _write_text_atomic(
+        report_markdown,
         render_markdown(
             rubric,
             selected,
@@ -56,16 +59,30 @@ def write_report_bundle(
             provider_ref=run.provider,
             model=run.model,
         ),
-        encoding="utf-8",
     )
-    evidence_json.write_text(
+    _write_text_atomic(
+        evidence_json,
         json.dumps(
             [item.model_dump(mode="json") for item in evidence], ensure_ascii=False, indent=2
         ),
-        encoding="utf-8",
     )
-    summary_json.write_text(run.model_dump_json(indent=2), encoding="utf-8")
+    _write_text_atomic(summary_json, run.model_dump_json(indent=2))
     return [report_markdown, report_json, evidence_json, summary_json]
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def file_sha256(path: Path) -> str:
@@ -149,12 +166,28 @@ def _render_evaluation_markdown(
     lines = [
         f"# {_text(title)}",
         "",
+    ]
+    human_review = _field(report, "human_review_summary", default=None)
+    if human_review is not None and not bool(
+        _field(human_review, "complete", default=True)
+    ):
+        lines.extend(
+            [
+                "> **AI 评测已完成。**",
+                ">",
+                "> **人工复核尚未完成，当前风险结论待定。**",
+                "",
+            ]
+        )
+    lines.extend(
+        [
         f"- Run ID: {_code(_field(report, 'run_id', default='unknown'))}",
         *provider_lines,
         f"- Rubric: {_code(f'{rubric.rubric_id}@{rubric.version}')}",
         f"- Evaluation mode: {_code(_field(report, 'evaluation_mode', default='dual_advisory'))}",
         f"- Evidence audit: {_code('passed' if audit.passed else 'failed')}",
-    ]
+        ]
+    )
     discipline = _field(report, "discipline_name", "discipline", default=None)
     if discipline:
         lines.append(f"- 专业：{_code(discipline)}")

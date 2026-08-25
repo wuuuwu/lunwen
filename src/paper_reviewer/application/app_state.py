@@ -32,11 +32,15 @@ ACTIVE_RUN_STATUS_VALUES = frozenset(
 )
 
 HUMAN_REVIEW_STATUS_VALUES = frozenset(
-    {"awaiting_hard_rule_confirmation", "awaiting_panel_review"}
+    {
+        "awaiting_hard_rule_confirmation",
+        "awaiting_panel_review",
+        "reported_pending_human_review",
+    }
 )
 
 TERMINAL_RUN_STATUS_VALUES = frozenset(
-    {"reported", "fatal_failure", "cancelled"}
+    {"reported", "reported_pending_human_review", "fatal_failure", "cancelled"}
 )
 
 

@@ -304,6 +304,7 @@ class RunsTableModel(QAbstractTableModel):
         "synthesizing": "正在汇总",
         "meta_reviewing": "汇总评测",
         "validating": "生成报告",
+        "reported_pending_human_review": "评测完成 · 待人工复核",
         "reported": "已完成",
         "retryable_failure": "失败，可恢复",
         "fatal_failure": "失败",
@@ -328,6 +329,7 @@ class RunsTableModel(QAbstractTableModel):
         "synthesizing": "rubric",
         "meta_reviewing": "rubric",
         "validating": "check",
+        "reported_pending_human_review": "warning",
         "reported": "check",
         "retryable_failure": "warning",
         "fatal_failure": "error",
@@ -349,6 +351,7 @@ class RunsTableModel(QAbstractTableModel):
         "synthesizing": "正在汇总评语和风险结论",
         "meta_reviewing": "正在汇总评测结果",
         "validating": "正在验证并生成报告",
+        "reported_pending_human_review": "AI 评测和报告已完成，等待人工复核",
         "reported": "评测报告已生成",
         "retryable_failure": "任务失败，可以恢复",
         "fatal_failure": "任务失败，无法自动恢复",
@@ -450,13 +453,17 @@ class RunsFilterProxyModel(QSortFilterProxyModel):
             "meta_reviewing",
             "validating",
         },
-        "hard_rule": {"awaiting_hard_rule_confirmation"},
+        "hard_rule": {
+            "awaiting_hard_rule_confirmation",
+            "awaiting_panel_review",
+            "reported_pending_human_review",
+        },
         "panel": {
             "panel_reviewing",
             "supplemental_reviewing",
             "awaiting_panel_review",
         },
-        "reported": {"reported"},
+        "reported": {"reported", "reported_pending_human_review"},
         "problem": {"retryable_failure", "fatal_failure", "cancelled"},
     }
 

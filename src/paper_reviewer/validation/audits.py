@@ -21,7 +21,11 @@ from paper_reviewer.domain.review import (
     Severity,
 )
 from paper_reviewer.domain.rubric import RubricProfile
-from paper_reviewer.validation.panel import decide_panel
+from paper_reviewer.validation.panel import (
+    build_human_review_summary,
+    decide_expert_panel,
+    decide_panel,
+)
 
 
 class AuditReport(BaseModel):
@@ -392,17 +396,35 @@ def audit_evaluation_report(
     initial = [item for item in report.expert_opinions if item.round == "initial"]
     supplemental = [item for item in report.expert_opinions if item.round == "supplemental"]
     try:
+        expected_expert = decide_expert_panel(
+            initial=initial,
+            supplemental=supplemental,
+        )
         expected = decide_panel(
             initial=initial,
             supplemental=supplemental,
             hard_rules=report.hard_rule_assessments,
             human_decisions=report.human_rule_decisions,
+            human_panel_decision=report.human_panel_decision,
+        )
+        expected_summary = build_human_review_summary(
+            hard_rules=report.hard_rule_assessments,
+            human_decisions=report.human_rule_decisions,
+            expert_panel_decision=expected_expert,
+            human_panel_decision=report.human_panel_decision,
         )
     except ValueError as exc:
         audit.errors.append(f"invalid deterministic panel inputs: {exc}")
         return audit
+    if (
+        report.expert_panel_decision is not None
+        and report.expert_panel_decision != expected_expert
+    ):
+        audit.errors.append("stored expert panel decision does not match 3+2 policy")
     if report.panel_decision != expected:
         audit.errors.append("stored panel decision does not match deterministic panel policy")
+    if report.human_review_summary != expected_summary:
+        audit.errors.append("stored human review summary does not match pending decisions")
     return audit
 
 

@@ -24,6 +24,7 @@ class RunStatus(StrEnum):
     SYNTHESIZING = "synthesizing"
     META_REVIEWING = "meta_reviewing"
     VALIDATING = "validating"
+    REPORTED_PENDING_HUMAN_REVIEW = "reported_pending_human_review"
     REPORTED = "reported"
     RETRYABLE_FAILURE = "retryable_failure"
     FATAL_FAILURE = "fatal_failure"

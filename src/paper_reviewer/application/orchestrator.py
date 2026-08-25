@@ -44,9 +44,9 @@ from paper_reviewer.domain.review import (
     ExpertOpinion,
     HardRuleAssessment,
     HardRuleStatus,
+    HumanPanelDecision,
     HumanRuleDecision,
     MetaReview,
-    PanelDecision,
     PanelOutcome,
     PolicyContext,
     ReviewerResult,
@@ -70,7 +70,11 @@ from paper_reviewer.validation.audits import (
     audit_reviews,
     reviewer_reference_errors,
 )
-from paper_reviewer.validation.panel import decide_panel
+from paper_reviewer.validation.panel import (
+    build_human_review_summary,
+    decide_expert_panel,
+    decide_panel,
+)
 from paper_reviewer.validation.scoring import aggregate_scores
 
 
@@ -455,14 +459,9 @@ class ReviewOrchestrator:
                     message = "deterministic review audit failed: " + "; ".join(audit.errors)
                     raise ValueError(message)
                 if dual_advisory:
-                    target = (
-                        RunStatus.AWAITING_HARD_RULE_CONFIRMATION
-                        if _has_pending_hard_rules(hard_rules, [])
-                        else RunStatus.PANEL_REVIEWING
+                    await self._complete_stage(
+                        run, "audit", RunStatus.PANEL_REVIEWING
                     )
-                    await self._complete_stage(run, "audit", target)
-                    if target is RunStatus.AWAITING_HARD_RULE_CONFIRMATION:
-                        return run
                 else:
                     await self._complete_stage(run, "audit", RunStatus.META_REVIEWING)
             else:
@@ -494,18 +493,6 @@ class ReviewOrchestrator:
                         )
                     ],
                 )
-                if _has_pending_hard_rules(hard_rules, human_decisions):
-                    if run.status is not RunStatus.AWAITING_HARD_RULE_CONFIRMATION:
-                        await self._set_status(
-                            run,
-                            RunStatus.AWAITING_HARD_RULE_CONFIRMATION,
-                            "hard_rule_confirmation_required",
-                        )
-                    return run
-
-                decision = decide_panel(
-                    initial=[], hard_rules=hard_rules, human_decisions=human_decisions
-                )
                 opinions_path = run_dir / "expert-opinions.json"
                 opinions = _load_models(opinions_path, ExpertOpinion)
                 persisted_opinions = [
@@ -513,21 +500,46 @@ class ReviewOrchestrator:
                     for item in await self.reviews.list_expert_opinion_payloads(run.run_id)
                 ]
                 opinions = _merge_expert_opinions(opinions, persisted_opinions)
-                if decision.outcome is not PanelOutcome.RISK_TRIGGERED:
-                    if panel_profile is None:
-                        panel_profile = _load_panel_profile_snapshot(run_dir)
-                    if panel_profile is None or len(panel_profile.reviewers) < 5:
-                        raise ValueError(
-                            "dual-advisory evaluation requires a five-member panel profile"
-                        )
-                    if run.status is not RunStatus.PANEL_REVIEWING:
-                        await self._set_status(
-                            run, RunStatus.PANEL_REVIEWING, "panel_review_started"
-                        )
+                if panel_profile is None:
+                    panel_profile = _load_panel_profile_snapshot(run_dir)
+                if panel_profile is None or len(panel_profile.reviewers) < 5:
+                    raise ValueError(
+                        "dual-advisory evaluation requires a five-member panel profile"
+                    )
+                if run.status is not RunStatus.PANEL_REVIEWING:
+                    await self._set_status(
+                        run, RunStatus.PANEL_REVIEWING, "panel_review_started"
+                    )
+                opinions = await self._run_panel_round(
+                    run=run,
+                    experts=panel_profile.reviewers[:3],
+                    round_name="initial",
+                    rubric=rubric,
+                    document=document,
+                    blocks=blocks,
+                    evidence=evidence,
+                    findings=[finding for item in results for finding in item.findings],
+                    discipline_name=discipline_name,
+                    discipline_profile=discipline_profile,
+                    existing=opinions,
+                    output_path=opinions_path,
+                )
+                initial = [item for item in opinions if item.round == "initial"]
+                supplemental = [item for item in opinions if item.round == "supplemental"]
+                expert_decision = decide_expert_panel(
+                    initial=initial,
+                    supplemental=supplemental,
+                )
+                if expert_decision.outcome is PanelOutcome.SUPPLEMENTAL_REQUIRED:
+                    await self._set_status(
+                        run,
+                        RunStatus.SUPPLEMENTAL_REVIEWING,
+                        "supplemental_review_started",
+                    )
                     opinions = await self._run_panel_round(
                         run=run,
-                        experts=panel_profile.reviewers[:3],
-                        round_name="initial",
+                        experts=panel_profile.reviewers[3:5],
+                        round_name="supplemental",
                         rubric=rubric,
                         document=document,
                         blocks=blocks,
@@ -538,53 +550,29 @@ class ReviewOrchestrator:
                         existing=opinions,
                         output_path=opinions_path,
                     )
-                    initial = [item for item in opinions if item.round == "initial"]
-                    supplemental = [
-                        item for item in opinions if item.round == "supplemental"
-                    ]
-                    decision = decide_panel(
-                        initial=initial,
-                        supplemental=supplemental,
-                        hard_rules=hard_rules,
-                        human_decisions=human_decisions,
+                    expert_decision = decide_expert_panel(
+                        initial=[item for item in opinions if item.round == "initial"],
+                        supplemental=[
+                            item for item in opinions if item.round == "supplemental"
+                        ],
                     )
-                    if decision.outcome is PanelOutcome.SUPPLEMENTAL_REQUIRED:
-                        await self._set_status(
-                            run,
-                            RunStatus.SUPPLEMENTAL_REVIEWING,
-                            "supplemental_review_started",
-                        )
-                        opinions = await self._run_panel_round(
-                            run=run,
-                            experts=panel_profile.reviewers[3:5],
-                            round_name="supplemental",
-                            rubric=rubric,
-                            document=document,
-                            blocks=blocks,
-                            evidence=evidence,
-                            findings=[finding for item in results for finding in item.findings],
-                            discipline_name=discipline_name,
-                            discipline_profile=discipline_profile,
-                            existing=opinions,
-                            output_path=opinions_path,
-                        )
-                        decision = decide_panel(
-                            initial=[item for item in opinions if item.round == "initial"],
-                            supplemental=[
-                                item for item in opinions if item.round == "supplemental"
-                            ],
-                            hard_rules=hard_rules,
-                            human_decisions=human_decisions,
-                        )
+                human_panel_decision = _load_optional_model(
+                    run_dir / "human-panel-decision.json", HumanPanelDecision
+                )
+                decision = decide_panel(
+                    initial=[item for item in opinions if item.round == "initial"],
+                    supplemental=[item for item in opinions if item.round == "supplemental"],
+                    hard_rules=hard_rules,
+                    human_decisions=human_decisions,
+                    human_panel_decision=human_panel_decision,
+                )
+                (run_dir / "expert-panel-decision.json").write_text(
+                    expert_decision.model_dump_json(indent=2), encoding="utf-8"
+                )
                 (run_dir / "panel-decision.json").write_text(
                     decision.model_dump_json(indent=2), encoding="utf-8"
                 )
                 await self.reviews.save_panel_decision(run.run_id, decision)
-                if decision.outcome is PanelOutcome.AWAITING_PANEL_REVIEW:
-                    await self._set_status(
-                        run, RunStatus.AWAITING_PANEL_REVIEW, "panel_human_review_required"
-                    )
-                    return run
                 await self._complete_stage(run, "panel", RunStatus.SYNTHESIZING)
 
             if "meta" not in run.completed_stages:
@@ -673,18 +661,28 @@ class ReviewOrchestrator:
                         )
                     ],
                 )
-                panel_decision_path = run_dir / "panel-decision.json"
-                if panel_decision_path.is_file():
-                    panel_decision = PanelDecision.model_validate_json(
-                        panel_decision_path.read_text(encoding="utf-8")
-                    )
-                else:
-                    stored_panel_decision = await self.reviews.get_panel_decision(
-                        run.run_id
-                    )
-                    if not isinstance(stored_panel_decision, dict):
-                        raise ValueError("panel decision checkpoint is missing")
-                    panel_decision = PanelDecision.model_validate(stored_panel_decision)
+                initial = [item for item in opinions if item.round == "initial"]
+                supplemental = [item for item in opinions if item.round == "supplemental"]
+                expert_panel_decision = decide_expert_panel(
+                    initial=initial,
+                    supplemental=supplemental,
+                )
+                human_panel_decision = _load_optional_model(
+                    run_dir / "human-panel-decision.json", HumanPanelDecision
+                )
+                panel_decision = decide_panel(
+                    initial=initial,
+                    supplemental=supplemental,
+                    hard_rules=hard_rules,
+                    human_decisions=human_decisions,
+                    human_panel_decision=human_panel_decision,
+                )
+                human_review_summary = build_human_review_summary(
+                    hard_rules=hard_rules,
+                    human_decisions=human_decisions,
+                    expert_panel_decision=expert_panel_decision,
+                    human_panel_decision=human_panel_decision,
+                )
                 policy_value = getattr(rubric, "policy_context", None) or getattr(
                     rubric, "policy", None
                 )
@@ -697,6 +695,9 @@ class ReviewOrchestrator:
                     hard_rule_assessments=hard_rules,
                     human_rule_decisions=human_decisions,
                     expert_opinions=opinions,
+                    expert_panel_decision=expert_panel_decision,
+                    human_panel_decision=human_panel_decision,
+                    human_review_summary=human_review_summary,
                     panel_decision=panel_decision,
                     meta_review=meta,
                 )
@@ -733,7 +734,13 @@ class ReviewOrchestrator:
                     await self._set_status(run, RunStatus.VALIDATING, "report_validation_started")
                 projected_run = run.model_copy(deep=True)
                 projected_run.completed_stages.append("report")
-                projected_run.status = transition(projected_run.status, RunStatus.REPORTED)
+                target_status = (
+                    RunStatus.REPORTED_PENDING_HUMAN_REVIEW
+                    if evaluation is not None
+                    and not evaluation.human_review_summary.complete
+                    else RunStatus.REPORTED
+                )
+                projected_run.status = transition(projected_run.status, target_status)
                 write_report_bundle(
                     run_dir=run_dir,
                     run=projected_run,
@@ -749,7 +756,11 @@ class ReviewOrchestrator:
             return run
         except asyncio.CancelledError:
             run.error = None
-            if run.status not in {RunStatus.CANCELLED, RunStatus.REPORTED}:
+            if run.status not in {
+                RunStatus.CANCELLED,
+                RunStatus.REPORTED,
+                RunStatus.REPORTED_PENDING_HUMAN_REVIEW,
+            }:
                 run.status = transition(run.status, RunStatus.CANCELLED)
                 await self.runs.save(run, event_type="run_cancelled", payload={})
                 self._append_trace(run.run_id, "run_cancelled", {"status": run.status.value})
@@ -761,6 +772,7 @@ class ReviewOrchestrator:
                 RunStatus.RETRYABLE_FAILURE,
                 RunStatus.FATAL_FAILURE,
                 RunStatus.REPORTED,
+                RunStatus.REPORTED_PENDING_HUMAN_REVIEW,
             }:
                 run.status = transition(run.status, RunStatus.RETRYABLE_FAILURE)
                 await self.runs.save(
@@ -1315,6 +1327,14 @@ def _load_models[ModelT: BaseModel](
     if not isinstance(payload, list):
         raise ValueError(f"invalid run artifact: {path.name}")
     return [model_type.model_validate(item) for item in payload]
+
+
+def _load_optional_model[ModelT: BaseModel](
+    path: Path, model_type: type[ModelT]
+) -> ModelT | None:
+    if not path.is_file():
+        return None
+    return model_type.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def _write_models(path: Path, items: Sequence[BaseModel]) -> None:

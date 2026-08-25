@@ -96,6 +96,7 @@ ALLOWED_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
         RunStatus.FATAL_FAILURE,
     },
     RunStatus.VALIDATING: {
+        RunStatus.REPORTED_PENDING_HUMAN_REVIEW,
         RunStatus.REPORTED,
         RunStatus.CANCELLED,
         RunStatus.RETRYABLE_FAILURE,
@@ -117,6 +118,7 @@ ALLOWED_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
         RunStatus.CANCELLED,
         RunStatus.FATAL_FAILURE,
     },
+    RunStatus.REPORTED_PENDING_HUMAN_REVIEW: {RunStatus.REPORTED},
     RunStatus.REPORTED: set(),
     RunStatus.FATAL_FAILURE: set(),
     RunStatus.CANCELLED: {
