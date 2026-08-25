@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
-from paper_reviewer.cli import _cli_resume_requires_desktop
+import pytest
+
+from paper_reviewer import cli
+from paper_reviewer.cli import (
+    _cli_builtin_provider_snapshot,
+    _cli_resume_requires_desktop,
+    _validate_cli_builtin_snapshot,
+)
 from paper_reviewer.domain.provider import (
     ModelApiProtocol,
     ProviderSnapshot,
@@ -43,3 +53,101 @@ def test_cli_resume_directs_responses_and_custom_tasks_to_desktop(tmp_path: Path
     )
     (tmp_path / "provider.json").write_text(snapshot.model_dump_json(), encoding="utf-8")
     assert _cli_resume_requires_desktop(_run("openai"), tmp_path)
+
+
+@pytest.mark.parametrize("provider", ["openai", "deepseek"])
+def test_cli_runtime_snapshot_is_chat_only(provider: str) -> None:
+    snapshot = _cli_builtin_provider_snapshot(provider, "test-model")
+
+    assert snapshot.provider_ref == provider
+    assert snapshot.protocol is ModelApiProtocol.CHAT_COMPLETIONS
+    assert snapshot.model == "test-model"
+
+
+def test_cli_runtime_snapshot_rejects_responses_provider() -> None:
+    with pytest.raises(ValueError, match="unsupported model provider"):
+        _cli_builtin_provider_snapshot("openai_responses", "test-model")
+
+
+def test_cli_rejects_rehashed_malicious_builtin_snapshot() -> None:
+    malicious_url = "https://attacker.example/v1"
+    snapshot = ProviderSnapshot(
+        provider_ref="openai",
+        display_name="OpenAI",
+        protocol=ModelApiProtocol.CHAT_COMPLETIONS,
+        base_url=malicious_url,
+        endpoint_fingerprint=endpoint_fingerprint(
+            malicious_url, ModelApiProtocol.CHAT_COMPLETIONS
+        ),
+        model="model",
+    )
+
+    with pytest.raises(ValueError, match="固定端点不一致"):
+        _validate_cli_builtin_snapshot("openai", snapshot)
+
+
+@pytest.mark.asyncio
+async def test_cli_rejects_malicious_snapshot_before_key_or_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    malicious_url = "https://attacker.example/v1"
+    malicious = ProviderSnapshot(
+        provider_ref="openai",
+        display_name="OpenAI",
+        protocol=ModelApiProtocol.CHAT_COMPLETIONS,
+        base_url=malicious_url,
+        endpoint_fingerprint=endpoint_fingerprint(
+            malicious_url, ModelApiProtocol.CHAT_COMPLETIONS
+        ),
+        model="model",
+    )
+    run = _run("openai")
+    engine = SimpleNamespace()
+    key_requested = False
+    runtime_entered = False
+
+    async def initialize(_engine: object) -> None:
+        return None
+
+    async def _dispose() -> None:
+        return None
+
+    engine.dispose = _dispose
+
+    class Repository:
+        async def get(self, _run_id: str) -> RunRecord:
+            return run
+
+    def fail_key(_provider: str) -> str:
+        nonlocal key_requested
+        key_requested = True
+        raise AssertionError("API Key must not be requested")
+
+    @asynccontextmanager
+    async def fail_runtime(**_kwargs: object) -> AsyncIterator[object]:
+        nonlocal runtime_entered
+        runtime_entered = True
+        raise AssertionError("runtime must not be entered")
+        yield object()
+
+    monkeypatch.setattr(
+        cli,
+        "Settings",
+        lambda: SimpleNamespace(database_url="sqlite+aiosqlite://", runs_dir=tmp_path),
+    )
+    monkeypatch.setattr(cli, "create_engine", lambda _url: engine)
+    monkeypatch.setattr(cli, "initialize_database", initialize)
+    monkeypatch.setattr(cli, "create_session_factory", lambda _engine: object())
+    monkeypatch.setattr(cli, "RunRepository", lambda _sessions: Repository())
+    monkeypatch.setattr(cli, "load_provider_snapshot", lambda _run_dir: malicious)
+    monkeypatch.setattr(cli, "load_run_snapshots", lambda _run_dir: (object(), object()))
+    monkeypatch.setattr(cli, "load_run_request_context", lambda _run_dir: {})
+    monkeypatch.setattr(cli, "_cli_provider_api_key", fail_key)
+    monkeypatch.setattr(cli, "review_runtime", fail_runtime)
+
+    with pytest.raises(ValueError, match="固定端点不一致"):
+        await cli._resume(run.run_id)
+
+    assert not key_requested
+    assert not runtime_entered

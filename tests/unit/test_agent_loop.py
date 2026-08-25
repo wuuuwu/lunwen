@@ -346,6 +346,60 @@ async def test_responses_continuation_is_forwarded_but_not_serialized() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_preserves_event_order_phases_and_idempotency_keys() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        name="lookup",
+        description="Lookup",
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=lambda: {"answer": 42},
+    )
+    model = FakeModel(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="lookup-1", name="lookup", arguments={})]),
+            ModelResponse(content='{"wrong":"shape"}'),
+            ModelResponse(content='{"value":"repaired"}'),
+        ]
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+
+    result = await run_bounded_agent(
+        model=model,
+        registry=registry,
+        allowlist=["lookup"],
+        system_prompt="system",
+        user_prompt="user",
+        output_type=Output,
+        trace_id="trace",
+        budget=AgentBudget(max_model_turns=2, max_tool_calls=1, max_repairs=1),
+        event_sink=lambda name, payload: events.append((name, payload)),
+    )
+
+    assert result.value == "repaired"
+    assert [name for name, _payload in events] == [
+        "model_call_started",
+        "model_call_completed",
+        "tool_call_started",
+        "tool_call_completed",
+        "model_call_started",
+        "model_call_completed",
+        "output_repair_requested",
+        "model_call_started",
+        "model_call_completed",
+    ]
+    assert [request.idempotency_key for request in model.requests] == [
+        "trace:turn:0",
+        "trace:turn:1",
+        "trace:turn:repair:1",
+    ]
+    assert [payload["phase"] for name, payload in events if name == "model_call_started"] == [
+        "tool_collection",
+        "final",
+        "repair",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_invalid_final_continuation_is_excluded_from_repair_context() -> None:
     model = FakeModel(
         [

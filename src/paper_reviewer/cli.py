@@ -6,14 +6,12 @@ import os
 from pathlib import Path
 from typing import Annotated, Any, cast
 
-import httpx
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
 from paper_reviewer.adapters.documents.pymupdf_parser import PyMuPDFParser
-from paper_reviewer.adapters.models.factory import create_model_adapter
 from paper_reviewer.adapters.persistence.database import (
     create_engine,
     create_session_factory,
@@ -25,18 +23,20 @@ from paper_reviewer.adapters.persistence.repositories import (
     ReviewRepository,
     RunRepository,
 )
-from paper_reviewer.adapters.scholarly.arxiv import ArxivClient
-from paper_reviewer.adapters.scholarly.crossref import CrossrefClient
-from paper_reviewer.adapters.scholarly.openalex import OpenAlexClient
-from paper_reviewer.adapters.search.ddgs import DdgsWebSearchClient
 from paper_reviewer.application.orchestrator import (
     ReviewOrchestrator,
     load_provider_snapshot,
     load_run_request_context,
     load_run_snapshots,
 )
+from paper_reviewer.application.providers import builtin_provider_connections
+from paper_reviewer.application.runtime import review_runtime
 from paper_reviewer.config import Settings, load_review_profile, load_rubric
-from paper_reviewer.domain.provider import ModelApiProtocol
+from paper_reviewer.domain.provider import (
+    ModelApiProtocol,
+    ProviderSnapshot,
+    normalize_base_url,
+)
 from paper_reviewer.domain.run import RunRecord
 
 load_dotenv()
@@ -226,18 +226,25 @@ async def _run_new(
         load_review_profile(DEFAULT_PANEL_PROFILE) if rubric.schema_version == "2" else None
     )
     engine = create_engine(settings.database_url)
-    await initialize_database(engine)
-    sessions = create_session_factory(engine)
-    model = create_model_adapter(provider, model_name, timeout=settings.request_timeout_seconds)
-    async with httpx.AsyncClient(timeout=settings.external_timeout_seconds) as client:
-        scholarly = (
-            [OpenAlexClient(client), CrossrefClient(client), ArxivClient(client)]
-            if external_search
-            else []
-        )
-        web_search = _web_search_client(settings) if external_search else None
-        orchestrator = _orchestrator(settings, model, sessions, scholarly, web_search)
-        try:
+    try:
+        await initialize_database(engine)
+        sessions = create_session_factory(engine)
+        provider_snapshot = _cli_builtin_provider_snapshot(provider, model_name)
+        api_key = _cli_provider_api_key(provider_snapshot.provider_ref)
+        async with review_runtime(
+            settings=settings,
+            provider_snapshot=provider_snapshot,
+            api_key=api_key,
+            external_search=external_search,
+            sessions=sessions,
+        ) as runtime:
+            orchestrator = _orchestrator(
+                settings,
+                runtime.model,
+                runtime.sessions,
+                runtime.scholarly_clients,
+                runtime.web_search_client,
+            )
             return await _create_and_execute(
                 orchestrator,
                 input_path=paper,
@@ -252,9 +259,8 @@ async def _run_new(
                 contains_classified_material=contains_classified_material,
                 external_search=external_search,
             )
-        finally:
-            await model.close()
-            await engine.dispose()
+    finally:
+        await engine.dispose()
 
 
 def _validate_cli_safety(
@@ -294,36 +300,45 @@ async def _create_and_execute(orchestrator: Any, **kwargs: Any) -> RunRecord:
 async def _resume(run_id: str) -> RunRecord:
     settings = Settings()
     engine = create_engine(settings.database_url)
-    await initialize_database(engine)
-    sessions = create_session_factory(engine)
-    repository = RunRepository(sessions)
-    run = await repository.get(run_id)
-    if run is None:
-        await engine.dispose()
-        raise typer.BadParameter(f"unknown run id: {run_id}")
-    run_dir = settings.runs_dir / run_id
-    if _cli_resume_requires_desktop(run, run_dir):
-        await engine.dispose()
-        raise typer.BadParameter(
-            "自定义 Provider 和 Responses API 任务首版仅支持在桌面端恢复，请打开应用后恢复该任务。"
-        )
-    rubric, profile = load_run_snapshots(run_dir)
-    context = load_run_request_context(run_dir)
-    external_search = context.get("external_search", True) is not False
-    model = create_model_adapter(run.provider, run.model, timeout=settings.request_timeout_seconds)
-    async with httpx.AsyncClient(timeout=settings.external_timeout_seconds) as client:
-        scholarly = (
-            [OpenAlexClient(client), CrossrefClient(client), ArxivClient(client)]
-            if external_search
-            else []
-        )
-        web_search = _web_search_client(settings) if external_search else None
-        orchestrator = _orchestrator(settings, model, sessions, scholarly, web_search)
-        try:
+    try:
+        await initialize_database(engine)
+        sessions = create_session_factory(engine)
+        repository = RunRepository(sessions)
+        run = await repository.get(run_id)
+        if run is None:
+            raise typer.BadParameter(f"unknown run id: {run_id}")
+        run_dir = settings.runs_dir / run_id
+        if _cli_resume_requires_desktop(run, run_dir):
+            raise typer.BadParameter(
+                "自定义 Provider 和 Responses API 任务首版仅支持在桌面端恢复，"
+                "请打开应用后恢复该任务。"
+            )
+        rubric, profile = load_run_snapshots(run_dir)
+        context = load_run_request_context(run_dir)
+        external_search = context.get("external_search", True) is not False
+        provider_snapshot = load_provider_snapshot(run_dir)
+        if provider_snapshot is None:
+            provider_snapshot = _cli_builtin_provider_snapshot(run.provider, run.model)
+        else:
+            _validate_cli_builtin_snapshot(run.provider, provider_snapshot)
+        api_key = _cli_provider_api_key(provider_snapshot.provider_ref)
+        async with review_runtime(
+            settings=settings,
+            provider_snapshot=provider_snapshot,
+            api_key=api_key,
+            external_search=external_search,
+            sessions=sessions,
+        ) as runtime:
+            orchestrator = _orchestrator(
+                settings,
+                runtime.model,
+                runtime.sessions,
+                runtime.scholarly_clients,
+                runtime.web_search_client,
+            )
             return await orchestrator.execute(run, rubric=rubric, profile=profile)
-        finally:
-            await model.close()
-            await engine.dispose()
+    finally:
+        await engine.dispose()
 
 
 def _cli_resume_requires_desktop(run: RunRecord, run_dir: Path) -> bool:
@@ -375,14 +390,80 @@ def _orchestrator(
     )
 
 
-def _web_search_client(settings: Settings) -> DdgsWebSearchClient:
-    return DdgsWebSearchClient(
-        backend=settings.web_search_backend,
-        region=settings.web_search_region,
-        safesearch=settings.web_search_safesearch,
-        min_interval_seconds=settings.web_search_min_interval_seconds,
-        timeout_seconds=settings.external_timeout_seconds,
+def _cli_builtin_provider_snapshot(provider: str, model: str) -> ProviderSnapshot:
+    """Build the immutable connection input required by ``review_runtime``.
+
+    The CLI intentionally only accepts the built-in Chat Completions providers.
+    Responses and custom providers remain desktop-only, including on resume.
+    """
+
+    normalized = provider.lower()
+    connection = next(
+        (
+            candidate
+            for candidate in builtin_provider_connections()
+            if candidate.provider_ref == normalized
+            and candidate.protocol is ModelApiProtocol.CHAT_COMPLETIONS
+        ),
+        None,
     )
+    if connection is None:
+        raise ValueError(f"unsupported model provider: {provider}")
+    return ProviderSnapshot(
+        provider_ref=connection.provider_ref,
+        display_name=connection.display_name,
+        protocol=connection.protocol,
+        base_url=connection.base_url,
+        endpoint_fingerprint=connection.endpoint_fingerprint,
+        model=model,
+    )
+
+
+def _validate_cli_builtin_snapshot(provider: str, snapshot: ProviderSnapshot) -> None:
+    """Reject mutable or cross-provider snapshots before reading credentials.
+
+    Legacy CLI tasks may contain a provider artifact written by the desktop
+    application.  The CLI only supports the fixed built-in Chat endpoints, so
+    every field that controls the destination must match the built-in catalog.
+    """
+
+    normalized_provider = provider.lower()
+    expected = next(
+        (
+            candidate
+            for candidate in builtin_provider_connections()
+            if candidate.provider_ref == normalized_provider
+            and candidate.protocol is ModelApiProtocol.CHAT_COMPLETIONS
+        ),
+        None,
+    )
+    if expected is None:
+        raise ValueError(f"unsupported model provider: {provider}")
+    try:
+        normalized_base_url = normalize_base_url(snapshot.base_url)
+    except ValueError as error:
+        raise ValueError("CLI Provider 快照的 Base URL 无效。") from error
+    if (
+        snapshot.provider_ref != expected.provider_ref
+        or snapshot.protocol is not expected.protocol
+        or snapshot.base_url != normalized_base_url
+        or normalized_base_url != expected.base_url
+        or snapshot.endpoint_fingerprint != expected.endpoint_fingerprint
+    ):
+        raise ValueError("CLI Provider 快照与内置 Provider 固定端点不一致。")
+
+
+def _cli_provider_api_key(provider: str) -> str:
+    if provider == "openai":
+        variable = "OPENAI_API_KEY"
+    elif provider == "deepseek":
+        variable = "DEEPSEEK_API_KEY"
+    else:
+        raise ValueError(f"unsupported model provider: {provider}")
+    value = os.getenv(variable)
+    if not value:
+        raise ValueError(f"{variable} is not configured")
+    return value
 
 
 if __name__ == "__main__":

@@ -7,15 +7,16 @@ from typing import Literal, cast
 from jinja2 import Template
 
 from paper_reviewer.agents.loop import AgentBudget, EventSink, run_bounded_agent
+from paper_reviewer.agents.reviewer_context import (
+    build_reviewer_read_context,
+    finding_evidence_blocks,
+)
 from paper_reviewer.config import ReviewerProfile
 from paper_reviewer.domain.document import DocumentBlock, DocumentInfo
 from paper_reviewer.domain.evidence import EvidenceItem, EvidenceKind
 from paper_reviewer.domain.review import ExpertOpinion, ExpertVerdict, ReviewFinding, Severity
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.ports.model import ModelPort
-from paper_reviewer.tools.evidence_reader import EvidenceReaderTools, register_evidence_tools
-from paper_reviewer.tools.paper_reader import PaperReaderTools, register_paper_tools
-from paper_reviewer.tools.registry import ToolRegistry
 
 
 async def run_panel_reviewer(
@@ -36,15 +37,14 @@ async def run_panel_reviewer(
 ) -> ExpertOpinion:
     """Run one isolated full-paper expert without exposing other experts' opinions."""
 
-    registry = ToolRegistry()
-    register_paper_tools(registry, PaperReaderTools(blocks))
-    register_evidence_tools(registry, EvidenceReaderTools(evidence))
+    read_context = build_reviewer_read_context(blocks=blocks, evidence=evidence)
+    registry = read_context.registry
     system_prompt = _panel_template().render(
         expert=expert,
         rubric_json=json.dumps(rubric.model_dump(mode="json"), ensure_ascii=False, indent=2),
         output_schema=json.dumps(ExpertOpinion.model_json_schema(), ensure_ascii=False),
     )
-    block_by_id = {block.block_id: block for block in blocks}
+    block_by_id = read_context.evidence_index.block_by_id
     cited_block_ids = {
         reference.block_id
         for finding in findings
@@ -59,28 +59,14 @@ async def run_panel_reviewer(
             "expert_id": expert.reviewer_id,
             "round": round,
             "paper": document.model_dump(mode="json"),
-            "paper_overview": [
-                {
-                    "block_id": block.block_id,
-                    "page": block.page,
-                    "type": block.block_type.value,
-                    "text": block.text[:1200],
-                }
-                for block in blocks[:12]
-            ],
+            "paper_overview": read_context.paper_overview,
             "discipline_name": discipline_name,
             "discipline_profile": discipline_profile,
             "review_findings": [finding.model_dump(mode="json") for finding in findings],
-            "finding_evidence_blocks": [
-                {
-                    "block_id": block.block_id,
-                    "page": block.page,
-                    "section_path": block.section_path,
-                    "text": block.text,
-                }
-                for block_id in sorted(cited_block_ids)
-                if (block := block_by_id.get(block_id)) is not None
-            ],
+            "finding_evidence_blocks": finding_evidence_blocks(
+                finding_block_ids=cited_block_ids,
+                index=read_context.evidence_index,
+            ),
             "instruction": (
                 "Independently assess the complete paper against the complete rubric. Use "
                 "paper tools to inspect all evidence needed. Return your own ExpertOpinion; "

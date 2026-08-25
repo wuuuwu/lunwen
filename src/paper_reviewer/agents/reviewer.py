@@ -9,6 +9,7 @@ from typing import cast
 from jinja2 import Template
 
 from paper_reviewer.agents.loop import AgentBudget, EventSink, run_bounded_agent
+from paper_reviewer.agents.reviewer_context import build_reviewer_read_context
 from paper_reviewer.config import ReviewerProfile
 from paper_reviewer.domain.document import DocumentBlock, DocumentInfo
 from paper_reviewer.domain.evidence import EvidenceItem, EvidenceKind, EvidenceRef
@@ -19,11 +20,9 @@ from paper_reviewer.domain.review import (
 )
 from paper_reviewer.domain.rubric import HardRule, RubricDimension
 from paper_reviewer.ports.model import ModelPort
-from paper_reviewer.tools.evidence_reader import EvidenceReaderTools, register_evidence_tools
-from paper_reviewer.tools.paper_reader import PaperReaderTools, register_paper_tools
-from paper_reviewer.tools.registry import ToolRegistry
 from paper_reviewer.tools.web_search import WebSearchTools, register_web_search_tools
 from paper_reviewer.validation.audits import reviewer_reference_errors
+from paper_reviewer.validation.evidence_references import EvidenceIndex
 
 
 async def run_reviewer(
@@ -44,9 +43,8 @@ async def run_reviewer(
     discipline_profile: str | None = None,
     web_search_tools: WebSearchTools | None = None,
 ) -> ReviewerResult:
-    registry = ToolRegistry()
-    register_paper_tools(registry, PaperReaderTools(blocks))
-    register_evidence_tools(registry, EvidenceReaderTools(evidence))
+    read_context = build_reviewer_read_context(blocks=blocks, evidence=evidence)
+    registry = read_context.registry
     if web_search_tools is not None:
         register_web_search_tools(registry, web_search_tools)
     allowed = [
@@ -68,20 +66,11 @@ async def run_reviewer(
         ),
         output_schema=json.dumps(ReviewerResult.model_json_schema(), ensure_ascii=False),
     )
-    overview = [
-        {
-            "block_id": block.block_id,
-            "page": block.page,
-            "type": block.block_type.value,
-            "text": block.text[:1200],
-        }
-        for block in blocks[:12]
-    ]
     user_payload: dict[str, object] = {
         "run_id": run_id,
         "reviewer_id": reviewer.reviewer_id,
         "paper": document.model_dump(mode="json"),
-        "paper_overview": overview,
+        "paper_overview": read_context.paper_overview,
         "scoring_enabled": scoring_enabled,
         "discipline_name": discipline_name,
         "discipline_profile": discipline_profile,
@@ -100,9 +89,7 @@ async def run_reviewer(
         )
     user_prompt = json.dumps(user_payload, ensure_ascii=False)
 
-    block_ids = {block.block_id for block in blocks}
-    block_by_id = {block.block_id: block for block in blocks}
-    block_pages = {block.block_id: block.page for block in blocks}
+    initial_index = read_context.evidence_index
     repair_baseline = (
         ReviewerResult.model_validate(repair_source.model_dump(mode="python"))
         if repair_source is not None
@@ -121,7 +108,7 @@ async def run_reviewer(
 
     def validate_result(result: ReviewerResult) -> None:
         nonlocal repair_baseline
-        evidence_ids = {item.evidence_id for item in evidence}
+        current_index = EvidenceIndex.build(blocks=blocks, evidence=evidence)
         errors: list[str] = []
         if result.reviewer_id != reviewer.reviewer_id:
             errors.append("reviewer result identity does not match the assigned reviewer")
@@ -140,8 +127,7 @@ async def run_reviewer(
                 dimensions=dimension_by_id,
                 hard_rule_ids=hard_rule_ids,
                 scoring_enabled=scoring_enabled,
-                block_pages=block_pages,
-                evidence_ids=evidence_ids,
+                evidence_index=current_index,
             )
         )
         if repair_baseline is not None:
@@ -149,15 +135,15 @@ async def run_reviewer(
                 _repair_constraint_errors(
                     baseline=repair_baseline,
                     candidate=result,
-                    block_ids=block_ids,
-                    evidence_ids=evidence_ids,
+                    block_ids=set(current_index.block_ids),
+                    evidence_ids=set(current_index.evidence_ids),
                 )
             )
         reference_errors = reviewer_reference_errors(
             result=result,
-            block_ids=block_ids,
-            evidence_ids=evidence_ids,
-            block_by_id=block_by_id,
+            block_ids=current_index.block_ids,
+            evidence_ids=current_index.evidence_ids,
+            block_by_id=current_index.block_by_id,
         )
         errors.extend(reference_errors)
         if errors:
@@ -204,12 +190,12 @@ async def run_reviewer(
         ),
     )
     if repair_baseline is not None:
-        evidence_ids = {item.evidence_id for item in evidence}
+        current_index = EvidenceIndex.build(blocks=blocks, evidence=evidence)
         return _merge_repaired_references(
             baseline=repair_baseline,
             candidate=result,
-            block_ids=block_ids,
-            evidence_ids=evidence_ids,
+            block_ids=set(initial_index.block_ids),
+            evidence_ids=set(current_index.evidence_ids),
         )
     return result
 
@@ -221,8 +207,7 @@ def _policy_assessment_errors(
     dimensions: dict[str, RubricDimension],
     hard_rule_ids: set[str],
     scoring_enabled: bool,
-    block_pages: dict[str, int],
-    evidence_ids: set[str],
+    evidence_index: EvidenceIndex,
 ) -> list[str]:
     errors: list[str] = []
     assessments = result.criterion_assessments
@@ -262,8 +247,7 @@ def _policy_assessment_errors(
                 label=f"criterion {assessment.criterion_id}",
                 paper_references=assessment.paper_evidence,
                 external_references=assessment.external_evidence,
-                block_pages=block_pages,
-                evidence_ids=evidence_ids,
+                evidence_index=evidence_index,
             )
         )
         policy = dimension.evidence_policy
@@ -306,8 +290,7 @@ def _policy_assessment_errors(
                 label=f"hard rule {rule_assessment.rule_id}",
                 paper_references=rule_assessment.paper_evidence,
                 external_references=rule_assessment.external_evidence,
-                block_pages=block_pages,
-                evidence_ids=evidence_ids,
+                evidence_index=evidence_index,
             )
         )
     return errors
@@ -318,24 +301,26 @@ def _reference_list_errors(
     label: str,
     paper_references: list[EvidenceRef],
     external_references: list[EvidenceRef],
-    block_pages: dict[str, int],
-    evidence_ids: set[str],
+    evidence_index: EvidenceIndex,
 ) -> list[str]:
     errors: list[str] = []
     for reference in paper_references:
         if reference.kind is not EvidenceKind.PAPER:
             errors.append(f"{label}: paper_evidence contains non-paper reference")
-        elif reference.block_id not in block_pages:
+        elif reference.block_id not in evidence_index.block_pages:
             errors.append(f"{label}: unknown paper block {reference.block_id}")
-        elif reference.page is not None and reference.page != block_pages[reference.block_id]:
+        elif (
+            reference.page is not None
+            and reference.page != evidence_index.block_pages[reference.block_id]
+        ):
             errors.append(
                 f"{label}: paper evidence page {reference.page} does not match "
-                f"block page {block_pages[reference.block_id]}"
+                f"block page {evidence_index.block_pages[reference.block_id]}"
             )
     for reference in external_references:
         if reference.kind is not EvidenceKind.EXTERNAL:
             errors.append(f"{label}: external_evidence contains non-external reference")
-        elif reference.evidence_id not in evidence_ids:
+        elif reference.evidence_id not in evidence_index.evidence_ids:
             errors.append(f"{label}: unknown external evidence {reference.evidence_id}")
     return errors
 

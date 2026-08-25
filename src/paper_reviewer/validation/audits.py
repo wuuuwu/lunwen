@@ -5,7 +5,7 @@ from collections.abc import Collection
 from pydantic import BaseModel, Field
 
 from paper_reviewer.domain.document import DocumentBlock
-from paper_reviewer.domain.evidence import EvidenceItem, EvidenceKind, EvidenceRef
+from paper_reviewer.domain.evidence import EvidenceItem, EvidenceKind
 from paper_reviewer.domain.review import (
     CriterionAssessment,
     EvaluationReport,
@@ -21,6 +21,10 @@ from paper_reviewer.domain.review import (
     Severity,
 )
 from paper_reviewer.domain.rubric import RubricProfile
+from paper_reviewer.validation.evidence_references import (
+    EvidenceIndex,
+    evidence_reference_errors,
+)
 from paper_reviewer.validation.panel import (
     build_human_review_summary,
     decide_expert_panel,
@@ -54,7 +58,17 @@ def reviewer_reference_errors(
     """
 
     errors: list[str] = []
-    known_evidence_ids = set(evidence_ids)
+    known_evidence_ids = frozenset(evidence_ids)
+    detailed_index = (
+        EvidenceIndex(
+            block_by_id=block_by_id,
+            block_ids=frozenset(block_ids),
+            block_pages={block_id: block.page for block_id, block in block_by_id.items()},
+            evidence_ids=known_evidence_ids,
+        )
+        if block_by_id is not None
+        else None
+    )
     for finding in result.findings:
         if finding.reviewer_id != result.reviewer_id:
             errors.append(
@@ -84,35 +98,32 @@ def reviewer_reference_errors(
         is_major = finding.severity in {Severity.CRITICAL, Severity.MAJOR}
         if is_major and not finding.paper_evidence:
             errors.append(f"{finding.finding_id}: major finding lacks paper evidence")
-    if block_by_id is not None:
+    if detailed_index is not None:
         for finding in result.findings:
             errors.extend(
-                _evidence_reference_errors(
+                evidence_reference_errors(
                     owner=f"finding {finding.finding_id}",
                     paper_evidence=finding.paper_evidence,
                     external_evidence=finding.external_evidence,
-                    block_by_id=block_by_id,
-                    evidence_ids=known_evidence_ids,
+                    index=detailed_index,
                 )
             )
         for criterion_assessment in result.criterion_assessments:
             errors.extend(
-                _evidence_reference_errors(
+                evidence_reference_errors(
                     owner=f"criterion {criterion_assessment.criterion_id}",
                     paper_evidence=criterion_assessment.paper_evidence,
                     external_evidence=criterion_assessment.external_evidence,
-                    block_by_id=block_by_id,
-                    evidence_ids=known_evidence_ids,
+                    index=detailed_index,
                 )
             )
         for hard_rule_assessment in result.hard_rule_assessments:
             errors.extend(
-                _evidence_reference_errors(
+                evidence_reference_errors(
                     owner=f"hard rule {hard_rule_assessment.rule_id}",
                     paper_evidence=hard_rule_assessment.paper_evidence,
                     external_evidence=hard_rule_assessment.external_evidence,
-                    block_by_id=block_by_id,
-                    evidence_ids=known_evidence_ids,
+                    index=detailed_index,
                 )
             )
     return errors
@@ -126,17 +137,15 @@ def audit_reviews(
     evidence: list[EvidenceItem],
 ) -> AuditReport:
     report = AuditReport()
-    block_ids = {block.block_id for block in blocks}
-    block_by_id = {block.block_id: block for block in blocks}
-    evidence_ids = {item.evidence_id for item in evidence}
+    index = EvidenceIndex.build(blocks=blocks, evidence=evidence)
     covered: set[str] = set()
     for result in results:
         report.errors.extend(
             reviewer_reference_errors(
                 result=result,
-                block_ids=block_ids,
-                evidence_ids=evidence_ids,
-                block_by_id=block_by_id,
+                block_ids=index.block_ids,
+                evidence_ids=index.evidence_ids,
+                block_by_id=index.block_by_id,
             )
         )
         covered.update(result.dimension_scores)
@@ -207,8 +216,7 @@ def audit_criterion_assessments(
 
     report = AuditReport()
     dimensions = {item.dimension_id: item for item in rubric.dimensions}
-    block_by_id = {item.block_id: item for item in blocks}
-    evidence_ids = {item.evidence_id for item in evidence}
+    index = EvidenceIndex.build(blocks=blocks, evidence=evidence)
     seen: set[str] = set()
     for assessment in assessments:
         criterion_id = assessment.criterion_id
@@ -232,12 +240,11 @@ def audit_criterion_assessments(
                     f"{assessment.reviewer_id}"
                 )
         report.errors.extend(
-            _evidence_reference_errors(
+            evidence_reference_errors(
                 owner=f"criterion {criterion_id}",
                 paper_evidence=assessment.paper_evidence,
                 external_evidence=assessment.external_evidence,
-                block_by_id=block_by_id,
-                evidence_ids=evidence_ids,
+                index=index,
             )
         )
         policy = dimension.evidence_policy
@@ -268,8 +275,7 @@ def audit_hard_rule_assessments(
 ) -> AuditReport:
     report = AuditReport()
     known = set(known_rule_ids)
-    block_by_id = {item.block_id: item for item in blocks}
-    evidence_ids = {item.evidence_id for item in evidence}
+    index = EvidenceIndex.build(blocks=blocks, evidence=evidence)
     assessment_ids: set[str] = set()
     for assessment in assessments:
         if not assessment.reviewer_id.strip():
@@ -282,12 +288,11 @@ def audit_hard_rule_assessments(
             report.errors.append(f"hard rule {assessment.rule_id} has multiple assessments")
         assessment_ids.add(assessment.rule_id)
         report.errors.extend(
-            _evidence_reference_errors(
+            evidence_reference_errors(
                 owner=f"hard rule {assessment.rule_id}",
                 paper_evidence=assessment.paper_evidence,
                 external_evidence=assessment.external_evidence,
-                block_by_id=block_by_id,
-                evidence_ids=evidence_ids,
+                index=index,
             )
         )
 
@@ -340,8 +345,7 @@ def audit_expert_opinions(
 
     report = AuditReport()
     finding_by_id = {item.finding_id: item for item in findings}
-    block_by_id = {item.block_id: item for item in blocks}
-    evidence_ids = {item.evidence_id for item in evidence}
+    index = EvidenceIndex.build(blocks=blocks, evidence=evidence)
     for opinion in opinions:
         referenced: list[ReviewFinding] = []
         for finding_id in opinion.finding_ids:
@@ -364,12 +368,11 @@ def audit_expert_opinions(
             continue
         evidence_is_valid = False
         for finding in major:
-            reference_errors = _evidence_reference_errors(
+            reference_errors = evidence_reference_errors(
                 owner=f"finding {finding.finding_id}",
                 paper_evidence=finding.paper_evidence,
                 external_evidence=finding.external_evidence,
-                block_by_id=block_by_id,
-                evidence_ids=evidence_ids,
+                index=index,
             )
             report.errors.extend(reference_errors)
             if finding.paper_evidence and not any(
@@ -426,40 +429,3 @@ def audit_evaluation_report(
     if report.human_review_summary != expected_summary:
         audit.errors.append("stored human review summary does not match pending decisions")
     return audit
-
-
-def _evidence_reference_errors(
-    *,
-    owner: str,
-    paper_evidence: list[EvidenceRef],
-    external_evidence: list[EvidenceRef],
-    block_by_id: dict[str, DocumentBlock],
-    evidence_ids: set[str],
-) -> list[str]:
-    errors: list[str] = []
-    for reference in paper_evidence:
-        if reference.kind is not EvidenceKind.PAPER:
-            errors.append(f"{owner}: paper evidence contains a non-paper reference")
-            continue
-        if reference.block_id is None:
-            errors.append(f"{owner}: paper evidence is missing a block id")
-            continue
-        block = block_by_id.get(reference.block_id)
-        if block is None:
-            errors.append(f"{owner}: paper evidence references unknown block {reference.block_id}")
-            continue
-        if reference.page is not None and reference.page != block.page:
-            errors.append(
-                f"{owner}: paper evidence page {reference.page} does not match "
-                f"block page {block.page}"
-            )
-        if reference.quote and reference.quote not in block.text:
-            errors.append(f"{owner}: paper evidence quote does not match its block")
-    for reference in external_evidence:
-        if reference.kind is not EvidenceKind.EXTERNAL:
-            errors.append(f"{owner}: external evidence contains a non-external reference")
-        if reference.evidence_id not in evidence_ids:
-            errors.append(
-                f"{owner}: external evidence references unknown item {reference.evidence_id}"
-            )
-    return errors

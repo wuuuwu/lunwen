@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import shutil
@@ -11,17 +10,10 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-import httpx
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from yaml import YAMLError
 
-from paper_reviewer.adapters.documents.pymupdf_parser import PyMuPDFParser
-from paper_reviewer.adapters.models.factory import create_model_adapter
-from paper_reviewer.adapters.persistence.database import (
-    create_engine,
-    create_session_factory,
-    initialize_database,
-)
 from paper_reviewer.adapters.persistence.repositories import (
     DocumentRepository,
     EvidenceRepository,
@@ -29,12 +21,9 @@ from paper_reviewer.adapters.persistence.repositories import (
     ReviewRepository,
     RunRepository,
 )
-from paper_reviewer.adapters.scholarly.arxiv import ArxivClient
-from paper_reviewer.adapters.scholarly.crossref import CrossrefClient
-from paper_reviewer.adapters.scholarly.openalex import OpenAlexClient
-from paper_reviewer.adapters.search.ddgs import DdgsWebSearchClient
 from paper_reviewer.adapters.security.keyring_store import SystemCredentialStore
 from paper_reviewer.application.app_state import AppPaths, PreferencesStore, read_json_lines
+from paper_reviewer.application.artifacts import RunArtifactStore
 from paper_reviewer.application.models import (
     ProviderCompatibilityResult,
     ProviderErrorDetails,
@@ -60,7 +49,9 @@ from paper_reviewer.application.providers import (
     builtin_provider_connections,
 )
 from paper_reviewer.application.review_planner import build_review_plan
+from paper_reviewer.application.run_events import RunEventView, project_run_event
 from paper_reviewer.application.state_machine import transition
+from paper_reviewer.application.unit_of_work import ApplicationUnitOfWork
 from paper_reviewer.config import Settings, load_review_profile, load_rubric
 from paper_reviewer.domain.document import DocumentInfo
 from paper_reviewer.domain.evidence import EvidenceItem
@@ -85,7 +76,6 @@ from paper_reviewer.domain.review import (
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.ports.model import Message, ModelRequest, ToolSpec
-from paper_reviewer.reporting.exporter import render_pdf, validate_pdf
 from paper_reviewer.reporting.presentation import load_presentation_profile
 from paper_reviewer.reporting.renderer import render_markdown, write_report_bundle
 from paper_reviewer.validation.audits import AuditReport, audit_evaluation_report
@@ -97,6 +87,46 @@ from paper_reviewer.validation.panel import (
 from paper_reviewer.validation.scoring import aggregate_scores
 
 EventSink = Callable[[RunEvent], None]
+
+
+# Keep these names as stable patch/injection points while delaying optional,
+# heavyweight dependencies until the operation that actually needs them.
+def PyMuPDFParser() -> Any:
+    from paper_reviewer.adapters.documents.pymupdf_parser import (
+        PyMuPDFParser as parser_type,
+    )
+
+    return parser_type()
+
+
+def create_model_adapter(*args: Any, **kwargs: Any) -> Any:
+    from paper_reviewer.adapters.models.factory import create_model_adapter as create_adapter
+
+    return create_adapter(*args, **kwargs)
+
+
+def review_runtime(**kwargs: Any) -> Any:
+    from paper_reviewer.application.runtime import review_runtime as create_runtime
+
+    return create_runtime(**kwargs)
+
+
+def render_pdf(
+    markdown: str,
+    destination: Path,
+    *,
+    title: str,
+    author: str = "Paper Reviewer",
+) -> None:
+    from paper_reviewer.reporting.exporter import render_pdf as render
+
+    render(markdown, destination, title=title, author=author)
+
+
+def validate_pdf(path: Path, markdown: str) -> None:
+    from paper_reviewer.reporting.exporter import validate_pdf as validate
+
+    validate(path, markdown)
 
 
 def _validate_cloud_processing_request(request: ReviewRequest) -> None:
@@ -395,96 +425,77 @@ class ReviewApplicationService:
         api_key = self.providers.get_snapshot_api_key(provider_snapshot)
         if not api_key:
             raise ValueError("所选 Provider 未配置 API Key。")
-        model = _adapter_from_snapshot(
-            provider_snapshot,
+        async with review_runtime(
+            settings=self.settings,
+            provider_snapshot=provider_snapshot,
             api_key=api_key,
-            timeout=self.settings.request_timeout_seconds,
-        )
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        sessions = create_session_factory(engine)
-        async with httpx.AsyncClient(timeout=self.settings.external_timeout_seconds) as client:
-            scholarly: list[Any] = (
-                [OpenAlexClient(client), CrossrefClient(client), ArxivClient(client)]
-                if request.external_search
-                else []
-            )
-            web_search = _web_search_client(self.settings) if request.external_search else None
+            external_search=request.external_search,
+        ) as runtime:
             orchestrator = self._orchestrator(
-                model, sessions, scholarly, web_search, event_sink
+                runtime.model,
+                runtime.sessions,
+                runtime.scholarly_clients,
+                runtime.web_search_client,
+                event_sink,
             )
-            try:
-                return await orchestrator.create_and_execute(
-                    input_path=request.paper,
-                    rubric=rubric,
-                    profile=profile,
-                    provider=request.provider,
-                    model_name=request.model,
-                    discipline_name=request.discipline_name,
-                    discipline_profile=request.discipline_profile,
-                    panel_profile=panel_profile,
-                    cloud_processing_authorized=request.cloud_processing_authorized,
-                    contains_classified_material=request.contains_classified_material,
-                    external_search=request.external_search,
-                    provider_snapshot=provider_snapshot,
-                )
-            finally:
-                await model.close()
-                await engine.dispose()
+            return await orchestrator.create_and_execute(
+                input_path=request.paper,
+                rubric=rubric,
+                profile=profile,
+                provider=request.provider,
+                model_name=request.model,
+                discipline_name=request.discipline_name,
+                discipline_profile=request.discipline_profile,
+                panel_profile=panel_profile,
+                cloud_processing_authorized=request.cloud_processing_authorized,
+                contains_classified_material=request.contains_classified_material,
+                external_search=request.external_search,
+                provider_snapshot=provider_snapshot,
+            )
 
     async def resume_review(self, run_id: str, *, event_sink: EventSink | None = None) -> RunRecord:
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        sessions = create_session_factory(engine)
-        repository = RunRepository(sessions)
-        run = await repository.get(run_id)
-        if run is None:
-            await engine.dispose()
-            raise ValueError(f"未知任务：{run_id}")
-        rubric, profile = load_run_snapshots(self.settings.runs_dir / run_id)
-        panel_path = self.settings.runs_dir / run_id / "panel-profile.json"
-        panel_profile = load_review_profile(panel_path) if panel_path.is_file() else None
-        run_dir = self.settings.runs_dir / run_id
-        provider_snapshot = load_provider_snapshot(run_dir)
-        if provider_snapshot is None:
-            if run.provider not in {"openai", "deepseek"}:
-                await engine.dispose()
-                raise ValueError(
-                    "该任务缺少 Provider 快照；自定义 Provider 或 Responses 任务"
-                    "请使用桌面端重新创建。"
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            sessions = unit_of_work.require_sessions()
+            run = await RunRepository(sessions).get(run_id)
+            if run is None:
+                raise ValueError(f"未知任务：{run_id}")
+            rubric, profile = load_run_snapshots(self.settings.runs_dir / run_id)
+            panel_path = self.settings.runs_dir / run_id / "panel-profile.json"
+            panel_profile = load_review_profile(panel_path) if panel_path.is_file() else None
+            run_dir = self.settings.runs_dir / run_id
+            provider_snapshot = load_provider_snapshot(run_dir)
+            if provider_snapshot is None:
+                if run.provider not in {"openai", "deepseek"}:
+                    raise ValueError(
+                        "该任务缺少 Provider 快照；自定义 Provider 或 Responses 任务"
+                        "请使用桌面端重新创建。"
+                    )
+                provider_snapshot = self.providers.snapshot(run.provider, run.model)
+            api_key = self.providers.get_snapshot_api_key(provider_snapshot)
+            if not api_key:
+                raise ValueError("恢复任务所需的 API Key 不存在，请先在设置中重新配置。")
+            request_context = load_run_request_context(run_dir)
+            external_search = request_context.get("external_search", True) is not False
+            async with review_runtime(
+                settings=self.settings,
+                provider_snapshot=provider_snapshot,
+                api_key=api_key,
+                external_search=external_search,
+                sessions=sessions,
+            ) as runtime:
+                orchestrator = self._orchestrator(
+                    runtime.model,
+                    runtime.sessions,
+                    runtime.scholarly_clients,
+                    runtime.web_search_client,
+                    event_sink,
                 )
-            provider_snapshot = self.providers.snapshot(run.provider, run.model)
-        api_key = self.providers.get_snapshot_api_key(provider_snapshot)
-        if not api_key:
-            await engine.dispose()
-            raise ValueError("恢复任务所需的 API Key 不存在，请先在设置中重新配置。")
-        model = _adapter_from_snapshot(
-            provider_snapshot,
-            api_key=api_key,
-            timeout=self.settings.request_timeout_seconds,
-        )
-        request_context = load_run_request_context(run_dir)
-        external_search = request_context.get("external_search", True) is not False
-        async with httpx.AsyncClient(timeout=self.settings.external_timeout_seconds) as client:
-            scholarly: list[Any] = (
-                [OpenAlexClient(client), CrossrefClient(client), ArxivClient(client)]
-                if external_search
-                else []
-            )
-            web_search = _web_search_client(self.settings) if external_search else None
-            orchestrator = self._orchestrator(
-                model, sessions, scholarly, web_search, event_sink
-            )
-            try:
                 return await orchestrator.execute(
                     run,
                     rubric=rubric,
                     profile=profile,
                     panel_profile=panel_profile,
                 )
-            finally:
-                await model.close()
-                await engine.dispose()
 
     async def get_pending_hard_rules(self, run_id: str) -> list[HardRuleAssessment]:
         """Return unresolved AI-suspected or unassessable hard rules.
@@ -494,72 +505,114 @@ class ReviewApplicationService:
         observes the same human-review gate.
         """
 
-        await self._require_run(run_id)
-        return await self._pending_hard_rules(run_id)
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            sessions = unit_of_work.require_sessions()
+            await self._require_run(run_id, sessions=sessions)
+            decisions = await self._human_rule_decisions(run_id, sessions=sessions)
+            return await self._pending_hard_rules(
+                run_id, sessions=sessions, decisions=decisions
+            )
 
     async def get_pending_human_reviews(self, run_id: str) -> HumanReviewSummary:
-        await self._require_run(run_id)
-        return await self._human_review_summary(run_id)
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            sessions = unit_of_work.require_sessions()
+            await self._require_run(run_id, sessions=sessions)
+            decisions = await self._human_rule_decisions(run_id, sessions=sessions)
+            pending_rules = await self._pending_hard_rules(
+                run_id, sessions=sessions, decisions=decisions
+            )
+            return await self._human_review_summary(
+                run_id, sessions=sessions, pending_rules=pending_rules
+            )
 
     async def resolve_hard_rule(
         self, run_id: str, decision: HumanRuleDecision
     ) -> HumanRuleDecision:
-        await self._require_run(run_id)
-        normalized = HumanRuleDecision.model_validate(decision)
-        pending = {item.rule_id for item in await self._pending_hard_rules(run_id)}
-        if normalized.rule_id not in pending:
-            raise ValueError(f"否决项不在待确认列表中：{normalized.rule_id}")
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            sessions = unit_of_work.require_sessions()
+            run = await self._require_run(run_id, sessions=sessions)
+            normalized = HumanRuleDecision.model_validate(decision)
+            decisions = await self._human_rule_decisions(run_id, sessions=sessions)
+            pending = {
+                item.rule_id
+                for item in await self._pending_hard_rules(
+                    run_id, sessions=sessions, decisions=decisions
+                )
+            }
+            if normalized.rule_id not in pending:
+                raise ValueError(f"否决项不在待确认列表中：{normalized.rule_id}")
 
-        path = self.settings.runs_dir / run_id / "human-rule-decisions.json"
-        decisions = await self._human_rule_decisions(run_id)
-        if any(item.rule_id == normalized.rule_id for item in decisions):
-            raise ValueError(f"否决项已经处理：{normalized.rule_id}")
-        decisions.append(normalized)
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        try:
-            await HardRuleDecisionRepository(
-                create_session_factory(engine)
-            ).save_human_rule_decision(
+            artifacts = RunArtifactStore(self.settings.runs_dir / run_id)
+            if any(item.rule_id == normalized.rule_id for item in decisions):
+                raise ValueError(f"否决项已经处理：{normalized.rule_id}")
+            decisions.append(normalized)
+            await HardRuleDecisionRepository(sessions).save_human_rule_decision(
                 run_id,
                 normalized,
                 reason=normalized.rationale,
                 timestamp=normalized.decided_at,
             )
-        finally:
-            await engine.dispose()
-        _write_model_list(path, decisions)
-        if (self.settings.runs_dir / run_id / "evaluation-report.json").is_file():
-            await self.refresh_after_human_review(run_id)
-        return normalized
+            artifacts.write_model_list("human-rule-decisions.json", decisions)
+            if artifacts.exists("evaluation-report.json"):
+                await self._refresh_after_human_review(
+                    run=run,
+                    decisions=decisions,
+                    sessions=sessions,
+                )
+            return normalized
 
     async def resolve_panel_review(
         self, run_id: str, decision: HumanPanelDecision
     ) -> HumanPanelDecision:
-        await self._require_run(run_id)
-        normalized = HumanPanelDecision.model_validate(decision)
-        summary = await self._human_review_summary(run_id)
-        if not summary.panel_review_required:
-            raise ValueError("当前任务没有待处理的人工面板复核。")
-        path = self.settings.runs_dir / run_id / "human-panel-decision.json"
-        if path.is_file():
-            raise ValueError("人工面板复核已经处理。")
-        _write_model_atomic(path, normalized)
-        if (self.settings.runs_dir / run_id / "evaluation-report.json").is_file():
-            await self.refresh_after_human_review(run_id)
-        return normalized
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            sessions = unit_of_work.require_sessions()
+            run = await self._require_run(run_id, sessions=sessions)
+            normalized = HumanPanelDecision.model_validate(decision)
+            summary = await self._human_review_summary(run_id, sessions=sessions)
+            if not summary.panel_review_required:
+                raise ValueError("当前任务没有待处理的人工面板复核。")
+            artifacts = RunArtifactStore(self.settings.runs_dir / run_id)
+            if artifacts.exists("human-panel-decision.json"):
+                raise ValueError("人工面板复核已经处理。")
+            artifacts.write_model("human-panel-decision.json", normalized)
+            if artifacts.exists("evaluation-report.json"):
+                decisions = await self._human_rule_decisions(run_id, sessions=sessions)
+                await self._refresh_after_human_review(
+                    run=run,
+                    decisions=decisions,
+                    sessions=sessions,
+                )
+            return normalized
 
     async def refresh_after_human_review(self, run_id: str) -> RunRecord:
         """Recompute deterministic conclusions and reports without any model call."""
 
-        run = await self._require_run(run_id)
+        unit_of_work = ApplicationUnitOfWork(self.settings.database_url)
+        async with unit_of_work:
+            sessions = unit_of_work.require_sessions()
+            run = await self._require_run(run_id, sessions=sessions)
+            decisions = await self._human_rule_decisions(run_id, sessions=sessions)
+            return await self._refresh_after_human_review(
+                run=run,
+                decisions=decisions,
+                sessions=sessions,
+            )
+
+    async def _refresh_after_human_review(
+        self,
+        *,
+        run: RunRecord,
+        decisions: list[HumanRuleDecision],
+        sessions: async_sessionmaker[AsyncSession],
+    ) -> RunRecord:
+        run_id = run.run_id
         run_dir = self.settings.runs_dir / run_id
+        artifacts = RunArtifactStore(run_dir)
         rubric, selected_report, audit = _load_export_report_snapshot(run_dir)
         if not isinstance(selected_report, EvaluationReport):
             raise ValueError("该任务不是可刷新人工复核的双层评测报告。")
-        decisions = await self._human_rule_decisions(run_id)
-        human_panel_decision = _load_optional_model(
-            run_dir / "human-panel-decision.json", HumanPanelDecision
+        human_panel_decision = artifacts.load_optional_model(
+            "human-panel-decision.json", HumanPanelDecision
         )
         opinions = selected_report.expert_opinions
         initial = [item for item in opinions if item.round == "initial"]
@@ -611,16 +664,11 @@ class ReviewApplicationService:
             raise ValueError("仅已生成报告的任务可以刷新人工复核结论。")
         run.error = None
 
-        evidence_path = run_dir / "evidence.json"
-        evidence = (
-            [
-                EvidenceItem.model_validate(item)
-                for item in json.loads(evidence_path.read_text(encoding="utf-8"))
-            ]
-            if evidence_path.is_file()
-            else []
+        evidence = artifacts.load_model_list(
+            "evidence.json",
+            EvidenceItem,
         )
-        _write_model_atomic(run_dir / "evaluation-report.json", updated)
+        artifacts.write_model("evaluation-report.json", updated)
         write_report_bundle(
             run_dir=run_dir,
             run=run,
@@ -629,20 +677,14 @@ class ReviewApplicationService:
             audit=audit,
             evidence=evidence,
         )
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        sessions = create_session_factory(engine)
-        try:
-            repository = ReviewRepository(sessions)
-            await repository.save_panel_decision(run_id, panel_decision)
-            await repository.save_evaluation_report(run_id, updated)
-            await RunRepository(sessions).save(
-                run,
-                event_type="human_review_report_refreshed",
-                payload={"status": run.status.value, "pending_count": summary.pending_count},
-            )
-        finally:
-            await engine.dispose()
+        repository = ReviewRepository(sessions)
+        await repository.save_panel_decision(run_id, panel_decision)
+        await repository.save_evaluation_report(run_id, updated)
+        await RunRepository(sessions).save(
+            run,
+            event_type="human_review_report_refreshed",
+            payload={"status": run.status.value, "pending_count": summary.pending_count},
+        )
         return run
 
     async def resume_after_human_review(
@@ -654,10 +696,8 @@ class ReviewApplicationService:
         return await self.resume_review(run_id, event_sink=event_sink)
 
     async def cancel_review(self, run_id: str) -> RunRecord:
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        repository = RunRepository(create_session_factory(engine))
-        try:
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            repository = RunRepository(unit_of_work.require_sessions())
             run = await repository.get(run_id)
             if run is None:
                 raise ValueError(f"未知任务：{run_id}")
@@ -672,19 +712,13 @@ class ReviewApplicationService:
             run.error = None
             await repository.save(run, event_type="run_cancelled", payload={})
             return run
-        finally:
-            await engine.dispose()
 
     async def list_runs(
         self, *, search: str = "", status: RunStatus | None = None
     ) -> list[RunSummary]:
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        repository = RunRepository(create_session_factory(engine))
-        try:
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            repository = RunRepository(unit_of_work.require_sessions())
             records = await repository.list(status=status)
-        finally:
-            await engine.dispose()
         needle = search.casefold().strip()
         summaries = []
         for record in records:
@@ -703,64 +737,28 @@ class ReviewApplicationService:
         return [item for item in summaries if needle in item.paper_name.casefold()]
 
     async def get_run(self, run_id: str) -> RunDetail:
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        repository = RunRepository(create_session_factory(engine))
-        try:
-            run = await repository.get(run_id)
-        finally:
-            await engine.dispose()
-        if run is None:
-            raise ValueError(f"未知任务：{run_id}")
-        events = _load_trace_events(self.settings.runs_dir / run_id / "trace.jsonl", run_id)
-        snapshot = _provider_snapshot_for_display(self.settings.runs_dir / run_id, run)
-        human_review_summary = await self._human_review_summary(run_id)
-        human_panel_decision = _load_optional_model(
-            self.settings.runs_dir / run_id / "human-panel-decision.json",
-            HumanPanelDecision,
-        )
-        return RunDetail(
-            run=run,
-            provider_display_name=snapshot.display_name if snapshot else None,
-            provider_protocol=snapshot.protocol if snapshot else None,
-            events=events,
-            pending_hard_rules=await self._pending_hard_rules(run_id),
-            human_rule_decisions=await self._human_rule_decisions(run_id),
-            human_review_summary=human_review_summary,
-            human_panel_decision=human_panel_decision,
-        )
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            sessions = unit_of_work.require_sessions()
+            return await self._get_run_detail(run_id, sessions=sessions)
 
     async def load_report(self, run_id: str) -> ReportView:
-        detail = await self.get_run(run_id)
-        run_dir = self.settings.runs_dir / run_id
-        rubric, selected_report, audit = _load_export_report_snapshot(run_dir)
-        evaluation = selected_report if isinstance(selected_report, EvaluationReport) else None
-        review = (
-            selected_report.meta_review
-            if isinstance(selected_report, EvaluationReport)
-            else selected_report
-        )
-        document_path = run_dir / "document.json"
-        evidence_path = run_dir / "evidence.json"
-        document = (
-            DocumentInfo.model_validate_json(document_path.read_text(encoding="utf-8"))
-            if document_path.is_file()
-            else None
-        )
-        evidence = (
-            [
-                EvidenceItem.model_validate(item)
-                for item in json.loads(evidence_path.read_text("utf-8"))
-            ]
-            if evidence_path.is_file()
-            else []
-        )
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        try:
-            results = await ReviewRepository(create_session_factory(engine)).list_results(run_id)
-        finally:
-            await engine.dispose()
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            sessions = unit_of_work.require_sessions()
+            detail = await self._get_run_detail(run_id, sessions=sessions)
+            run_dir = self.settings.runs_dir / run_id
+            artifacts = RunArtifactStore(run_dir)
+            rubric, selected_report, audit = _load_export_report_snapshot(run_dir)
+            evaluation = (
+                selected_report if isinstance(selected_report, EvaluationReport) else None
+            )
+            review = (
+                selected_report.meta_review
+                if isinstance(selected_report, EvaluationReport)
+                else selected_report
+            )
+            document = artifacts.load_optional_model("document.json", DocumentInfo)
+            evidence = artifacts.load_model_list("evidence.json", EvidenceItem)
+            results = await ReviewRepository(sessions).list_results(run_id)
         dimension_scores = (
             {
                 item.criterion_id: float(item.rating)
@@ -786,6 +784,41 @@ class ReviewApplicationService:
             pending_hard_rules=detail.pending_hard_rules,
             human_panel_decision=detail.human_panel_decision,
             presentation_profile=load_presentation_profile(run_dir),
+        )
+
+    async def _get_run_detail(
+        self,
+        run_id: str,
+        *,
+        sessions: async_sessionmaker[AsyncSession],
+    ) -> RunDetail:
+        run = await RunRepository(sessions).get(run_id)
+        if run is None:
+            raise ValueError(f"未知任务：{run_id}")
+        events = _load_trace_events(self.settings.runs_dir / run_id / "trace.jsonl", run_id)
+        snapshot = _provider_snapshot_for_display(self.settings.runs_dir / run_id, run)
+        decisions = await self._human_rule_decisions(run_id, sessions=sessions)
+        pending_rules = await self._pending_hard_rules(
+            run_id, sessions=sessions, decisions=decisions
+        )
+        human_review_summary = await self._human_review_summary(
+            run_id, sessions=sessions, pending_rules=pending_rules
+        )
+        human_panel_decision = RunArtifactStore(
+            self.settings.runs_dir / run_id
+        ).load_optional_model(
+            "human-panel-decision.json",
+            HumanPanelDecision,
+        )
+        return RunDetail(
+            run=run,
+            provider_display_name=snapshot.display_name if snapshot else None,
+            provider_protocol=snapshot.protocol if snapshot else None,
+            events=events,
+            pending_hard_rules=pending_rules,
+            human_rule_decisions=decisions,
+            human_review_summary=human_review_summary,
+            human_panel_decision=human_panel_decision,
         )
 
     async def export_report(
@@ -864,11 +897,10 @@ class ReviewApplicationService:
     async def _read_run_for_export(self, run_id: str) -> RunRecord:
         """Read export eligibility without running migrations or update hooks."""
 
-        engine = create_engine(self.settings.database_url)
-        try:
-            run = await RunRepository(create_session_factory(engine)).get(run_id)
-        finally:
-            await engine.dispose()
+        async with ApplicationUnitOfWork(
+            self.settings.database_url, initialize=False
+        ) as unit_of_work:
+            run = await RunRepository(unit_of_work.require_sessions()).get(run_id)
         if run is None:
             raise ValueError(f"未知任务：{run_id}")
         return run
@@ -894,30 +926,44 @@ class ReviewApplicationService:
             event_sink=event_sink,
         )
 
-    async def _require_run(self, run_id: str) -> RunRecord:
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        try:
-            run = await RunRepository(create_session_factory(engine)).get(run_id)
-        finally:
-            await engine.dispose()
+    async def _require_run(
+        self,
+        run_id: str,
+        *,
+        sessions: async_sessionmaker[AsyncSession] | None = None,
+    ) -> RunRecord:
+        if sessions is not None:
+            run = await RunRepository(sessions).get(run_id)
+            if run is None:
+                raise ValueError(f"未知任务：{run_id}")
+            return run
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            run = await RunRepository(unit_of_work.require_sessions()).get(run_id)
         if run is None:
             raise ValueError(f"未知任务：{run_id}")
         return run
 
     async def _provider_is_referenced(self, provider_ref: str) -> bool:
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        try:
-            records = await RunRepository(create_session_factory(engine)).list()
-        finally:
-            await engine.dispose()
+        async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+            records = await RunRepository(unit_of_work.require_sessions()).list()
         return any(record.provider == provider_ref for record in records)
 
-    async def _pending_hard_rules(self, run_id: str) -> list[HardRuleAssessment]:
+    async def _pending_hard_rules(
+        self,
+        run_id: str,
+        *,
+        sessions: async_sessionmaker[AsyncSession] | None = None,
+        decisions: list[HumanRuleDecision] | None = None,
+    ) -> list[HardRuleAssessment]:
         run_dir = self.settings.runs_dir / run_id
-        assessments = _load_hard_rule_assessments(run_dir / "hard-rule-assessments.json")
-        resolved = {item.rule_id for item in await self._human_rule_decisions(run_id)}
+        assessments = RunArtifactStore(run_dir).load_model_list(
+            "hard-rule-assessments.json",
+            HardRuleAssessment,
+            invalid_message="否决项评估快照格式无效。",
+        )
+        if decisions is None:
+            decisions = await self._human_rule_decisions(run_id, sessions=sessions)
+        resolved = {item.rule_id for item in decisions}
 
         return [
             item
@@ -926,17 +972,27 @@ class ReviewApplicationService:
             and item.rule_id not in resolved
         ]
 
-    async def _human_rule_decisions(self, run_id: str) -> list[HumanRuleDecision]:
+    async def _human_rule_decisions(
+        self,
+        run_id: str,
+        *,
+        sessions: async_sessionmaker[AsyncSession] | None = None,
+    ) -> list[HumanRuleDecision]:
         run_dir = self.settings.runs_dir / run_id
-        decisions = _load_human_rule_decisions(run_dir / "human-rule-decisions.json")
-        engine = create_engine(self.settings.database_url)
-        await initialize_database(engine)
-        try:
-            persisted = await HardRuleDecisionRepository(
-                create_session_factory(engine)
-            ).list_human_rule_decisions(run_id)
-        finally:
-            await engine.dispose()
+        decisions = RunArtifactStore(run_dir).load_model_list(
+            "human-rule-decisions.json",
+            HumanRuleDecision,
+            invalid_message="人工复核快照格式无效。",
+        )
+        if sessions is None:
+            async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
+                persisted = await HardRuleDecisionRepository(
+                    unit_of_work.require_sessions()
+                ).list_human_rule_decisions(run_id)
+        else:
+            persisted = await HardRuleDecisionRepository(sessions).list_human_rule_decisions(
+                run_id
+            )
         by_rule = {item.rule_id: item for item in decisions}
         for item in persisted:
             decision = HumanRuleDecision.model_validate(
@@ -951,18 +1007,26 @@ class ReviewApplicationService:
             by_rule[decision.rule_id] = decision
         return list(by_rule.values())
 
-    async def _human_review_summary(self, run_id: str) -> HumanReviewSummary:
+    async def _human_review_summary(
+        self,
+        run_id: str,
+        *,
+        sessions: async_sessionmaker[AsyncSession] | None = None,
+        pending_rules: list[HardRuleAssessment] | None = None,
+    ) -> HumanReviewSummary:
         run_dir = self.settings.runs_dir / run_id
-        pending_rules = await self._pending_hard_rules(run_id)
-        human_panel_decision = _load_optional_model(
-            run_dir / "human-panel-decision.json", HumanPanelDecision
+        artifacts = RunArtifactStore(run_dir)
+        if pending_rules is None:
+            pending_rules = await self._pending_hard_rules(run_id, sessions=sessions)
+        human_panel_decision = artifacts.load_optional_model(
+            "human-panel-decision.json", HumanPanelDecision
         )
-        expert_panel_decision = _load_optional_model(
-            run_dir / "expert-panel-decision.json", PanelDecision
+        expert_panel_decision = artifacts.load_optional_model(
+            "expert-panel-decision.json", PanelDecision
         )
         if expert_panel_decision is None:
-            evaluation = _load_optional_model(
-                run_dir / "evaluation-report.json", EvaluationReport
+            evaluation = artifacts.load_optional_model(
+                "evaluation-report.json", EvaluationReport
             )
             if evaluation is not None:
                 expert_panel_decision = evaluation.expert_panel_decision
@@ -976,16 +1040,6 @@ class ReviewApplicationService:
         )
 
 
-def _web_search_client(settings: Settings) -> DdgsWebSearchClient:
-    return DdgsWebSearchClient(
-        backend=settings.web_search_backend,
-        region=settings.web_search_region,
-        safesearch=settings.web_search_safesearch,
-        min_interval_seconds=settings.web_search_min_interval_seconds,
-        timeout_seconds=settings.external_timeout_seconds,
-    )
-
-
 def _validation_messages(error: Exception) -> list[str]:
     if isinstance(error, ValidationError):
         return [
@@ -993,19 +1047,6 @@ def _validation_messages(error: Exception) -> list[str]:
             for item in error.errors()
         ]
     return [str(error)]
-
-
-def _adapter_from_snapshot(
-    snapshot: ProviderSnapshot, *, api_key: str, timeout: float
-) -> Any:
-    return create_model_adapter(
-        snapshot.provider_ref,
-        snapshot.model,
-        timeout=timeout,
-        api_key=api_key,
-        protocol=snapshot.protocol,
-        base_url=snapshot.base_url,
-    )
 
 
 def _provider_snapshot_for_display(
@@ -1235,8 +1276,9 @@ def _load_export_report_snapshot(
 ) -> tuple[RubricProfile, EvaluationReport | MetaReview, AuditReport]:
     """Load the immutable inputs needed for deterministic Markdown rebuilding."""
 
-    rubric_path = run_dir / "rubric.json"
-    audit_path = run_dir / "audit.json"
+    artifacts = RunArtifactStore(run_dir)
+    rubric_path = artifacts.path("rubric.json")
+    audit_path = artifacts.path("audit.json")
     missing = [
         label
         for label, path in (("rubric", rubric_path), ("audit", audit_path))
@@ -1245,25 +1287,20 @@ def _load_export_report_snapshot(
     if missing:
         raise ValueError(f"报告尚不完整：{', '.join(missing)}")
 
-    rubric = RubricProfile.model_validate_json(rubric_path.read_text(encoding="utf-8"))
-    audit = AuditReport.model_validate_json(audit_path.read_text(encoding="utf-8"))
-    candidates = (
-        run_dir / "evaluation-report.json",
-        run_dir / "report.json",
-        run_dir / "meta-review.json",
-    )
+    rubric = artifacts.load_model("rubric.json", RubricProfile)
+    audit = artifacts.load_model("audit.json", AuditReport)
+    candidates = ("evaluation-report.json", "report.json", "meta-review.json")
     invalid: list[str] = []
-    for path in candidates:
-        if not path.is_file():
+    for name in candidates:
+        if not artifacts.exists(name):
             continue
-        payload = path.read_text(encoding="utf-8")
         try:
-            return rubric, EvaluationReport.model_validate_json(payload), audit
+            return rubric, artifacts.load_model(name, EvaluationReport), audit
         except ValidationError:
             try:
-                return rubric, MetaReview.model_validate_json(payload), audit
+                return rubric, artifacts.load_model(name, MetaReview), audit
             except ValidationError:
-                invalid.append(path.name)
+                invalid.append(name)
     if invalid:
         raise ValueError("报告快照格式无效：" + "、".join(invalid))
     raise ValueError("报告尚不完整：evaluation/meta review")
@@ -1291,120 +1328,13 @@ def _load_trace_events(path: Path, run_id: str) -> list[RunEvent]:
     events: list[RunEvent] = []
     for row in read_json_lines(path):
         event_type = str(row.get("event_type", "event"))
-        payload = row.get("payload")
-        normalized_payload = payload if isinstance(payload, dict) else {}
-        timestamp = row.get("timestamp")
-        event_data: dict[str, object] = {
-            "run_id": run_id,
-            "event_type": event_type,
-            "status": _status_from_payload(normalized_payload),
-            "stage": _stage_from_event(event_type),
-            "message": _TRACE_MESSAGES.get(event_type, event_type.replace("_", " ")),
-            "payload": normalized_payload,
-        }
-        if isinstance(timestamp, str):
-            event_data["timestamp"] = timestamp
-        events.append(RunEvent.model_validate(event_data))
+        events.append(
+            project_run_event(
+                run_id=run_id,
+                event_type=event_type,
+                payload=row.get("payload"),
+                timestamp=row.get("timestamp"),
+                view=RunEventView.TRACE,
+            )
+        )
     return events
-
-
-def _status_from_payload(payload: dict[str, object]) -> RunStatus | None:
-    value = payload.get("status")
-    if not isinstance(value, str):
-        return None
-    try:
-        return RunStatus(value)
-    except ValueError:
-        return None
-
-
-def _stage_from_event(event_type: str) -> str | None:
-    for prefix, stage in (
-        ("ingest", "ingest"),
-        ("evidence", "evidence"),
-        ("reference", "evidence"),
-        ("scoring", "scoring"),
-        ("review", "reviews"),
-        ("audit", "audit"),
-        ("hard_rule", "hard_rule_gate"),
-        ("panel", "panel"),
-        ("supplemental", "supplemental"),
-        ("meta", "meta"),
-        ("report", "report"),
-    ):
-        if event_type.startswith(prefix):
-            return stage
-    return None
-
-
-_TRACE_MESSAGES = {
-    "run_created": "已创建评测任务",
-    "ingest_started": "正在解析论文",
-    "ingest_completed": "论文解析完成",
-    "evidence_collection_started": "正在收集外部学术证据",
-    "evidence_completed": "外部证据收集完成",
-    "reference_check_started": "正在自动核验参考文献",
-    "reference_check_completed": "参考文献自动核验完成",
-    "scoring_started": "专业化 Reviewer 正在执行九项诊断评分",
-    "scoring_completed": "九项诊断评分完成",
-    "reviews_started": "多位 Reviewer 正在评测",
-    "reviews_completed": "Reviewer 评测完成",
-    "audit_started": "正在执行确定性审计",
-    "audit_completed": "确定性审计完成",
-    "hard_rule_confirmation_required": "否决项需要人工确认",
-    "panel_review_started": "三名独立专家正在初评",
-    "panel_expert_completed": "独立专家评议完成",
-    "supplemental_review_started": "两名独立专家正在复评",
-    "panel_human_review_required": "专家无法判断，需要人工面板复核",
-    "panel_completed": "独立专家面板评议完成",
-    "meta_review_started": "正在汇总 Meta Review",
-    "meta_completed": "Meta Review 完成",
-    "report_validation_started": "正在验证并生成报告",
-    "report_completed": "评测报告已生成",
-    "stage_failed": "评测任务失败，可从检查点恢复",
-    "run_cancelled": "评测任务已取消",
-}
-
-
-def _load_hard_rule_assessments(path: Path) -> list[HardRuleAssessment]:
-    if not path.is_file():
-        return []
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        raise ValueError("否决项评估快照格式无效。")
-    return [HardRuleAssessment.model_validate(item) for item in payload]
-
-
-def _load_human_rule_decisions(path: Path) -> list[HumanRuleDecision]:
-    if not path.is_file():
-        return []
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        raise ValueError("人工复核快照格式无效。")
-    return [HumanRuleDecision.model_validate(item) for item in payload]
-
-
-def _write_model_list(path: Path, items: list[HumanRuleDecision]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [item.model_dump(mode="json") for item in items]
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
-def _write_model_atomic(path: Path, model: BaseModel) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(model.model_dump_json(indent=2), encoding="utf-8")
-    temporary.replace(path)
-
-
-def _load_optional_model[ModelT: BaseModel](
-    path: Path, model_type: type[ModelT]
-) -> ModelT | None:
-    if not path.is_file():
-        return None
-    return model_type.model_validate_json(path.read_text(encoding="utf-8"))

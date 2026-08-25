@@ -6,11 +6,10 @@ import json
 import re
 import sqlite3
 import uuid
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
 
 from paper_reviewer.adapters.persistence.repositories import (
@@ -22,8 +21,10 @@ from paper_reviewer.adapters.persistence.repositories import (
 from paper_reviewer.agents.meta_reviewer import run_meta_reviewer
 from paper_reviewer.agents.panel_reviewer import run_panel_reviewer
 from paper_reviewer.agents.reviewer import run_reviewer
+from paper_reviewer.application.artifacts import RunArtifactStore
 from paper_reviewer.application.evidence_builder import build_external_evidence
 from paper_reviewer.application.models import RunEvent
+from paper_reviewer.application.pipeline import PipelineContext
 from paper_reviewer.application.providers import builtin_provider_connections
 from paper_reviewer.application.reference_checker import (
     MAX_EXTRACTED_REFERENCES,
@@ -31,6 +32,7 @@ from paper_reviewer.application.reference_checker import (
     extract_references,
 )
 from paper_reviewer.application.review_planner import ReviewPlan, build_review_plan
+from paper_reviewer.application.run_events import project_run_event
 from paper_reviewer.application.state_machine import transition
 from paper_reviewer.config import ReviewerProfile, ReviewProfile, Settings
 from paper_reviewer.domain.document import DocumentBlock, DocumentInfo
@@ -137,14 +139,11 @@ class ReviewOrchestrator:
         if provider_snapshot is None:
             provider_snapshot = _builtin_provider_snapshot(provider, model_name)
         if provider_snapshot is not None and (
-            provider_snapshot.provider_ref != provider
-            or provider_snapshot.model != model_name
+            provider_snapshot.provider_ref != provider or provider_snapshot.model != model_name
         ):
             raise ValueError("Provider 快照与任务 Provider 或模型不一致。")
         if provider.startswith("custom:") and provider_snapshot is None:
-            raise ValueError(
-                "自定义 Provider 任务必须由桌面端提供不可变 Provider 快照。"
-            )
+            raise ValueError("自定义 Provider 任务必须由桌面端提供不可变 Provider 快照。")
         if _is_dual_advisory(rubric):
             if cloud_processing_authorized is not True:
                 raise ValueError("cloud processing authorization is required")
@@ -177,32 +176,22 @@ class ReviewOrchestrator:
         await self.runs.create(run)
         run_dir = self.settings.runs_dir / run.run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = RunArtifactStore(run_dir)
         if provider_snapshot is not None:
-            _write_json_atomic(
-                run_dir / "provider.json",
-                provider_snapshot.model_dump(mode="json"),
-            )
-        (run_dir / "rubric.json").write_text(rubric.model_dump_json(indent=2), encoding="utf-8")
-        (run_dir / "review-profile.json").write_text(
-            profile.model_dump_json(indent=2), encoding="utf-8"
-        )
+            artifacts.write_json("provider.json", provider_snapshot.model_dump(mode="json"))
+        artifacts.write_model("rubric.json", rubric)
+        artifacts.write_model("review-profile.json", profile)
         if panel_profile is not None:
-            (run_dir / "panel-profile.json").write_text(
-                panel_profile.model_dump_json(indent=2), encoding="utf-8"
-            )
-        (run_dir / "request-context.json").write_text(
-            json.dumps(
-                {
-                    "discipline_name": discipline_name,
-                    "discipline_profile": discipline_profile_text,
-                    "cloud_processing_authorized": bool(cloud_processing_authorized),
-                    "contains_classified_material": contains_classified_material,
-                    "external_search": external_search,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+            artifacts.write_model("panel-profile.json", panel_profile)
+        artifacts.write_json(
+            "request-context.json",
+            {
+                "discipline_name": discipline_name,
+                "discipline_profile": discipline_profile_text,
+                "cloud_processing_authorized": bool(cloud_processing_authorized),
+                "contains_classified_material": contains_classified_material,
+                "external_search": external_search,
+            },
         )
         self._append_trace(run.run_id, "run_created", {"status": run.status.value})
         return await self.execute(
@@ -228,531 +217,24 @@ class ReviewOrchestrator:
         discipline_profile = context.get("discipline_profile")
         if discipline_profile is not None and not isinstance(discipline_profile, str):
             discipline_profile = None
+        pipeline = PipelineContext(
+            run=run,
+            run_dir=run_dir,
+            rubric=rubric,
+            panel_profile=panel_profile,
+            plan=plan,
+            dual_advisory=dual_advisory,
+            discipline_name=discipline_name,
+            discipline_profile=discipline_profile,
+        )
         try:
-            if "ingest" not in run.completed_stages:
-                await self._set_status(run, RunStatus.INGESTING, "ingest_started")
-                parsed = await asyncio.to_thread(self.parser.parse, Path(run.input_path))
-                await self.documents.add_blocks(run.run_id, parsed.blocks)
-                (run_dir / "document.json").write_text(
-                    parsed.info.model_dump_json(indent=2), encoding="utf-8"
-                )
-                await self._complete_stage(run, "ingest", RunStatus.INGESTED)
-            else:
-                parsed = None
-
-            document = (
-                parsed.info
-                if parsed
-                else DocumentInfo.model_validate_json(
-                    (run_dir / "document.json").read_text(encoding="utf-8")
-                )
-            )
-            blocks = await self.documents.list_blocks(run.run_id)
-            reference_report_path = run_dir / "reference-checks.json"
-            reference_report = ReferenceCheckReport()
-
-            if "evidence" not in run.completed_stages:
-                await self._set_status(
-                    run, RunStatus.BUILDING_EVIDENCE, "evidence_collection_started"
-                )
-                evidence, warnings = await build_external_evidence(
-                    run_id=run.run_id,
-                    query=document.title or "academic paper",
-                    clients=self.scholarly_clients,
-                )
-                extracted_references = extract_references(
-                    blocks,
-                    max_references=min(
-                        self.settings.max_reference_checks + 1,
-                        MAX_EXTRACTED_REFERENCES,
-                    ),
-                )
-                reference_entries = extracted_references[
-                    : self.settings.max_reference_checks
-                ]
-                if reference_entries and (
-                    self.web_search_client is not None or self.scholarly_clients
-                ):
-                    self._append_trace(
-                        run.run_id,
-                        "reference_check_started",
-                        {"count": len(reference_entries)},
-                    )
-                    reference_report, reference_evidence = await check_references(
-                        run_id=run.run_id,
-                        entries=reference_entries,
-                        web_search=self.web_search_client,
-                        scholarly_clients=self.scholarly_clients,
-                        per_source_limit=self.settings.reference_search_results,
-                        max_concurrency=self.settings.reference_check_concurrency,
-                    )
-                    if len(extracted_references) > len(reference_entries):
-                        reference_report.warnings.insert(
-                            0,
-                            "参考文献超过本次自动核验上限 "
-                            f"{self.settings.max_reference_checks} 条；其余条目建议人工核对。",
-                        )
-                    evidence_by_id = {item.evidence_id: item for item in evidence}
-                    for item in reference_evidence:
-                        evidence_by_id.setdefault(item.evidence_id, item)
-                    evidence = list(evidence_by_id.values())
-                    warnings.extend(reference_report.warnings)
-                    self._append_trace(
-                        run.run_id,
-                        "reference_check_completed",
-                        {
-                            "count": len(reference_report.checks),
-                            "verified": reference_report.verified_count,
-                            "probable": reference_report.probable_count,
-                            "unresolved": reference_report.unresolved_count,
-                        },
-                    )
-                _write_json_atomic(
-                    reference_report_path,
-                    reference_report.model_dump(mode="json"),
-                )
-                await self.evidence.replace(run.run_id, evidence)
-                await self._complete_stage(
-                    run,
-                    "evidence",
-                    RunStatus.EVIDENCE_READY,
-                    payload={
-                        "count": len(evidence),
-                        "reference_checks": len(reference_report.checks),
-                        "reference_verified": reference_report.verified_count,
-                        "reference_probable": reference_report.probable_count,
-                        "reference_unresolved": reference_report.unresolved_count,
-                        "warnings": warnings,
-                    },
-                )
-            elif reference_report_path.is_file():
-                reference_report = ReferenceCheckReport.model_validate_json(
-                    reference_report_path.read_text(encoding="utf-8")
-                )
-            evidence = await self.evidence.list(run.run_id)
-
-            scoring_stage = "scoring" if dual_advisory else "reviews"
-            scoring_status = RunStatus.SCORING if dual_advisory else RunStatus.REVIEWING
-            if scoring_stage not in run.completed_stages:
-                await self._set_status(
-                    run,
-                    scoring_status,
-                    "scoring_started" if dual_advisory else "reviews_started",
-                )
-                stored_results = await self.reviews.list_results(run.run_id)
-                assigned_ids = {item.reviewer.reviewer_id for item in plan.assignments}
-                completed_ids = {
-                    item.reviewer_id for item in stored_results if item.reviewer_id in assigned_ids
-                }
-                await self._run_reviewers(
-                    run=run,
-                    plan=plan,
-                    rubric=rubric,
-                    document=document,
-                    blocks=blocks,
-                    evidence=evidence,
-                    reviewer_ids=assigned_ids - completed_ids,
-                    discipline_name=discipline_name,
-                    discipline_profile=discipline_profile,
-                    persist_results=True,
-                )
-                await self._complete_stage(
-                    run,
-                    scoring_stage,
-                    RunStatus.AUDITING,
-                    payload={"count": len(assigned_ids)},
-                )
-            stored_results = await self.reviews.list_results(run.run_id)
-            assigned_ids = {item.reviewer.reviewer_id for item in plan.assignments}
-            results = [item for item in stored_results if item.reviewer_id in assigned_ids]
-
-            if "audit" not in run.completed_stages:
-                if run.status != RunStatus.AUDITING:
-                    await self._set_status(run, RunStatus.AUDITING, "audit_started")
-                results = await self._repair_invalid_reviewer_references(
-                    run=run,
-                    plan=plan,
-                    rubric=rubric,
-                    document=document,
-                    blocks=blocks,
-                    evidence=evidence,
-                    results=results,
-                    discipline_name=discipline_name,
-                    discipline_profile=discipline_profile,
-                )
-                if dual_advisory:
-                    criterion_assessments = [
-                        assessment
-                        for result in results
-                        for assessment in result.criterion_assessments
-                    ]
-                    hard_rules = _collect_hard_rule_assessments(results)
-                    reviewer_dimensions: dict[str, Collection[str]] = {
-                        item.reviewer.reviewer_id: item.dimension_ids
-                        for item in plan.assignments
-                    }
-                    reference_audit = AuditReport()
-                    block_ids = {item.block_id for item in blocks}
-                    block_by_id = {item.block_id: item for item in blocks}
-                    evidence_ids = {item.evidence_id for item in evidence}
-                    for result in results:
-                        reference_audit.errors.extend(
-                            reviewer_reference_errors(
-                                result=result,
-                                block_ids=block_ids,
-                                evidence_ids=evidence_ids,
-                                block_by_id=block_by_id,
-                            )
-                        )
-                    criterion_audit = audit_criterion_assessments(
-                        assessments=criterion_assessments,
-                        rubric=rubric,
-                        blocks=blocks,
-                        evidence=evidence,
-                        reviewer_dimensions=reviewer_dimensions,
-                    )
-                    hard_rule_audit = audit_hard_rule_assessments(
-                        assessments=hard_rules,
-                        known_rule_ids={item.rule_id for item in rubric.hard_rules},
-                        human_decisions=[],
-                        blocks=blocks,
-                        evidence=evidence,
-                    )
-                    audit = _combine_audits(
-                        reference_audit, criterion_audit, hard_rule_audit
-                    )
-                    diagnostic = DiagnosticScore(
-                        assessments=criterion_assessments,
-                        group_scores=_diagnostic_group_scores(
-                            rubric, criterion_assessments
-                        ),
-                        total_score=round(
-                            sum(item.weighted_contribution for item in criterion_assessments),
-                            2,
-                        ),
-                    )
-                    await self.reviews.save_diagnostic_score(run.run_id, diagnostic)
-                    (run_dir / "diagnostic-score.json").write_text(
-                        diagnostic.model_dump_json(indent=2), encoding="utf-8"
-                    )
-                    await self.reviews.artifacts.save_json(
-                        run.run_id,
-                        "hard_rule_assessments",
-                        hard_rules,
-                        replace=True,
-                    )
-                    _write_models(run_dir / "hard-rule-assessments.json", hard_rules)
-                else:
-                    audit = audit_reviews(
-                        results=results,
-                        rubric=rubric,
-                        blocks=blocks,
-                        evidence=evidence,
-                    )
-                for warning in reference_report.warnings:
-                    if warning not in audit.warnings:
-                        audit.warnings.append(warning)
-                (run_dir / "audit.json").write_text(
-                    audit.model_dump_json(indent=2), encoding="utf-8"
-                )
-                if not audit.passed:
-                    message = "deterministic review audit failed: " + "; ".join(audit.errors)
-                    raise ValueError(message)
-                if dual_advisory:
-                    await self._complete_stage(
-                        run, "audit", RunStatus.PANEL_REVIEWING
-                    )
-                else:
-                    await self._complete_stage(run, "audit", RunStatus.META_REVIEWING)
-            else:
-                audit = AuditReport.model_validate_json(
-                    (run_dir / "audit.json").read_text(encoding="utf-8")
-                )
-
-            if dual_advisory and "panel" not in run.completed_stages:
-                hard_rules_path = run_dir / "hard-rule-assessments.json"
-                hard_rules = _load_models(hard_rules_path, HardRuleAssessment)
-                if not hard_rules_path.is_file():
-                    stored_hard_rules = await self.reviews.artifacts.get_json(
-                        run.run_id, artifact_type="hard_rule_assessments"
-                    )
-                    if isinstance(stored_hard_rules, list):
-                        hard_rules = [
-                            HardRuleAssessment.model_validate(item)
-                            for item in stored_hard_rules
-                        ]
-                human_decisions = _load_models(
-                    run_dir / "human-rule-decisions.json", HumanRuleDecision
-                )
-                human_decisions = _merge_human_decisions(
-                    human_decisions,
-                    [
-                        _human_decision_from_repository(item)
-                        for item in await self.reviews.hard_rules.list_human_rule_decisions(
-                            run.run_id
-                        )
-                    ],
-                )
-                opinions_path = run_dir / "expert-opinions.json"
-                opinions = _load_models(opinions_path, ExpertOpinion)
-                persisted_opinions = [
-                    ExpertOpinion.model_validate(item)
-                    for item in await self.reviews.list_expert_opinion_payloads(run.run_id)
-                ]
-                opinions = _merge_expert_opinions(opinions, persisted_opinions)
-                if panel_profile is None:
-                    panel_profile = _load_panel_profile_snapshot(run_dir)
-                if panel_profile is None or len(panel_profile.reviewers) < 5:
-                    raise ValueError(
-                        "dual-advisory evaluation requires a five-member panel profile"
-                    )
-                if run.status is not RunStatus.PANEL_REVIEWING:
-                    await self._set_status(
-                        run, RunStatus.PANEL_REVIEWING, "panel_review_started"
-                    )
-                opinions = await self._run_panel_round(
-                    run=run,
-                    experts=panel_profile.reviewers[:3],
-                    round_name="initial",
-                    rubric=rubric,
-                    document=document,
-                    blocks=blocks,
-                    evidence=evidence,
-                    findings=[finding for item in results for finding in item.findings],
-                    discipline_name=discipline_name,
-                    discipline_profile=discipline_profile,
-                    existing=opinions,
-                    output_path=opinions_path,
-                )
-                initial = [item for item in opinions if item.round == "initial"]
-                supplemental = [item for item in opinions if item.round == "supplemental"]
-                expert_decision = decide_expert_panel(
-                    initial=initial,
-                    supplemental=supplemental,
-                )
-                if expert_decision.outcome is PanelOutcome.SUPPLEMENTAL_REQUIRED:
-                    await self._set_status(
-                        run,
-                        RunStatus.SUPPLEMENTAL_REVIEWING,
-                        "supplemental_review_started",
-                    )
-                    opinions = await self._run_panel_round(
-                        run=run,
-                        experts=panel_profile.reviewers[3:5],
-                        round_name="supplemental",
-                        rubric=rubric,
-                        document=document,
-                        blocks=blocks,
-                        evidence=evidence,
-                        findings=[finding for item in results for finding in item.findings],
-                        discipline_name=discipline_name,
-                        discipline_profile=discipline_profile,
-                        existing=opinions,
-                        output_path=opinions_path,
-                    )
-                    expert_decision = decide_expert_panel(
-                        initial=[item for item in opinions if item.round == "initial"],
-                        supplemental=[
-                            item for item in opinions if item.round == "supplemental"
-                        ],
-                    )
-                human_panel_decision = _load_optional_model(
-                    run_dir / "human-panel-decision.json", HumanPanelDecision
-                )
-                decision = decide_panel(
-                    initial=[item for item in opinions if item.round == "initial"],
-                    supplemental=[item for item in opinions if item.round == "supplemental"],
-                    hard_rules=hard_rules,
-                    human_decisions=human_decisions,
-                    human_panel_decision=human_panel_decision,
-                )
-                (run_dir / "expert-panel-decision.json").write_text(
-                    expert_decision.model_dump_json(indent=2), encoding="utf-8"
-                )
-                (run_dir / "panel-decision.json").write_text(
-                    decision.model_dump_json(indent=2), encoding="utf-8"
-                )
-                await self.reviews.save_panel_decision(run.run_id, decision)
-                await self._complete_stage(run, "panel", RunStatus.SYNTHESIZING)
-
-            if "meta" not in run.completed_stages:
-                meta_status = RunStatus.SYNTHESIZING if dual_advisory else RunStatus.META_REVIEWING
-                if run.status != meta_status:
-                    await self._set_status(run, meta_status, "meta_review_started")
-                meta = await run_meta_reviewer(
-                    run_id=run.run_id,
-                    model=self.model,
-                    rubric=rubric,
-                    results=results,
-                    audit=audit,
-                    max_repairs=self.settings.max_output_repairs,
-                    event_sink=lambda event, payload: self._append_trace(
-                        run.run_id, event, payload
-                    ),
-                )
-                final_audit = audit_meta_review(
-                    meta=meta,
-                    source_results=results,
-                    blocks=blocks,
-                    evidence=evidence,
-                    scoring_enabled=rubric.scoring_enabled,
-                )
-                if not final_audit.passed:
-                    message = "meta review audit failed: " + "; ".join(final_audit.errors)
-                    raise ValueError(message)
-                if dual_advisory:
-                    meta.total_score = None
-                    meta.verdict = None
-                else:
-                    aggregated = aggregate_scores(rubric, results)
-                    meta.total_score = aggregated.total_score
-                    meta.verdict = aggregated.verdict
-                (run_dir / "meta-review.json").write_text(
-                    meta.model_dump_json(indent=2), encoding="utf-8"
-                )
-                await self._complete_stage(run, "meta", RunStatus.VALIDATING)
-            else:
-                meta = MetaReview.model_validate_json(
-                    (run_dir / "meta-review.json").read_text(encoding="utf-8")
-                )
-
-            evaluation: EvaluationReport | None = None
-            if dual_advisory:
-                diagnostic_path = run_dir / "diagnostic-score.json"
-                if diagnostic_path.is_file():
-                    diagnostic = DiagnosticScore.model_validate_json(
-                        diagnostic_path.read_text(encoding="utf-8")
-                    )
-                else:
-                    stored_diagnostic = await self.reviews.get_diagnostic_score(run.run_id)
-                    if not isinstance(stored_diagnostic, dict):
-                        raise ValueError("diagnostic score checkpoint is missing")
-                    diagnostic = DiagnosticScore.model_validate(stored_diagnostic)
-                hard_rules_path = run_dir / "hard-rule-assessments.json"
-                hard_rules = _load_models(hard_rules_path, HardRuleAssessment)
-                if not hard_rules_path.is_file():
-                    stored_hard_rules = await self.reviews.artifacts.get_json(
-                        run.run_id, artifact_type="hard_rule_assessments"
-                    )
-                    if isinstance(stored_hard_rules, list):
-                        hard_rules = [
-                            HardRuleAssessment.model_validate(item)
-                            for item in stored_hard_rules
-                        ]
-                human_decisions = _load_models(
-                    run_dir / "human-rule-decisions.json", HumanRuleDecision
-                )
-                human_decisions = _merge_human_decisions(
-                    human_decisions,
-                    [
-                        _human_decision_from_repository(item)
-                        for item in await self.reviews.hard_rules.list_human_rule_decisions(
-                            run.run_id
-                        )
-                    ],
-                )
-                opinions = _load_models(run_dir / "expert-opinions.json", ExpertOpinion)
-                opinions = _merge_expert_opinions(
-                    opinions,
-                    [
-                        ExpertOpinion.model_validate(item)
-                        for item in await self.reviews.list_expert_opinion_payloads(
-                            run.run_id
-                        )
-                    ],
-                )
-                initial = [item for item in opinions if item.round == "initial"]
-                supplemental = [item for item in opinions if item.round == "supplemental"]
-                expert_panel_decision = decide_expert_panel(
-                    initial=initial,
-                    supplemental=supplemental,
-                )
-                human_panel_decision = _load_optional_model(
-                    run_dir / "human-panel-decision.json", HumanPanelDecision
-                )
-                panel_decision = decide_panel(
-                    initial=initial,
-                    supplemental=supplemental,
-                    hard_rules=hard_rules,
-                    human_decisions=human_decisions,
-                    human_panel_decision=human_panel_decision,
-                )
-                human_review_summary = build_human_review_summary(
-                    hard_rules=hard_rules,
-                    human_decisions=human_decisions,
-                    expert_panel_decision=expert_panel_decision,
-                    human_panel_decision=human_panel_decision,
-                )
-                policy_value = getattr(rubric, "policy_context", None) or getattr(
-                    rubric, "policy", None
-                )
-                if policy_value is None:
-                    raise ValueError("dual-advisory rubric is missing policy context")
-                evaluation = EvaluationReport(
-                    run_id=run.run_id,
-                    policy_context=PolicyContext.model_validate(policy_value),
-                    diagnostic_score=diagnostic,
-                    hard_rule_assessments=hard_rules,
-                    human_rule_decisions=human_decisions,
-                    expert_opinions=opinions,
-                    expert_panel_decision=expert_panel_decision,
-                    human_panel_decision=human_panel_decision,
-                    human_review_summary=human_review_summary,
-                    panel_decision=panel_decision,
-                    meta_review=meta,
-                )
-                findings = [finding for item in results for finding in item.findings]
-                panel_audit = audit_expert_opinions(
-                    opinions=opinions,
-                    findings=findings,
-                    blocks=blocks,
-                    evidence=evidence,
-                )
-                resolved_hard_rule_audit = audit_hard_rule_assessments(
-                    assessments=hard_rules,
-                    known_rule_ids={item.rule_id for item in rubric.hard_rules},
-                    human_decisions=human_decisions,
-                    blocks=blocks,
-                    evidence=evidence,
-                )
-                evaluation_audit = audit_evaluation_report(report=evaluation)
-                final_evaluation_audit = _combine_audits(
-                    panel_audit, resolved_hard_rule_audit, evaluation_audit
-                )
-                if not final_evaluation_audit.passed:
-                    raise ValueError(
-                        "evaluation report audit failed: "
-                        + "; ".join(final_evaluation_audit.errors)
-                    )
-                (run_dir / "evaluation-report.json").write_text(
-                    evaluation.model_dump_json(indent=2), encoding="utf-8"
-                )
-                await self.reviews.save_evaluation_report(run.run_id, evaluation)
-
-            if "report" not in run.completed_stages:
-                if run.status != RunStatus.VALIDATING:
-                    await self._set_status(run, RunStatus.VALIDATING, "report_validation_started")
-                projected_run = run.model_copy(deep=True)
-                projected_run.completed_stages.append("report")
-                target_status = (
-                    RunStatus.REPORTED_PENDING_HUMAN_REVIEW
-                    if evaluation is not None
-                    and not evaluation.human_review_summary.complete
-                    else RunStatus.REPORTED
-                )
-                projected_run.status = transition(projected_run.status, target_status)
-                write_report_bundle(
-                    run_dir=run_dir,
-                    run=projected_run,
-                    rubric=rubric,
-                    review=evaluation or meta,
-                    audit=audit,
-                    evidence=evidence,
-                )
-                run.completed_stages = projected_run.completed_stages
-                run.status = projected_run.status
-                await self.runs.save(run, event_type="report_completed", payload={})
-                self._append_trace(run.run_id, "report_completed", {})
+            await self._execute_ingest_stage(pipeline)
+            await self._execute_evidence_stage(pipeline)
+            await self._execute_reviews_stage(pipeline)
+            await self._execute_audit_stage(pipeline)
+            await self._execute_panel_stage(pipeline)
+            await self._execute_meta_stage(pipeline)
+            await self._execute_report_stage(pipeline)
             return run
         except asyncio.CancelledError:
             run.error = None
@@ -796,6 +278,490 @@ class ReviewOrchestrator:
             if _is_database_error(error):
                 raise SanitizedDatabaseError(safe_message, original_error=error) from None
             raise
+
+    async def _execute_ingest_stage(self, pipeline: PipelineContext) -> None:
+        run = pipeline.run
+        artifacts = RunArtifactStore(pipeline.run_dir)
+        if "ingest" not in run.completed_stages:
+            await self._set_status(run, RunStatus.INGESTING, "ingest_started")
+            parsed = await asyncio.to_thread(self.parser.parse, Path(run.input_path))
+            await self.documents.add_blocks(run.run_id, parsed.blocks)
+            artifacts.write_model("document.json", parsed.info)
+            await self._complete_stage(run, "ingest", RunStatus.INGESTED)
+            pipeline.document = parsed.info
+        else:
+            pipeline.document = artifacts.load_model("document.json", DocumentInfo)
+        pipeline.blocks = await self.documents.list_blocks(run.run_id)
+
+    async def _execute_evidence_stage(self, pipeline: PipelineContext) -> None:
+        run = pipeline.run
+        assert pipeline.document is not None
+        artifacts = RunArtifactStore(pipeline.run_dir)
+        reference_report_path = pipeline.run_dir / "reference-checks.json"
+        reference_report = ReferenceCheckReport()
+        if "evidence" not in run.completed_stages:
+            await self._set_status(run, RunStatus.BUILDING_EVIDENCE, "evidence_collection_started")
+            evidence, warnings = await build_external_evidence(
+                run_id=run.run_id,
+                query=pipeline.document.title or "academic paper",
+                clients=self.scholarly_clients,
+            )
+            extracted_references = extract_references(
+                pipeline.blocks,
+                max_references=min(
+                    self.settings.max_reference_checks + 1,
+                    MAX_EXTRACTED_REFERENCES,
+                ),
+            )
+            reference_entries = extracted_references[: self.settings.max_reference_checks]
+            if reference_entries and (self.web_search_client is not None or self.scholarly_clients):
+                self._append_trace(
+                    run.run_id,
+                    "reference_check_started",
+                    {"count": len(reference_entries)},
+                )
+                reference_report, reference_evidence = await check_references(
+                    run_id=run.run_id,
+                    entries=reference_entries,
+                    web_search=self.web_search_client,
+                    scholarly_clients=self.scholarly_clients,
+                    per_source_limit=self.settings.reference_search_results,
+                    max_concurrency=self.settings.reference_check_concurrency,
+                )
+                if len(extracted_references) > len(reference_entries):
+                    reference_report.warnings.insert(
+                        0,
+                        "参考文献超过本次自动核验上限 "
+                        f"{self.settings.max_reference_checks} 条；其余条目建议人工核对。",
+                    )
+                evidence_by_id = {item.evidence_id: item for item in evidence}
+                for item in reference_evidence:
+                    evidence_by_id.setdefault(item.evidence_id, item)
+                evidence = list(evidence_by_id.values())
+                warnings.extend(reference_report.warnings)
+                self._append_trace(
+                    run.run_id,
+                    "reference_check_completed",
+                    {
+                        "count": len(reference_report.checks),
+                        "verified": reference_report.verified_count,
+                        "probable": reference_report.probable_count,
+                        "unresolved": reference_report.unresolved_count,
+                    },
+                )
+            artifacts.write_json("reference-checks.json", reference_report.model_dump(mode="json"))
+            await self.evidence.replace(run.run_id, evidence)
+            await self._complete_stage(
+                run,
+                "evidence",
+                RunStatus.EVIDENCE_READY,
+                payload={
+                    "count": len(evidence),
+                    "reference_checks": len(reference_report.checks),
+                    "reference_verified": reference_report.verified_count,
+                    "reference_probable": reference_report.probable_count,
+                    "reference_unresolved": reference_report.unresolved_count,
+                    "warnings": warnings,
+                },
+            )
+        elif reference_report_path.is_file():
+            reference_report = artifacts.load_model("reference-checks.json", ReferenceCheckReport)
+        pipeline.reference_report = reference_report
+        pipeline.evidence = await self.evidence.list(run.run_id)
+
+    async def _execute_reviews_stage(self, pipeline: PipelineContext) -> None:
+        run = pipeline.run
+        assert pipeline.document is not None
+        scoring_stage = "scoring" if pipeline.dual_advisory else "reviews"
+        scoring_status = RunStatus.SCORING if pipeline.dual_advisory else RunStatus.REVIEWING
+        assigned_ids = {item.reviewer.reviewer_id for item in pipeline.plan.assignments}
+        if scoring_stage not in run.completed_stages:
+            await self._set_status(
+                run,
+                scoring_status,
+                "scoring_started" if pipeline.dual_advisory else "reviews_started",
+            )
+            stored_results = await self.reviews.list_results(run.run_id)
+            completed_ids = {
+                item.reviewer_id for item in stored_results if item.reviewer_id in assigned_ids
+            }
+            await self._run_reviewers(
+                run=run,
+                plan=pipeline.plan,
+                rubric=pipeline.rubric,
+                document=pipeline.document,
+                blocks=pipeline.blocks,
+                evidence=pipeline.evidence,
+                reviewer_ids=assigned_ids - completed_ids,
+                discipline_name=pipeline.discipline_name,
+                discipline_profile=pipeline.discipline_profile,
+                persist_results=True,
+            )
+            await self._complete_stage(
+                run,
+                scoring_stage,
+                RunStatus.AUDITING,
+                payload={"count": len(assigned_ids)},
+            )
+        stored_results = await self.reviews.list_results(run.run_id)
+        pipeline.results = [item for item in stored_results if item.reviewer_id in assigned_ids]
+
+    async def _execute_audit_stage(self, pipeline: PipelineContext) -> None:
+        run = pipeline.run
+        assert pipeline.document is not None
+        artifacts = RunArtifactStore(pipeline.run_dir)
+        if "audit" in run.completed_stages:
+            pipeline.audit = artifacts.load_model("audit.json", AuditReport)
+            return
+        if run.status != RunStatus.AUDITING:
+            await self._set_status(run, RunStatus.AUDITING, "audit_started")
+        pipeline.results = await self._repair_invalid_reviewer_references(
+            run=run,
+            plan=pipeline.plan,
+            rubric=pipeline.rubric,
+            document=pipeline.document,
+            blocks=pipeline.blocks,
+            evidence=pipeline.evidence,
+            results=pipeline.results,
+            discipline_name=pipeline.discipline_name,
+            discipline_profile=pipeline.discipline_profile,
+        )
+        if pipeline.dual_advisory:
+            criterion_assessments = [
+                assessment
+                for result in pipeline.results
+                for assessment in result.criterion_assessments
+            ]
+            hard_rules = _collect_hard_rule_assessments(pipeline.results)
+            reviewer_dimensions: dict[str, Collection[str]] = {
+                item.reviewer.reviewer_id: item.dimension_ids for item in pipeline.plan.assignments
+            }
+            reference_audit = AuditReport()
+            block_ids = {item.block_id for item in pipeline.blocks}
+            block_by_id = {item.block_id: item for item in pipeline.blocks}
+            evidence_ids = {item.evidence_id for item in pipeline.evidence}
+            for result in pipeline.results:
+                reference_audit.errors.extend(
+                    reviewer_reference_errors(
+                        result=result,
+                        block_ids=block_ids,
+                        evidence_ids=evidence_ids,
+                        block_by_id=block_by_id,
+                    )
+                )
+            criterion_audit = audit_criterion_assessments(
+                assessments=criterion_assessments,
+                rubric=pipeline.rubric,
+                blocks=pipeline.blocks,
+                evidence=pipeline.evidence,
+                reviewer_dimensions=reviewer_dimensions,
+            )
+            hard_rule_audit = audit_hard_rule_assessments(
+                assessments=hard_rules,
+                known_rule_ids={item.rule_id for item in pipeline.rubric.hard_rules},
+                human_decisions=[],
+                blocks=pipeline.blocks,
+                evidence=pipeline.evidence,
+            )
+            audit = _combine_audits(reference_audit, criterion_audit, hard_rule_audit)
+            diagnostic = DiagnosticScore(
+                assessments=criterion_assessments,
+                group_scores=_diagnostic_group_scores(pipeline.rubric, criterion_assessments),
+                total_score=round(
+                    sum(item.weighted_contribution for item in criterion_assessments),
+                    2,
+                ),
+            )
+            await self.reviews.save_diagnostic_score(run.run_id, diagnostic)
+            artifacts.write_model("diagnostic-score.json", diagnostic)
+            await self.reviews.artifacts.save_json(
+                run.run_id,
+                "hard_rule_assessments",
+                hard_rules,
+                replace=True,
+            )
+            artifacts.write_model_list("hard-rule-assessments.json", hard_rules)
+        else:
+            audit = audit_reviews(
+                results=pipeline.results,
+                rubric=pipeline.rubric,
+                blocks=pipeline.blocks,
+                evidence=pipeline.evidence,
+            )
+        for warning in pipeline.reference_report.warnings:
+            if warning not in audit.warnings:
+                audit.warnings.append(warning)
+        artifacts.write_model("audit.json", audit)
+        if not audit.passed:
+            raise ValueError("deterministic review audit failed: " + "; ".join(audit.errors))
+        pipeline.audit = audit
+        target = RunStatus.PANEL_REVIEWING if pipeline.dual_advisory else RunStatus.META_REVIEWING
+        await self._complete_stage(run, "audit", target)
+
+    async def _execute_panel_stage(self, pipeline: PipelineContext) -> None:
+        run = pipeline.run
+        if not pipeline.dual_advisory or "panel" in run.completed_stages:
+            return
+        assert pipeline.document is not None
+        artifacts = RunArtifactStore(pipeline.run_dir)
+        hard_rules_path = pipeline.run_dir / "hard-rule-assessments.json"
+        hard_rules = artifacts.load_model_list("hard-rule-assessments.json", HardRuleAssessment)
+        if not hard_rules_path.is_file():
+            stored_hard_rules = await self.reviews.artifacts.get_json(
+                run.run_id, artifact_type="hard_rule_assessments"
+            )
+            if isinstance(stored_hard_rules, list):
+                hard_rules = [HardRuleAssessment.model_validate(item) for item in stored_hard_rules]
+        human_decisions = _merge_human_decisions(
+            artifacts.load_model_list("human-rule-decisions.json", HumanRuleDecision),
+            [
+                _human_decision_from_repository(item)
+                for item in await self.reviews.hard_rules.list_human_rule_decisions(run.run_id)
+            ],
+        )
+        opinions_path = pipeline.run_dir / "expert-opinions.json"
+        opinions = _merge_expert_opinions(
+            artifacts.load_model_list("expert-opinions.json", ExpertOpinion),
+            [
+                ExpertOpinion.model_validate(item)
+                for item in await self.reviews.list_expert_opinion_payloads(run.run_id)
+            ],
+        )
+        if pipeline.panel_profile is None:
+            pipeline.panel_profile = _load_panel_profile_snapshot(pipeline.run_dir)
+        if pipeline.panel_profile is None or len(pipeline.panel_profile.reviewers) < 5:
+            raise ValueError("dual-advisory evaluation requires a five-member panel profile")
+        if run.status is not RunStatus.PANEL_REVIEWING:
+            await self._set_status(run, RunStatus.PANEL_REVIEWING, "panel_review_started")
+        findings = [finding for item in pipeline.results for finding in item.findings]
+        opinions = await self._run_panel_round(
+            run=run,
+            experts=pipeline.panel_profile.reviewers[:3],
+            round_name="initial",
+            rubric=pipeline.rubric,
+            document=pipeline.document,
+            blocks=pipeline.blocks,
+            evidence=pipeline.evidence,
+            findings=findings,
+            discipline_name=pipeline.discipline_name,
+            discipline_profile=pipeline.discipline_profile,
+            existing=opinions,
+            output_path=opinions_path,
+        )
+        initial = [item for item in opinions if item.round == "initial"]
+        supplemental = [item for item in opinions if item.round == "supplemental"]
+        expert_decision = decide_expert_panel(
+            initial=initial,
+            supplemental=supplemental,
+        )
+        if expert_decision.outcome is PanelOutcome.SUPPLEMENTAL_REQUIRED:
+            await self._set_status(
+                run,
+                RunStatus.SUPPLEMENTAL_REVIEWING,
+                "supplemental_review_started",
+            )
+            opinions = await self._run_panel_round(
+                run=run,
+                experts=pipeline.panel_profile.reviewers[3:5],
+                round_name="supplemental",
+                rubric=pipeline.rubric,
+                document=pipeline.document,
+                blocks=pipeline.blocks,
+                evidence=pipeline.evidence,
+                findings=findings,
+                discipline_name=pipeline.discipline_name,
+                discipline_profile=pipeline.discipline_profile,
+                existing=opinions,
+                output_path=opinions_path,
+            )
+            expert_decision = decide_expert_panel(
+                initial=[item for item in opinions if item.round == "initial"],
+                supplemental=[item for item in opinions if item.round == "supplemental"],
+            )
+        human_panel_decision = artifacts.load_optional_model(
+            "human-panel-decision.json", HumanPanelDecision
+        )
+        decision = decide_panel(
+            initial=[item for item in opinions if item.round == "initial"],
+            supplemental=[item for item in opinions if item.round == "supplemental"],
+            hard_rules=hard_rules,
+            human_decisions=human_decisions,
+            human_panel_decision=human_panel_decision,
+        )
+        artifacts.write_model("expert-panel-decision.json", expert_decision)
+        artifacts.write_model("panel-decision.json", decision)
+        await self.reviews.save_panel_decision(run.run_id, decision)
+        await self._complete_stage(run, "panel", RunStatus.SYNTHESIZING)
+
+    async def _execute_meta_stage(self, pipeline: PipelineContext) -> None:
+        run = pipeline.run
+        assert pipeline.audit is not None
+        artifacts = RunArtifactStore(pipeline.run_dir)
+        if "meta" in run.completed_stages:
+            pipeline.meta = artifacts.load_model("meta-review.json", MetaReview)
+            return
+        meta_status = RunStatus.SYNTHESIZING if pipeline.dual_advisory else RunStatus.META_REVIEWING
+        if run.status != meta_status:
+            await self._set_status(run, meta_status, "meta_review_started")
+        meta = await run_meta_reviewer(
+            run_id=run.run_id,
+            model=self.model,
+            rubric=pipeline.rubric,
+            results=pipeline.results,
+            audit=pipeline.audit,
+            max_repairs=self.settings.max_output_repairs,
+            event_sink=lambda event, payload: self._append_trace(run.run_id, event, payload),
+        )
+        final_audit = audit_meta_review(
+            meta=meta,
+            source_results=pipeline.results,
+            blocks=pipeline.blocks,
+            evidence=pipeline.evidence,
+            scoring_enabled=pipeline.rubric.scoring_enabled,
+        )
+        if not final_audit.passed:
+            raise ValueError("meta review audit failed: " + "; ".join(final_audit.errors))
+        if pipeline.dual_advisory:
+            meta.total_score = None
+            meta.verdict = None
+        else:
+            aggregated = aggregate_scores(pipeline.rubric, pipeline.results)
+            meta.total_score = aggregated.total_score
+            meta.verdict = aggregated.verdict
+        artifacts.write_model("meta-review.json", meta)
+        pipeline.meta = meta
+        await self._complete_stage(run, "meta", RunStatus.VALIDATING)
+
+    async def _execute_report_stage(self, pipeline: PipelineContext) -> None:
+        run = pipeline.run
+        assert pipeline.meta is not None
+        assert pipeline.audit is not None
+        artifacts = RunArtifactStore(pipeline.run_dir)
+        evaluation: EvaluationReport | None = None
+        if pipeline.dual_advisory:
+            diagnostic_path = pipeline.run_dir / "diagnostic-score.json"
+            if diagnostic_path.is_file():
+                diagnostic = artifacts.load_model("diagnostic-score.json", DiagnosticScore)
+            else:
+                stored_diagnostic = await self.reviews.get_diagnostic_score(run.run_id)
+                if not isinstance(stored_diagnostic, dict):
+                    raise ValueError("diagnostic score checkpoint is missing")
+                diagnostic = DiagnosticScore.model_validate(stored_diagnostic)
+            hard_rules_path = pipeline.run_dir / "hard-rule-assessments.json"
+            hard_rules = artifacts.load_model_list(
+                "hard-rule-assessments.json", HardRuleAssessment
+            )
+            if not hard_rules_path.is_file():
+                stored_hard_rules = await self.reviews.artifacts.get_json(
+                    run.run_id, artifact_type="hard_rule_assessments"
+                )
+                if isinstance(stored_hard_rules, list):
+                    hard_rules = [
+                        HardRuleAssessment.model_validate(item) for item in stored_hard_rules
+                    ]
+            human_decisions = _merge_human_decisions(
+                artifacts.load_model_list("human-rule-decisions.json", HumanRuleDecision),
+                [
+                    _human_decision_from_repository(item)
+                    for item in await self.reviews.hard_rules.list_human_rule_decisions(run.run_id)
+                ],
+            )
+            opinions = _merge_expert_opinions(
+                artifacts.load_model_list("expert-opinions.json", ExpertOpinion),
+                [
+                    ExpertOpinion.model_validate(item)
+                    for item in await self.reviews.list_expert_opinion_payloads(run.run_id)
+                ],
+            )
+            initial = [item for item in opinions if item.round == "initial"]
+            supplemental = [item for item in opinions if item.round == "supplemental"]
+            expert_panel_decision = decide_expert_panel(
+                initial=initial,
+                supplemental=supplemental,
+            )
+            human_panel_decision = artifacts.load_optional_model(
+                "human-panel-decision.json", HumanPanelDecision
+            )
+            panel_decision = decide_panel(
+                initial=initial,
+                supplemental=supplemental,
+                hard_rules=hard_rules,
+                human_decisions=human_decisions,
+                human_panel_decision=human_panel_decision,
+            )
+            human_review_summary = build_human_review_summary(
+                hard_rules=hard_rules,
+                human_decisions=human_decisions,
+                expert_panel_decision=expert_panel_decision,
+                human_panel_decision=human_panel_decision,
+            )
+            policy_value = getattr(pipeline.rubric, "policy_context", None) or getattr(
+                pipeline.rubric, "policy", None
+            )
+            if policy_value is None:
+                raise ValueError("dual-advisory rubric is missing policy context")
+            evaluation = EvaluationReport(
+                run_id=run.run_id,
+                policy_context=PolicyContext.model_validate(policy_value),
+                diagnostic_score=diagnostic,
+                hard_rule_assessments=hard_rules,
+                human_rule_decisions=human_decisions,
+                expert_opinions=opinions,
+                expert_panel_decision=expert_panel_decision,
+                human_panel_decision=human_panel_decision,
+                human_review_summary=human_review_summary,
+                panel_decision=panel_decision,
+                meta_review=pipeline.meta,
+            )
+            findings = [finding for item in pipeline.results for finding in item.findings]
+            panel_audit = audit_expert_opinions(
+                opinions=opinions,
+                findings=findings,
+                blocks=pipeline.blocks,
+                evidence=pipeline.evidence,
+            )
+            resolved_hard_rule_audit = audit_hard_rule_assessments(
+                assessments=hard_rules,
+                known_rule_ids={item.rule_id for item in pipeline.rubric.hard_rules},
+                human_decisions=human_decisions,
+                blocks=pipeline.blocks,
+                evidence=pipeline.evidence,
+            )
+            evaluation_audit = audit_evaluation_report(report=evaluation)
+            final_evaluation_audit = _combine_audits(
+                panel_audit, resolved_hard_rule_audit, evaluation_audit
+            )
+            if not final_evaluation_audit.passed:
+                raise ValueError(
+                    "evaluation report audit failed: " + "; ".join(final_evaluation_audit.errors)
+                )
+            artifacts.write_model("evaluation-report.json", evaluation)
+            await self.reviews.save_evaluation_report(run.run_id, evaluation)
+        pipeline.evaluation = evaluation
+        if "report" in run.completed_stages:
+            return
+        if run.status != RunStatus.VALIDATING:
+            await self._set_status(run, RunStatus.VALIDATING, "report_validation_started")
+        projected_run = run.model_copy(deep=True)
+        projected_run.completed_stages.append("report")
+        target_status = (
+            RunStatus.REPORTED_PENDING_HUMAN_REVIEW
+            if evaluation is not None and not evaluation.human_review_summary.complete
+            else RunStatus.REPORTED
+        )
+        projected_run.status = transition(projected_run.status, target_status)
+        write_report_bundle(
+            run_dir=pipeline.run_dir,
+            run=projected_run,
+            rubric=pipeline.rubric,
+            review=evaluation or pipeline.meta,
+            audit=pipeline.audit,
+            evidence=pipeline.evidence,
+        )
+        run.completed_stages = projected_run.completed_stages
+        run.status = projected_run.status
+        await self.runs.save(run, event_type="report_completed", payload={})
+        self._append_trace(run.run_id, "report_completed", {})
 
     async def _run_reviewers(
         self,
@@ -843,9 +809,7 @@ class ReviewOrchestrator:
                     evidence=evidence,
                     scoring_enabled=rubric.scoring_enabled,
                     hard_rules=(
-                        rubric.hard_rules
-                        if _reviews_hard_rules(assignment.reviewer)
-                        else []
+                        rubric.hard_rules if _reviews_hard_rules(assignment.reviewer) else []
                     ),
                     discipline_name=discipline_name,
                     discipline_profile=discipline_profile,
@@ -926,9 +890,7 @@ class ReviewOrchestrator:
                 discipline_name=discipline_name,
                 discipline_profile=discipline_profile,
                 max_repairs=self.settings.max_output_repairs,
-                event_sink=lambda event, payload: self._append_trace(
-                    run.run_id, event, payload
-                ),
+                event_sink=lambda event, payload: self._append_trace(run.run_id, event, payload),
             )
             opinions.append(opinion)
             await self.reviews.save_expert_opinion(
@@ -937,7 +899,7 @@ class ReviewOrchestrator:
                 role=panel_round,
                 expert_id=opinion.expert_id,
             )
-            _write_models(output_path, opinions)
+            RunArtifactStore(output_path.parent).write_model_list(output_path.name, opinions)
             self._append_trace(
                 run.run_id,
                 "panel_expert_completed",
@@ -1060,54 +1022,39 @@ class ReviewOrchestrator:
             handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
         if self.event_sink is not None:
             self.event_sink(
-                RunEvent(
+                project_run_event(
                     run_id=run_id,
                     event_type=event_type,
-                    status=_status_from_payload(payload),
-                    stage=_stage_from_event(event_type),
-                    message=_event_message(event_type),
                     payload=payload,
                 )
             )
 
 
 def load_run_snapshots(run_dir: Path) -> tuple[RubricProfile, ReviewProfile]:
-    rubric = RubricProfile.model_validate_json(
-        (run_dir / "rubric.json").read_text(encoding="utf-8")
-    )
-    profile = ReviewProfile.model_validate_json(
-        (run_dir / "review-profile.json").read_text(encoding="utf-8")
-    )
+    artifacts = RunArtifactStore(run_dir)
+    rubric = artifacts.load_model("rubric.json", RubricProfile)
+    profile = artifacts.load_model("review-profile.json", ReviewProfile)
     return rubric, profile
 
 
 def _load_panel_profile_snapshot(run_dir: Path) -> ReviewProfile | None:
-    path = run_dir / "panel-profile.json"
-    if not path.is_file():
-        return None
-    return ReviewProfile.model_validate_json(path.read_text(encoding="utf-8"))
+    return RunArtifactStore(run_dir).load_optional_model("panel-profile.json", ReviewProfile)
 
 
 def load_run_request_context(run_dir: Path) -> dict[str, object]:
-    path = run_dir / "request-context.json"
-    if not path.is_file():
+    artifacts = RunArtifactStore(run_dir)
+    if not artifacts.exists("request-context.json"):
         return {}
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = artifacts.read_json("request-context.json")
     return payload if isinstance(payload, dict) else {}
 
 
 def load_provider_snapshot(run_dir: Path) -> ProviderSnapshot | None:
     """Load the immutable, non-secret provider connection snapshot for a run."""
-
-    path = run_dir / "provider.json"
-    if not path.is_file():
-        return None
-    return ProviderSnapshot.model_validate_json(path.read_text(encoding="utf-8"))
+    return RunArtifactStore(run_dir).load_optional_model("provider.json", ProviderSnapshot)
 
 
-def _builtin_provider_snapshot(
-    provider_ref: str, model: str
-) -> ProviderSnapshot | None:
+def _builtin_provider_snapshot(provider_ref: str, model: str) -> ProviderSnapshot | None:
     for connection in builtin_provider_connections():
         if connection.provider_ref == provider_ref:
             return ProviderSnapshot(
@@ -1160,21 +1107,9 @@ def _run_config_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _write_json_atomic(path: Path, payload: object) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _is_dual_advisory(rubric: RubricProfile) -> bool:
     return (
-        getattr(rubric, "evaluation_mode", None) == "dual_advisory"
-        or rubric.schema_version == "2"
+        getattr(rubric, "evaluation_mode", None) == "dual_advisory" or rubric.schema_version == "2"
     )
 
 
@@ -1215,9 +1150,7 @@ def _diagnostic_group_scores(
     scores: dict[str, float] = {}
     for group in getattr(rubric, "groups", []):
         group_id = str(getattr(group, "group_id", "")).strip()
-        criterion_ids = getattr(group, "dimensions", None) or getattr(
-            group, "criterion_ids", []
-        )
+        criterion_ids = getattr(group, "dimensions", None) or getattr(group, "criterion_ids", [])
         if group_id and isinstance(criterion_ids, list):
             scores[group_id] = round(
                 sum(
@@ -1307,45 +1240,6 @@ def _merge_human_decisions(
     return list(merged.values())
 
 
-def _has_pending_hard_rules(
-    assessments: list[HardRuleAssessment], decisions: list[HumanRuleDecision]
-) -> bool:
-    decided = {item.rule_id for item in decisions}
-    return any(
-        item.status in {HardRuleStatus.SUSPECTED, HardRuleStatus.NOT_ASSESSABLE}
-        and item.rule_id not in decided
-        for item in assessments
-    )
-
-
-def _load_models[ModelT: BaseModel](
-    path: Path, model_type: type[ModelT]
-) -> list[ModelT]:
-    if not path.is_file():
-        return []
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        raise ValueError(f"invalid run artifact: {path.name}")
-    return [model_type.model_validate(item) for item in payload]
-
-
-def _load_optional_model[ModelT: BaseModel](
-    path: Path, model_type: type[ModelT]
-) -> ModelT | None:
-    if not path.is_file():
-        return None
-    return model_type.model_validate_json(path.read_text(encoding="utf-8"))
-
-
-def _write_models(path: Path, items: Sequence[BaseModel]) -> None:
-    payload = [item.model_dump(mode="json") for item in items]
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    temporary.replace(path)
-
-
 def _file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1404,15 +1298,9 @@ def _safe_external_reason(error: BaseException) -> str:
         r"\1<redacted>",
         message,
     )
-    message = re.sub(
-        r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", message
-    )
-    message = re.sub(
-        r"(?i)\b(?:sk|key)-[A-Za-z0-9_-]{12,}\b", "<api-key>", message
-    )
-    message = re.sub(
-        r"(?i)https?://[^\s\]\[(){}<>\"']+", "<provider-url>", message
-    )
+    message = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", message)
+    message = re.sub(r"(?i)\b(?:sk|key)-[A-Za-z0-9_-]{12,}\b", "<api-key>", message)
+    message = re.sub(r"(?i)https?://[^\s\]\[(){}<>\"']+", "<provider-url>", message)
     if not message:
         message = "external provider request failed"
     return message[:400]
@@ -1475,65 +1363,3 @@ def _safe_database_reason(message: str) -> str:
         if lowered == reason or lowered.startswith(reason + ":"):
             return reason
     return "database operation failed"
-
-
-def _status_from_payload(payload: dict[str, object]) -> RunStatus | None:
-    value = payload.get("status")
-    if not isinstance(value, str):
-        return None
-    try:
-        return RunStatus(value)
-    except ValueError:
-        return None
-
-
-def _stage_from_event(event_type: str) -> str | None:
-    for prefix, stage in (
-        ("ingest", "ingest"),
-        ("evidence", "evidence"),
-        ("reference", "evidence"),
-        ("scoring", "scoring"),
-        ("review", "reviews"),
-        ("audit", "audit"),
-        ("hard_rule", "hard_rule_gate"),
-        ("panel", "panel"),
-        ("supplemental", "supplemental"),
-        ("meta", "meta"),
-        ("report", "report"),
-    ):
-        if event_type.startswith(prefix):
-            return stage
-    return None
-
-
-def _event_message(event_type: str) -> str:
-    messages = {
-        "run_created": "已创建评测任务",
-        "ingest_started": "正在解析论文",
-        "ingest_completed": "论文解析完成",
-        "evidence_collection_started": "正在收集外部学术证据",
-        "evidence_completed": "外部证据收集完成",
-        "reference_check_started": "正在自动核验参考文献",
-        "reference_check_completed": "参考文献自动核验完成",
-        "scoring_started": "专业化 Reviewer 正在执行九项诊断评分",
-        "scoring_completed": "九项诊断评分完成",
-        "reviews_started": "多位 Reviewer 正在评测",
-        "reviews_completed": "Reviewer 评测完成",
-        "review_reference_repair_started": "正在修复 Reviewer 的无效证据引用",
-        "review_reference_repair_completed": "Reviewer 证据引用修复完成",
-        "audit_started": "正在执行确定性审计",
-        "audit_completed": "确定性审计完成",
-        "hard_rule_confirmation_required": "否决项需要人工确认",
-        "panel_review_started": "三名独立专家正在初评",
-        "panel_expert_completed": "独立专家评议完成",
-        "supplemental_review_started": "两名独立专家正在复评",
-        "panel_human_review_required": "专家无法判断，需要人工面板复核",
-        "panel_completed": "独立专家面板评议完成",
-        "meta_review_started": "正在汇总 Meta Review",
-        "meta_completed": "Meta Review 完成",
-        "report_validation_started": "正在验证并生成报告",
-        "report_completed": "评测报告已生成",
-        "stage_failed": "评测任务失败，可从检查点恢复",
-        "run_cancelled": "评测任务已取消",
-    }
-    return messages.get(event_type, event_type.replace("_", " "))
