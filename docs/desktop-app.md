@@ -24,7 +24,7 @@ primary rest, focus, disabled, invalid, busy, and severity variants for visual r
 
 ## Local data and secrets
 
-`platformdirs` resolves `%LOCALAPPDATA%\PaperReviewer` for the database, run artifacts, logs, and
+`platformdirs` resolves `%LOCALAPPDATA%\PaperReviewer\PaperReviewer` for the database, run artifacts, logs, and
 preferences. Provider API keys are retrieved from Windows Credential Manager using `keyring`, with
 environment variables retained as a CLI-compatible fallback. Keys are passed directly to model
 adapters and are never written to preferences, traces, reports, or the database.

@@ -76,7 +76,7 @@ Start the Chinese PySide6 desktop client during development:
 ```
 
 The client stores its SQLite database, reports, logs, and non-secret preferences under
-`%LOCALAPPDATA%\PaperReviewer`. OpenAI and DeepSeek API keys are stored through Windows Credential
+`%LOCALAPPDATA%\PaperReviewer\PaperReviewer`. OpenAI and DeepSeek API keys are stored through Windows Credential
 Manager. Rubric dimensions, anchors, hard rules, scores, and report findings are rendered from the
 selected YAML/report data rather than hard-coded in the interface.
 
