@@ -7,7 +7,16 @@ Revises: 0002_run_scoped_identifiers
 from __future__ import annotations
 
 from alembic import op
-from sqlalchemy import Boolean, Column, DateTime, ForeignKeyConstraint, Integer, String, Text, inspect
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKeyConstraint,
+    Integer,
+    String,
+    Text,
+    inspect,
+)
 
 revision = "0003_evaluation_persistence"
 down_revision = "0002_run_scoped_identifiers"

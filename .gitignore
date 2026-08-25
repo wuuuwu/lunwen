@@ -10,5 +10,7 @@ __pycache__/
 runs/
 dist/
 build/
+/dist-*/
+/build-*/
 tmp/
 *.egg-info/

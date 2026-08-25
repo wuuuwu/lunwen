@@ -219,20 +219,7 @@ class RunRepository:
             row = await session.get(RunRow, run_id)
             if row is None:
                 return None
-            return RunRecord(
-                run_id=row.run_id,
-                status=RunStatus(row.status),
-                input_path=row.input_path,
-                input_hash=row.input_hash,
-                config_hash=row.config_hash,
-                rubric_id=row.rubric_id,
-                provider=row.provider,
-                model=row.model,
-                completed_stages=json.loads(row.completed_stages_json),
-                error=row.error,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-            )
+            return _run_record_from_row(row)
 
     async def list(self, *, status: RunStatus | None = None) -> list[RunRecord]:
         async with self.sessions() as session:
@@ -240,23 +227,7 @@ class RunRepository:
             if status is not None:
                 statement = statement.where(RunRow.status == status.value)
             rows = (await session.execute(statement)).scalars().all()
-            return [
-                RunRecord(
-                    run_id=row.run_id,
-                    status=RunStatus(row.status),
-                    input_path=row.input_path,
-                    input_hash=row.input_hash,
-                    config_hash=row.config_hash,
-                    rubric_id=row.rubric_id,
-                    provider=row.provider,
-                    model=row.model,
-                    completed_stages=json.loads(row.completed_stages_json),
-                    error=row.error,
-                    created_at=row.created_at,
-                    updated_at=row.updated_at,
-                )
-                for row in rows
-            ]
+            return [_run_record_from_row(row) for row in rows]
 
     async def save(self, run: RunRecord, *, event_type: str, payload: dict[str, object]) -> None:
         async with self.sessions() as session:
@@ -276,6 +247,29 @@ class RunRepository:
             await session.commit()
             await session.refresh(row)
             run.updated_at = row.updated_at
+
+
+def _run_record_from_row(row: RunRow) -> RunRecord:
+    """Map a persisted run row to the domain record used by all callers.
+
+    Keeping this conversion in one place is important for ``get`` and
+    ``list``: both paths must preserve the same status parsing, checkpoint
+    decoding, and timestamp values when reading old databases.
+    """
+    return RunRecord(
+        run_id=row.run_id,
+        status=RunStatus(row.status),
+        input_path=row.input_path,
+        input_hash=row.input_hash,
+        config_hash=row.config_hash,
+        rubric_id=row.rubric_id,
+        provider=row.provider,
+        model=row.model,
+        completed_stages=json.loads(row.completed_stages_json),
+        error=row.error,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
 
 
 class HardRuleDecisionRepository:

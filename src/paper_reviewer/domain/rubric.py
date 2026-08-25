@@ -176,81 +176,98 @@ class RubricProfile(BaseModel):
         return self
 
     def _check_v2_profile(self) -> None:
-        if self.policy_context is None:
-            raise ValueError("schema v2 requires policy_context")
-        if self.evaluation_mode != "dual_advisory":
-            raise ValueError("schema v2 requires evaluation_mode=dual_advisory")
-        if not self.scoring_enabled:
-            raise ValueError("schema v2 dual-advisory rubric must enable diagnostic scoring")
-        if self.aggregation is None or self.aggregation.method != "weighted_rating":
-            raise ValueError("schema v2 requires aggregation.method=weighted_rating")
-        if self.aggregation.passing_score is not None:
-            raise ValueError("schema v2 passing_score must be null")
-        if abs(self.aggregation.maximum_total - 100) > 0.001:
-            raise ValueError("schema v2 maximum_total must be 100")
-        if self.rating_scale is None:
-            raise ValueError("schema v2 requires a discrete rating_scale")
-        if self.panel_strategy is None:
-            raise ValueError("schema v2 requires a 3+2 panel_strategy")
-        if not self.experimental or not self.version.startswith("0."):
-            raise ValueError("uncalibrated schema v2 rubrics must be marked 0.x experimental")
-        if not self.validation_notice or "效度" not in self.validation_notice:
-            raise ValueError("schema v2 requires an educational-validity validation_notice")
-        if not self.groups:
-            raise ValueError("schema v2 requires first-level indicator groups")
-        if not self.hard_rules:
-            raise ValueError("schema v2 requires structured hard rules")
-        if any(not rule.requires_human_confirmation for rule in self.hard_rules):
-            raise ValueError("schema v2 hard rules must require human confirmation")
-        allowed_ai_statuses = {"not_detected", "suspected", "not_assessable"}
-        if any(set(rule.ai_allowed_statuses) != allowed_ai_statuses for rule in self.hard_rules):
+        _check_v2_profile_requirements(self)
+        _check_v2_group_structure(self)
+        _check_v2_dimension_scales(self)
+
+
+def _check_v2_profile_requirements(profile: RubricProfile) -> None:
+    """Validate the policy-level requirements of a schema v2 rubric.
+
+    This helper intentionally performs only checks that do not depend on the
+    relationship between groups and dimensions.  Keeping the sequence here
+    preserves the existing validation error precedence for malformed rubrics.
+    """
+
+    if profile.policy_context is None:
+        raise ValueError("schema v2 requires policy_context")
+    if profile.evaluation_mode != "dual_advisory":
+        raise ValueError("schema v2 requires evaluation_mode=dual_advisory")
+    if not profile.scoring_enabled:
+        raise ValueError("schema v2 dual-advisory rubric must enable diagnostic scoring")
+    if profile.aggregation is None or profile.aggregation.method != "weighted_rating":
+        raise ValueError("schema v2 requires aggregation.method=weighted_rating")
+    if profile.aggregation.passing_score is not None:
+        raise ValueError("schema v2 passing_score must be null")
+    if abs(profile.aggregation.maximum_total - 100) > 0.001:
+        raise ValueError("schema v2 maximum_total must be 100")
+    if profile.rating_scale is None:
+        raise ValueError("schema v2 requires a discrete rating_scale")
+    if profile.panel_strategy is None:
+        raise ValueError("schema v2 requires a 3+2 panel_strategy")
+    if not profile.experimental or not profile.version.startswith("0."):
+        raise ValueError("uncalibrated schema v2 rubrics must be marked 0.x experimental")
+    if not profile.validation_notice or "效度" not in profile.validation_notice:
+        raise ValueError("schema v2 requires an educational-validity validation_notice")
+    if not profile.groups:
+        raise ValueError("schema v2 requires first-level indicator groups")
+    if not profile.hard_rules:
+        raise ValueError("schema v2 requires structured hard rules")
+    if any(not rule.requires_human_confirmation for rule in profile.hard_rules):
+        raise ValueError("schema v2 hard rules must require human confirmation")
+    allowed_ai_statuses = {"not_detected", "suspected", "not_assessable"}
+    if any(set(rule.ai_allowed_statuses) != allowed_ai_statuses for rule in profile.hard_rules):
+        raise ValueError(
+            "schema v2 hard rules must restrict AI to not_detected/suspected/not_assessable"
+        )
+
+
+def _check_v2_group_structure(profile: RubricProfile) -> None:
+    """Validate group membership and weight relationships for schema v2."""
+    dimension_by_id = {item.dimension_id: item for item in profile.dimensions}
+    grouped_ids: list[str] = []
+    for group in profile.groups:
+        grouped_ids.extend(group.dimensions)
+        unknown = set(group.dimensions) - set(dimension_by_id)
+        if unknown:
             raise ValueError(
-                "schema v2 hard rules must restrict AI to not_detected/suspected/not_assessable"
+                f"rubric group {group.group_id} references unknown dimensions: "
+                f"{sorted(unknown)}"
             )
+        group_weight = sum(dimension_by_id[item].weight for item in group.dimensions)
+        if abs(group_weight - group.weight) > 0.01:
+            raise ValueError(
+                f"rubric group {group.group_id} weight {group.weight} does not match "
+                f"its dimensions {group_weight}"
+            )
+        for dimension_id in group.dimensions:
+            if dimension_by_id[dimension_id].group_id != group.group_id:
+                raise ValueError(
+                    f"dimension {dimension_id} group_id does not match group {group.group_id}"
+                )
+    if len(grouped_ids) != len(set(grouped_ids)):
+        raise ValueError("schema v2 dimensions may belong to only one group")
+    if set(grouped_ids) != set(dimension_by_id):
+        missing = set(dimension_by_id) - set(grouped_ids)
+        raise ValueError(f"schema v2 groups do not cover every dimension: {sorted(missing)}")
+    if abs(sum(group.weight for group in profile.groups) - 100) > 0.01:
+        raise ValueError("schema v2 group weights must total 100")
 
-        dimension_by_id = {item.dimension_id: item for item in self.dimensions}
-        grouped_ids: list[str] = []
-        for group in self.groups:
-            grouped_ids.extend(group.dimensions)
-            unknown = set(group.dimensions) - set(dimension_by_id)
-            if unknown:
-                raise ValueError(
-                    f"rubric group {group.group_id} references unknown dimensions: "
-                    f"{sorted(unknown)}"
-                )
-            group_weight = sum(dimension_by_id[item].weight for item in group.dimensions)
-            if abs(group_weight - group.weight) > 0.01:
-                raise ValueError(
-                    f"rubric group {group.group_id} weight {group.weight} does not match "
-                    f"its dimensions {group_weight}"
-                )
-            for dimension_id in group.dimensions:
-                if dimension_by_id[dimension_id].group_id != group.group_id:
-                    raise ValueError(
-                        f"dimension {dimension_id} group_id does not match group {group.group_id}"
-                    )
-        if len(grouped_ids) != len(set(grouped_ids)):
-            raise ValueError("schema v2 dimensions may belong to only one group")
-        if set(grouped_ids) != set(dimension_by_id):
-            missing = set(dimension_by_id) - set(grouped_ids)
-            raise ValueError(f"schema v2 groups do not cover every dimension: {sorted(missing)}")
-        if abs(sum(group.weight for group in self.groups) - 100) > 0.01:
-            raise ValueError("schema v2 group weights must total 100")
 
-        expected_anchors = [(float(value), float(value)) for value in range(5)]
-        for dimension in self.dimensions:
-            if dimension.minimum_score != 0 or dimension.maximum_score != 4:
-                raise ValueError(
-                    f"schema v2 dimension {dimension.dimension_id} must use the 0-4 range"
-                )
-            values = [
-                (anchor.minimum, anchor.maximum)
-                for anchor in sorted(dimension.anchors, key=lambda item: item.minimum)
-            ]
-            if values != expected_anchors:
-                raise ValueError(
-                    f"schema v2 dimension {dimension.dimension_id} requires exact 0-4 anchors"
-                )
+def _check_v2_dimension_scales(profile: RubricProfile) -> None:
+    """Validate the fixed five-level scale on every schema v2 dimension."""
+    expected_anchors = [(float(value), float(value)) for value in range(5)]
+    for dimension in profile.dimensions:
+        if dimension.minimum_score != 0 or dimension.maximum_score != 4:
+            raise ValueError(f"schema v2 dimension {dimension.dimension_id} must use the 0-4 range")
+        values = [
+            (anchor.minimum, anchor.maximum)
+            for anchor in sorted(dimension.anchors, key=lambda item: item.minimum)
+        ]
+        if values != expected_anchors:
+            raise ValueError(
+                f"schema v2 dimension {dimension.dimension_id} requires exact 0-4 anchors"
+            )
 
 
 def _forbid_unknown(payload: object, *, path: str, allowed: set[str]) -> None:
@@ -262,6 +279,20 @@ def _forbid_unknown(payload: object, *, path: str, allowed: set[str]) -> None:
 
 
 def _check_v2_unknown_fields(payload: dict[str, Any]) -> None:
+    """Reject fields not covered by the schema v2 contract.
+
+    The helpers are deliberately ordered to preserve the historical error
+    precedence: root fields, collection items, singleton objects, then
+    nested evidence/anchor objects.
+    """
+    _check_v2_root_fields(payload)
+    _check_v2_collection_fields(payload)
+    _check_v2_singleton_fields(payload)
+    _check_v2_dimension_nested_fields(payload)
+    _check_v2_rating_scale_nested_fields(payload)
+
+
+def _check_v2_root_fields(payload: dict[str, Any]) -> None:
     _forbid_unknown(
         payload,
         path="rubric",
@@ -285,6 +316,9 @@ def _check_v2_unknown_fields(payload: dict[str, Any]) -> None:
             "validation_notice",
         },
     )
+
+
+def _check_v2_collection_fields(payload: dict[str, Any]) -> None:
     nested_specs: list[tuple[str, set[str]]] = [
         (
             "dimensions",
@@ -321,6 +355,9 @@ def _check_v2_unknown_fields(payload: dict[str, Any]) -> None:
         if isinstance(values, list):
             for index, item in enumerate(values):
                 _forbid_unknown(item, path=f"{key}[{index}]", allowed=allowed)
+
+
+def _check_v2_singleton_fields(payload: dict[str, Any]) -> None:
     _forbid_unknown(
         payload.get("policy_context"),
         path="policy_context",
@@ -348,6 +385,9 @@ def _check_v2_unknown_fields(payload: dict[str, Any]) -> None:
         path="aggregation",
         allowed={"method", "passing_score", "maximum_total"},
     )
+
+
+def _check_v2_dimension_nested_fields(payload: dict[str, Any]) -> None:
     for index, dimension in enumerate(payload.get("dimensions", [])):
         if not isinstance(dimension, dict):
             continue
@@ -366,6 +406,9 @@ def _check_v2_unknown_fields(payload: dict[str, Any]) -> None:
                 path=f"dimensions[{index}].anchors[{anchor_index}]",
                 allowed={"label", "minimum", "maximum", "description"},
             )
+
+
+def _check_v2_rating_scale_nested_fields(payload: dict[str, Any]) -> None:
     rating_scale = payload.get("rating_scale")
     if isinstance(rating_scale, dict):
         for index, anchor in enumerate(rating_scale.get("anchors", [])):

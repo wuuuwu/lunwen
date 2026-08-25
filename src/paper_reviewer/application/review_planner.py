@@ -35,8 +35,6 @@ def build_review_plan(rubric: RubricProfile, profile: ReviewProfile) -> ReviewPl
             if tags.intersection(reviewer.dimension_tags)
         }
         assigned = sorted(explicit | by_tag)
-        if not rubric.dimensions:
-            assigned = []
         covered.update(assigned)
         assignments.append(ReviewAssignment(reviewer=reviewer, dimension_ids=assigned))
     uncovered = dimension_ids - covered
