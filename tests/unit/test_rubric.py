@@ -90,6 +90,8 @@ def test_bundled_zhejiang_v2_rubric_is_strict_and_complete() -> None:
     assert rubric.policy_context is not None
     assert "2023" in rubric.policy_context.document_number
     assert len(rubric.dimensions) == 9
+    assert rubric.version == "0.1.1-experimental"
+    assert {item.title for item in rubric.hard_rules} == {"政治方向", "学术诚信"}
     assert sum(item.weight for item in rubric.dimensions) == 100
     assert rubric.aggregation is not None
     assert rubric.aggregation.method == "weighted_rating"

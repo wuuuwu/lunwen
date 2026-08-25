@@ -18,6 +18,7 @@ from PySide6.QtGui import QIcon
 
 from paper_reviewer.application.models import RunSummary
 from paper_reviewer.domain.review import ReviewFinding
+from paper_reviewer.reporting.presentation import ReportPresentation
 
 
 @dataclass(frozen=True)
@@ -520,6 +521,15 @@ class FindingsTableModel(QAbstractTableModel):
     def __init__(self) -> None:
         super().__init__()
         self.items: list[ReviewFinding] = []
+        self.presentation: ReportPresentation | None = None
+
+    def set_presentation(self, presentation: ReportPresentation | None) -> None:
+        self.presentation = presentation
+        if self.items:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self.items) - 1, len(self.HEADERS) - 1),
+            )
 
     def set_items(self, items: list[ReviewFinding]) -> None:
         self.beginResetModel()
@@ -554,13 +564,35 @@ class FindingsTableModel(QAbstractTableModel):
             return None
         item = self.items[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
+            severity = (
+                self.presentation.severity(item.severity)
+                if self.presentation is not None
+                else self.SEVERITY_TEXT.get(item.severity.value, item.severity.value)
+            )
+            dimension = (
+                self.presentation.dimension(item.dimension_id)
+                if self.presentation is not None
+                else item.dimension_id
+            )
             return (
-                self.SEVERITY_TEXT.get(item.severity.value, item.severity.value),
-                item.dimension_id,
+                severity,
+                dimension,
                 item.claim,
                 f"{item.confidence:.0%}",
                 "需要" if item.needs_human_check else "否",
             )[index.column()]
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            severity = (
+                self.presentation.severity(item.severity)
+                if self.presentation is not None
+                else self.SEVERITY_TEXT.get(item.severity.value, item.severity.value)
+            )
+            dimension = (
+                self.presentation.dimension(item.dimension_id)
+                if self.presentation is not None
+                else item.dimension_id
+            )
+            return f"{severity}；{dimension}；{item.claim}"
         if role == Qt.ItemDataRole.UserRole:
             return item.finding_id
         return None

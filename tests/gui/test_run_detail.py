@@ -18,12 +18,18 @@ from paper_reviewer.domain.review import (
     PanelOutcome,
     PolicyContext,
 )
-from paper_reviewer.domain.rubric import AggregationPolicy, RubricDimension, RubricProfile
+from paper_reviewer.domain.rubric import (
+    AggregationPolicy,
+    RubricDimension,
+    RubricGroup,
+    RubricProfile,
+)
 from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.gui.icons import FluentIconService
 from paper_reviewer.gui.main_window import MainWindow
 from paper_reviewer.gui.pages.run_detail import RunDetailPage
 from paper_reviewer.gui.theme import FluentThemeManager
+from paper_reviewer.reporting.presentation import ReportPresentationProfile
 from paper_reviewer.validation.audits import AuditReport
 
 
@@ -434,6 +440,15 @@ def test_v2_report_uses_experimental_score_without_legacy_verdict_card(
         title="动态报告测试",
         scoring_enabled=True,
         aggregation=AggregationPolicy(method="weighted_mean"),
+        groups=[
+            RubricGroup(
+                group_id="group",
+                title="测试分组",
+                description="测试分组说明",
+                weight=100,
+                dimensions=["criterion"],
+            )
+        ],
         dimensions=[
             RubricDimension(
                 dimension_id="criterion",
@@ -519,6 +534,19 @@ def test_v2_report_uses_experimental_score_without_legacy_verdict_card(
     assert "50" in page.experimental_score.text()
     assert "risk_not_triggered" in page.decision_path.toPlainText()
     assert "不是浙江省教育厅正式抽检结论" in page.disclaimers.text()
+
+    localized = report.model_copy(
+        update={"presentation_profile": ReportPresentationProfile.ZH_CN_V1},
+        deep=True,
+    )
+    page.show_report(localized, run_dir=tmp_path)
+
+    assert page.diagnostic_scores_model.item(0, 0).text() == "测试指标"
+    assert page.diagnostic_scores_model.item(0, 1).text() == "测试分组"
+    assert "三名初评专家均判定合格" in page.decision_path.toPlainText()
+    assert "risk_not_triggered" not in page.decision_path.toPlainText()
+    assert "初评专家 1" in page.panel_report.toPlainText()
+    assert "expert-1" not in page.panel_report.toPlainText()
 
 
 @pytest.mark.parametrize(("width", "height"), [(900, 600), (1180, 760)])

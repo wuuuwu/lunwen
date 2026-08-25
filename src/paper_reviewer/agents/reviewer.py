@@ -193,6 +193,15 @@ async def run_reviewer(
         ),
         event_sink=event_sink,
         output_validator=validate_result,
+        repair_guidance=(
+            "Preserve all valid ReviewerResult fields. Every assigned criterion_assessment "
+            "must appear exactly once, use the rubric's exact id and weight, and include every "
+            "paper reference required by its evidence policy. Every critical or major finding "
+            "must cite at least one exact paper block returned in the paper overview or tool "
+            "results. If no exact paper block supports that severity, lower it to minor or "
+            "suggestion, or remove the unsupported finding; never invent a block_id, page, or "
+            "quote."
+        ),
     )
     if repair_baseline is not None:
         evidence_ids = {item.evidence_id for item in evidence}

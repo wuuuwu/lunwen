@@ -19,6 +19,7 @@ from paper_reviewer.domain.review import (
 )
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
+from paper_reviewer.reporting.presentation import ReportPresentationProfile
 from paper_reviewer.validation.audits import AuditReport
 
 
@@ -163,3 +164,4 @@ class ReportView(BaseModel):
     human_review_summary: HumanReviewSummary = Field(default_factory=HumanReviewSummary)
     pending_hard_rules: list[HardRuleAssessment] = Field(default_factory=list)
     human_panel_decision: HumanPanelDecision | None = None
+    presentation_profile: ReportPresentationProfile = ReportPresentationProfile.LEGACY

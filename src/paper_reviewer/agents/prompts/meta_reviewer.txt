@@ -11,6 +11,8 @@ For selected_finding_ids:
 Summarize the overall assessment, preserve genuine disagreements, and identify human checks.
 Do not calculate scores or verdicts; those are computed deterministically. Return only one
 compact, complete JSON object matching Schema.
+Write every narrative field in clear Chinese and use rubric criterion titles rather than
+stable internal IDs. IDs may appear only in their dedicated structured JSON fields.
 Rubric={{ rubric_json }}
 Reviews={{ reviewer_results_json }}
 Audit={{ audit_json }}

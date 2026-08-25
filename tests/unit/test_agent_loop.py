@@ -111,7 +111,9 @@ async def test_semantic_output_validator_uses_the_existing_repair_loop() -> None
     )
 
     assert result.value == "source-id"
-    assert "value must be an exact source ID" in (model.requests[1].messages[-1].content or "")
+    repair_instruction = model.requests[1].messages[-1].content or ""
+    assert "value must be an exact source ID" in repair_instruction
+    assert '"value": "invented"' in repair_instruction
 
 
 @pytest.mark.asyncio
@@ -553,10 +555,11 @@ async def test_repairs_are_extra_no_tool_turns() -> None:
     )
     assert all(request.forced_tool_name == FINAL_OUTPUT_TOOL_NAME for request in model.requests)
     assert "Validation error" in (model.requests[-1].messages[-1].content or "")
+    assert '"wrong": "shape"' in (model.requests[-1].messages[-1].content or "")
 
 
 @pytest.mark.asyncio
-async def test_tool_collection_exhaustion_has_traceable_error() -> None:
+async def test_final_validation_failure_after_tool_collection_has_traceable_error() -> None:
     registry = ToolRegistry()
     registry.register(
         name="lookup",
@@ -574,7 +577,7 @@ async def test_tool_collection_exhaustion_has_traceable_error() -> None:
 
     with pytest.raises(
         InvalidAgentOutput,
-        match=r"tool collection turns exhausted without a final JSON response.*trace_id=trace",
+        match=r"final result failed validation after evidence collection.*trace_id=trace",
     ):
         await run_bounded_agent(
             model=model,

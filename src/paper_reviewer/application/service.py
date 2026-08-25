@@ -86,6 +86,7 @@ from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.ports.model import Message, ModelRequest, ToolSpec
 from paper_reviewer.reporting.exporter import render_pdf, validate_pdf
+from paper_reviewer.reporting.presentation import load_presentation_profile
 from paper_reviewer.reporting.renderer import render_markdown, write_report_bundle
 from paper_reviewer.validation.audits import AuditReport, audit_evaluation_report
 from paper_reviewer.validation.panel import (
@@ -784,6 +785,7 @@ class ReviewApplicationService:
             human_review_summary=detail.human_review_summary,
             pending_hard_rules=detail.pending_hard_rules,
             human_panel_decision=detail.human_panel_decision,
+            presentation_profile=load_presentation_profile(run_dir),
         )
 
     async def export_report(
@@ -825,6 +827,7 @@ class ReviewApplicationService:
                 provider_snapshot=load_provider_snapshot(run_dir),
                 provider_ref=run.provider,
                 model=run.model,
+                presentation_profile=load_presentation_profile(run_dir),
             ).encode("utf-8")
         else:
             markdown_bytes = source.read_bytes()

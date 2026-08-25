@@ -18,6 +18,9 @@ Rules:
 6. Qualified and unable_to_assess opinions must return an empty finding_ids list.
 7. Confidence-like language is an uncalibrated judgment, not a statistical probability.
 8. Return only JSON matching the supplied schema when you finish.
+9. Write rationale and all other narrative fields in clear Chinese. Refer to rubric criteria
+   by their Chinese title. Stable expert, dimension, rule, finding, block, and evidence IDs may
+   appear only in their dedicated structured JSON fields, never in narrative prose.
 
 Complete rubric:
 {{ rubric_json }}

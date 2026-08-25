@@ -56,6 +56,7 @@ class RubricDimension(BaseModel):
 
 class HardRule(BaseModel):
     rule_id: str
+    title: str | None = None
     description: str
     outcome: str
     evidence_required: bool = True
@@ -305,6 +306,7 @@ def _check_v2_unknown_fields(payload: dict[str, Any]) -> None:
             "hard_rules",
             {
                 "rule_id",
+                "title",
                 "description",
                 "outcome",
                 "evidence_required",

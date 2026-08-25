@@ -61,6 +61,50 @@ def _reviewer_response(block_id: str) -> ModelResponse:
 
 
 @pytest.mark.asyncio
+async def test_reviewer_repairs_major_finding_that_omits_paper_evidence() -> None:
+    block = DocumentBlock.create(document_id="doc", page=1, text="A valid paper passage.")
+    invalid_payload = json.loads(_reviewer_response(block.block_id).content or "{}")
+    invalid_payload["findings"][0]["paper_evidence"] = []
+    model = RecordingModel(
+        [
+            ModelResponse(content=json.dumps(invalid_payload)),
+            _reviewer_response(block.block_id),
+        ]
+    )
+
+    result = await run_reviewer(
+        run_id="run-1",
+        model=model,
+        reviewer=ReviewerProfile(
+            reviewer_id="novelty-reviewer",
+            title="Novelty reviewer",
+            description="Review novelty.",
+            allowed_tools=[],
+            max_model_turns=1,
+            max_tool_calls=0,
+        ),
+        dimensions=[],
+        document=DocumentInfo(
+            document_id="doc",
+            source_path="paper.pdf",
+            sha256="a" * 64,
+            title="Paper",
+            page_count=1,
+        ),
+        blocks=[block],
+        evidence=[],
+        scoring_enabled=False,
+        max_repairs=1,
+    )
+
+    assert result.findings[0].paper_evidence[0].block_id == block.block_id
+    repair_instruction = model.requests[1].messages[-1].content or ""
+    assert "critical or major finding" in repair_instruction
+    assert "novelty-reviewer-003" in repair_instruction
+    assert '"paper_evidence": []' in repair_instruction
+
+
+@pytest.mark.asyncio
 async def test_reviewer_repairs_unknown_paper_block_before_returning() -> None:
     block = DocumentBlock.create(document_id="doc", page=1, text="A valid paper passage.")
     invented_block_id = "70705e53a223cdac5945709508f08a91"

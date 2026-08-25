@@ -16,6 +16,11 @@ from paper_reviewer.domain.review import (
     MetaReview,
 )
 from paper_reviewer.domain.run import RunRecord, RunStatus
+from paper_reviewer.reporting.presentation import (
+    REPORT_PRESENTATION_FILENAME,
+    ReportPresentationMetadata,
+    ReportPresentationProfile,
+)
 from paper_reviewer.reporting.renderer import render_markdown, write_report_bundle
 from paper_reviewer.validation.audits import AuditReport
 from paper_reviewer.validation.panel import decide_panel
@@ -81,6 +86,38 @@ def test_actual_evaluation_report_renders_scores_panel_path_and_disclaimers() ->
     assert "学术不端检测报告未由系统自动读取" in markdown
 
 
+def test_zh_cn_report_contains_labels_without_machine_identifiers() -> None:
+    rubric, evaluation = _evaluation()
+    markdown = render_markdown(
+        rubric,  # type: ignore[arg-type]
+        evaluation,
+        AuditReport(),
+        presentation_profile=ReportPresentationProfile.ZH_CN_V1,
+    )
+
+    assert "层次体系" in markdown
+    assert "逻辑构建" in markdown
+    assert "学术诚信" in markdown
+    assert "未发现" in markdown
+    assert "合格" in markdown
+    assert "未触发存在问题风险" in markdown
+    assert "三名初评专家均判定合格" in markdown
+    assert "初评专家 1" in markdown
+    forbidden = {
+        *(item.dimension_id for item in rubric.dimensions),  # type: ignore[union-attr]
+        *(item.group_id for item in rubric.groups),  # type: ignore[union-attr]
+        *(item.rule_id for item in rubric.hard_rules),  # type: ignore[union-attr]
+        "not_detected",
+        "qualified",
+        "risk_not_triggered",
+        "initial_unqualified_zero",
+        "initial-1",
+    }
+    assert not forbidden.intersection(markdown.split())
+    for value in forbidden:
+        assert value not in markdown
+
+
 def test_pending_human_review_marker_is_at_top_of_markdown() -> None:
     rubric, evaluation = _evaluation()
     pending = evaluation.model_copy(
@@ -122,8 +159,47 @@ def test_v2_report_json_contains_the_full_evaluation(tmp_path: Path) -> None:
     )
     payload = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert payload["diagnostic_score"]["total_score"] == 50
+    assert payload["diagnostic_score"]["assessments"][0]["criterion_id"] in {
+        item.dimension_id for item in rubric.dimensions  # type: ignore[union-attr]
+    }
     assert payload["panel_decision"]["outcome"] == "risk_not_triggered"
     assert payload["meta_review"]["verdict"] is None
+    metadata = ReportPresentationMetadata.model_validate_json(
+        (tmp_path / REPORT_PRESENTATION_FILENAME).read_text(encoding="utf-8")
+    )
+    assert metadata.profile is ReportPresentationProfile.ZH_CN_V1
+    markdown = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "层次体系" in markdown
+    assert "hierarchy_system" not in markdown
+
+
+def test_existing_report_without_marker_keeps_legacy_presentation(tmp_path: Path) -> None:
+    rubric, evaluation = _evaluation()
+    (tmp_path / "report.md").write_text("# Existing report", encoding="utf-8")
+    run = RunRecord(
+        run_id="run-v2",
+        status=RunStatus.REPORTED,
+        input_path="paper.pdf",
+        input_hash="a" * 64,
+        config_hash="b" * 64,
+        rubric_id="zhejiang@0.1",
+        provider="deepseek",
+        model="deepseek-chat",
+    )
+
+    write_report_bundle(
+        run_dir=tmp_path,
+        run=run,
+        rubric=rubric,  # type: ignore[arg-type]
+        evaluation_report=evaluation,
+        audit=AuditReport(),
+        evidence=[],
+    )
+
+    assert not (tmp_path / REPORT_PRESENTATION_FILENAME).exists()
+    markdown = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "hierarchy_system" in markdown
+    assert "risk_not_triggered" in markdown
 
 
 def test_report_header_uses_snapshot_name_model_and_protocol_without_endpoint_or_id(

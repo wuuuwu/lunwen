@@ -38,6 +38,7 @@ from paper_reviewer.gui.icons import FluentIconService
 from paper_reviewer.gui.models import FindingsTableModel, provider_label
 from paper_reviewer.gui.theme import set_fluent_property
 from paper_reviewer.gui.widgets import MessageBar, PageHeader
+from paper_reviewer.reporting.presentation import ReportPresentation
 
 
 class RunDetailPage(QWidget):
@@ -115,6 +116,7 @@ class RunDetailPage(QWidget):
         self._report_input_path = ""
         self._exported_report_path: Path | None = None
         self._export_trigger_button: QPushButton | None = None
+        self._presentation: ReportPresentation | None = None
 
         self.root = QVBoxLayout(self)
         self.root.setContentsMargins(24, 24, 24, 24)
@@ -635,6 +637,9 @@ class RunDetailPage(QWidget):
 
     def show_report(self, report: ReportView, *, run_dir: Path) -> None:
         self._reset_report_context(True)
+        presentation = ReportPresentation(report.rubric, report.presentation_profile)
+        self._presentation = presentation if presentation.localized else None
+        self.findings_model.set_presentation(self._presentation)
         self._set_review_busy(False)
         self.run_id = report.run.run_id
         self.run_dir = run_dir
@@ -655,7 +660,11 @@ class RunDetailPage(QWidget):
             f"{title} · {report.rubric.title} ({report.rubric.version}) · "
             f"{provider_label(report.run.provider, report.run.model, provider_source)}"
         )
-        self.overall_summary.setText(report.review.overall_summary)
+        self.overall_summary.setText(
+            self._presentation.narrative(report.review.overall_summary)
+            if self._presentation is not None
+            else report.review.overall_summary
+        )
         if report.evaluation is not None:
             # v2 uses an experimental diagnostic score and a separate policy
             # risk decision. Do not present the legacy course-style verdict card.
@@ -691,7 +700,9 @@ class RunDetailPage(QWidget):
         self._show_hard_rule_review(
             pending_rules,
             panel_review_required=panel_review_required,
-            panel_review_detail=_format_panel_review_detail(evaluation_source),
+            panel_review_detail=_format_panel_review_detail(
+                evaluation_source, self._presentation
+            ),
         )
         self.findings_model.set_items(report.review.findings)
         self.findings.resizeColumnsToContents()
@@ -703,17 +714,26 @@ class RunDetailPage(QWidget):
         notes: list[str] = []
         if report.review.disagreements:
             notes.append(
-                "Reviewer 分歧\n" + "\n".join(f"• {x}" for x in report.review.disagreements)
+                "Reviewer 分歧\n"
+                + "\n".join(
+                    f"• {self._localized_narrative(x)}"
+                    for x in report.review.disagreements
+                )
             )
         if report.review.human_checks:
-            notes.append("人工核查\n" + "\n".join(f"• {x}" for x in report.review.human_checks))
+            notes.append(
+                "人工核查\n"
+                + "\n".join(
+                    f"• {self._localized_narrative(x)}" for x in report.review.human_checks
+                )
+            )
         if report.audit.errors or report.audit.warnings:
             notes.append(
                 "审计说明\n"
                 + "\n".join(
                     [
-                        *(f"错误：{x}" for x in report.audit.errors),
-                        *(f"警告：{x}" for x in report.audit.warnings),
+                        *(f"错误：{self._localized_narrative(x)}" for x in report.audit.errors),
+                        *(f"警告：{self._localized_narrative(x)}" for x in report.audit.warnings),
                     ]
                 )
             )
@@ -765,6 +785,9 @@ class RunDetailPage(QWidget):
         self._report_input_path = ""
         self._exported_report_path = None
         self._export_trigger_button = None
+        self._presentation = None
+        if hasattr(self, "findings_model"):
+            self.findings_model.set_presentation(None)
         self._set_export_busy(False)
         if hasattr(self, "message"):
             self.message.clear()
@@ -926,9 +949,11 @@ class RunDetailPage(QWidget):
         self._render_diagnostic_scores(report, diagnostic, source)
         assessments = _first(source, "hard_rule_assessments", "hard_rules", "hard_rule_results")
         decisions = _first(source, "human_rule_decisions", "hard_rule_decisions", "human_decisions")
-        self.hard_rule_report.setPlainText(_format_hard_report(assessments, decisions))
+        self.hard_rule_report.setPlainText(
+            _format_hard_report(assessments, decisions, self._presentation)
+        )
         panel = _first(source, "panel_decision", "panel", "expert_panel")
-        self.panel_report.setPlainText(_format_panel(panel, source))
+        self.panel_report.setPlainText(_format_panel(panel, source, self._presentation))
         path = _first(
             source,
             "decision_path",
@@ -937,7 +962,7 @@ class RunDetailPage(QWidget):
         )
         if path is None and panel is not None:
             path = _first(panel, "decision_path")
-        lines = _format_lines(path)
+        lines = _format_lines(path, self._presentation)
         risk = _first(
             source,
             "risk_conclusion",
@@ -948,7 +973,12 @@ class RunDetailPage(QWidget):
         if risk is None and panel is not None:
             risk = _first(panel, "outcome", "verdict", "decision")
         if risk is not None:
-            lines.append(f"AI 辅助抽检风险结论：{_display_value(risk)}")
+            risk_text = (
+                self._presentation.panel_outcome(risk)
+                if self._presentation is not None
+                else _display_value(risk)
+            )
+            lines.append(f"AI 辅助抽检风险结论：{risk_text}")
         self.decision_path.setPlainText("\n".join(lines) or "暂无结构化决策路径数据。")
         self.disclaimers.setText(
             "使用说明：\n"
@@ -973,7 +1003,17 @@ class RunDetailPage(QWidget):
                 diagnostic = nested
         values = diagnostic if diagnostic is not None else report.dimension_scores
         if isinstance(values, Mapping):
-            rows = [(str(key), "", _display_value(value), "") for key, value in values.items()]
+            rows = [
+                (
+                    self._presentation.dimension(key)
+                    if self._presentation is not None
+                    else str(key),
+                    "",
+                    _display_value(value),
+                    "",
+                )
+                for key, value in values.items()
+            ]
         else:
             if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
                 values = [values] if values is not None else []
@@ -989,16 +1029,24 @@ class RunDetailPage(QWidget):
                 )
                 dimension = dimensions.get(str(criterion_id))
                 title_value = _first(item, "title", "criterion_title", "dimension_title")
-                title = _display_value(
-                    title_value
-                    or (dimension.title if dimension else None)
-                    or criterion_id
-                    or "未命名指标"
+                title = (
+                    self._presentation.dimension(criterion_id)
+                    if self._presentation is not None
+                    else _display_value(
+                        title_value
+                        or (dimension.title if dimension else None)
+                        or criterion_id
+                        or "未命名指标"
+                    )
                 )
                 group_value = _first(item, "group", "group_title", "category", "group_id")
                 if group_value is None and dimension is not None:
                     group_value = _first(dimension, "group", "group_id", "category")
-                group = _display_value(group_value or "")
+                group = (
+                    self._presentation.group(group_value)
+                    if self._presentation is not None and group_value
+                    else _display_value(group_value or "")
+                )
                 rating = _first(
                     item, "rating", "level", "score", "grade", "value", default="未提供"
                 )
@@ -1022,7 +1070,15 @@ class RunDetailPage(QWidget):
         groups = _first(source, "group_scores", "diagnostic_group_scores")
         if groups is None and score_source is not None:
             groups = _first(score_source, "group_scores", "diagnostic_group_scores")
-        summary = "；".join(f"{_display_value(k)}：{_display_value(v)}" for k, v in _items(groups))
+        summary_parts: list[str] = []
+        for key, value in _items(groups):
+            group_label = (
+                self._presentation.group(key)
+                if self._presentation is not None
+                else _display_value(key)
+            )
+            summary_parts.append(f"{group_label}：{_display_value(value)}")
+        summary = "；".join(summary_parts)
         self.diagnostic_summary.setText(f"分组得分：{summary}" if summary else "")
         total = _first(
             source, "experimental_total_score", "diagnostic_total_score", "diagnostic_score_total"
@@ -1118,18 +1174,31 @@ class RunDetailPage(QWidget):
         self.hard_rule_list.clear()
         for rule in rules:
             rule_id = str(_first(rule, "rule_id", "id", default="否决项"))
-            status = _display_value(_first(rule, "status", "state", default="待复核"))
-            description = str(_first(rule, "description", "title", "rule", default=rule_id))
+            raw_status = _first(rule, "status", "state", default="待复核")
+            status = (
+                self._presentation.hard_rule_status(raw_status)
+                if self._presentation is not None
+                else _display_value(raw_status)
+            )
+            description = (
+                self._presentation.rule(rule_id)
+                if self._presentation is not None
+                else str(_first(rule, "description", "title", "rule", default=rule_id))
+            )
             if rule_id in self._submitted_hard_rules:
                 status = "已提交"
             item = QListWidgetItem(f"{status} · {description}")
             item.setData(Qt.ItemDataRole.UserRole, rule)
-            item.setToolTip(f"{rule_id}：{description}")
+            item.setToolTip(
+                description
+                if self._presentation is not None
+                else f"{rule_id}：{description}"
+            )
             item.setData(
                 Qt.ItemDataRole.AccessibleTextRole,
                 f"{description}，状态：{status}",
             )
-            good = status in {"已驳回", "dismissed", "已提交"}
+            good = status in {"已驳回", "确认不成立", "dismissed", "已提交"}
             item.setIcon(
                 self.icons.icon(
                     "check" if good else "warning",
@@ -1158,7 +1227,11 @@ class RunDetailPage(QWidget):
 
     def _hard_rule_selected(self, row: int) -> None:
         if 0 <= row < len(self._pending_hard_rules):
-            self.hard_rule_detail.setPlainText(_format_hard_detail(self._pending_hard_rules[row]))
+            self.hard_rule_detail.setPlainText(
+                _format_hard_detail(
+                    self._pending_hard_rules[row], self._presentation
+                )
+            )
             self.hard_rule_error.clear()
             self.confirm_rule_button.setText("确认成立")
             self.dismiss_rule_button.setText("确认不成立")
@@ -1256,8 +1329,13 @@ class RunDetailPage(QWidget):
 
     def _mark_rule_submitted(self, rule_id: str, confirmed: bool) -> None:
         self._set_review_busy(False)
+        rule_label = (
+            self._presentation.rule(rule_id)
+            if self._presentation is not None
+            else rule_id
+        )
         self.hard_rule_error.setText(
-            f"已保存：{rule_id} · {'确认成立' if confirmed else '确认不成立'}。报告已更新。"
+            f"已保存：{rule_label} · {'确认成立' if confirmed else '确认不成立'}。报告已更新。"
         )
         item = self.hard_rule_list.currentItem()
         if item is not None:
@@ -1359,7 +1437,17 @@ class RunDetailPage(QWidget):
             or "无"
         )
         self.finding_detail.setPlainText(
-            f"问题\n{finding.claim}\n\n解释\n{finding.rationale}\n\n修改建议\n{finding.recommendation}\n\n论文证据\n{paper}\n\n外部证据\n{external}"
+            f"问题\n{self._localized_narrative(finding.claim)}\n\n"
+            f"解释\n{self._localized_narrative(finding.rationale)}\n\n"
+            f"修改建议\n{self._localized_narrative(finding.recommendation)}\n\n"
+            f"论文证据\n{paper}\n\n外部证据\n{external}"
+        )
+
+    def _localized_narrative(self, value: Any) -> str:
+        return (
+            self._presentation.narrative(value)
+            if self._presentation is not None
+            else _display_value(value)
         )
 
     def _cancel(self) -> None:
@@ -1438,15 +1526,24 @@ def _items(value: Any) -> list[tuple[Any, Any]]:
     return []
 
 
-def _format_lines(value: Any) -> list[str]:
+def _format_lines(
+    value: Any, presentation: ReportPresentation | None = None
+) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return [value]
+        return [presentation.decision_step(value) if presentation is not None else value]
     if isinstance(value, Mapping):
-        return [f"{_display_value(k)}：{_display_value(v)}" for k, v in value.items()]
+        return [
+            f"{presentation.decision_step(k) if presentation is not None else _display_value(k)}"
+            f"：{presentation.panel_outcome(v) if presentation is not None else _display_value(v)}"
+            for k, v in value.items()
+        ]
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_display_value(item) for item in value]
+        return [
+            presentation.decision_step(item) if presentation is not None else _display_value(item)
+            for item in value
+        ]
     return [_display_value(value)]
 
 
@@ -1497,10 +1594,17 @@ def _evidence_lines(value: Any, *, external: bool = False) -> list[str]:
     return lines
 
 
-def _format_hard_detail(rule: Any) -> str:
+def _format_hard_detail(
+    rule: Any, presentation: ReportPresentation | None = None
+) -> str:
     rule_id = _display_value(_first(rule, "rule_id", "id", default="未命名规则"))
     description = _display_value(_first(rule, "description", "title", "rule", default=""))
-    status = _display_value(_first(rule, "status", "state", default="待复核"))
+    raw_status = _first(rule, "status", "state", default="待复核")
+    status = (
+        presentation.hard_rule_status(raw_status)
+        if presentation is not None
+        else _display_value(raw_status)
+    )
     judgment = _first(
         rule,
         "ai_judgment",
@@ -1517,14 +1621,27 @@ def _format_hard_detail(rule: Any) -> str:
     )
     paper_text = "\n".join(paper) if paper else "• 无"
     external_text = "\n".join(external) if external else "• 无"
+    rule_header = (
+        f"规则：{presentation.rule(rule_id)}"
+        if presentation is not None
+        else f"规则 ID：{rule_id}\n规则：{description}"
+    )
+    rendered_judgment = (
+        presentation.narrative(judgment)
+        if presentation is not None
+        else _display_value(judgment)
+    )
     return (
-        f"规则 ID：{rule_id}\n规则：{description}\n"
-        f"AI 判断：{_display_value(judgment)}\n状态：{status}\n\n"
+        f"{rule_header}\nAI 判断：{rendered_judgment}\n状态：{status}\n\n"
         f"论文页码与引文\n{paper_text}\n\n外部来源\n{external_text}"
     )
 
 
-def _format_hard_report(assessments: Any, decisions: Any) -> str:
+def _format_hard_report(
+    assessments: Any,
+    decisions: Any,
+    presentation: ReportPresentation | None = None,
+) -> str:
     lines: list[str] = []
     values = (
         []
@@ -1537,12 +1654,24 @@ def _format_hard_report(assessments: Any, decisions: Any) -> str:
     )
     for rule in values:
         rule_id = _display_value(_first(rule, "rule_id", "id", default="未命名规则"))
-        status = _display_value(_first(rule, "status", "state", default="未提供"))
-        judgment = _display_value(
-            _first(rule, "ai_judgment", "judgment", "assessment", "rationale", default="")
+        raw_status = _first(rule, "status", "state", default="未提供")
+        status = (
+            presentation.hard_rule_status(raw_status)
+            if presentation is not None
+            else _display_value(raw_status)
         )
+        raw_judgment = _first(
+            rule, "ai_judgment", "judgment", "assessment", "rationale", default=""
+        )
+        judgment = (
+            presentation.narrative(raw_judgment)
+            if presentation is not None
+            else _display_value(raw_judgment)
+        )
+        rule_label = presentation.rule(rule_id) if presentation is not None else rule_id
         lines.append(
-            f"{rule_id} · 状态：{status}" + (f" · AI 判断：{judgment}" if judgment else "")
+            f"{rule_label} · 状态：{status}"
+            + (f" · AI 判断：{judgment}" if judgment else "")
         )
     values = (
         []
@@ -1557,20 +1686,33 @@ def _format_hard_report(assessments: Any, decisions: Any) -> str:
         lines.append("人工处理记录：")
         for decision in values:
             rule_id = _display_value(_first(decision, "rule_id", "id", default="未命名规则"))
-            result = _display_value(_first(decision, "decision", "status", default="未提供"))
+            raw_result = _first(decision, "decision", "status", default="未提供")
+            result = (
+                presentation.human_decision(raw_result)
+                if presentation is not None
+                else _display_value(raw_result)
+            )
             reviewer = _display_value(_first(decision, "reviewer", "reviewer_id", default="未提供"))
-            reason = _display_value(_first(decision, "reason", "rationale", default="未提供"))
+            raw_reason = _first(decision, "reason", "rationale", default="未提供")
+            reason = (
+                presentation.narrative(raw_reason)
+                if presentation is not None
+                else _display_value(raw_reason)
+            )
+            rule_label = presentation.rule(rule_id) if presentation is not None else rule_id
             decided_at = _display_value(
                 _first(decision, "decided_at", "reviewed_at", "timestamp", default="")
             )
             lines.append(
-                f"• {rule_id} · {result} · 复核人：{reviewer} · {reason}"
+                f"• {rule_label} · {result} · 复核人：{reviewer} · {reason}"
                 + (f" · 时间：{decided_at}" if decided_at else "")
             )
     return "\n".join(lines) or "暂无结构化否决项数据。"
 
 
-def _format_panel_review_detail(source: Any) -> str:
+def _format_panel_review_detail(
+    source: Any, presentation: ReportPresentation | None = None
+) -> str:
     opinions = _first(source, "expert_opinions", "opinions", default=[])
     if not isinstance(opinions, Sequence) or isinstance(opinions, (str, bytes)):
         opinions = [opinions] if opinions else []
@@ -1585,14 +1727,18 @@ def _format_panel_review_detail(source: Any) -> str:
         _format_opinion(
             item,
             _display_value(_first(item, "round", default="专家")),
+            index,
+            presentation,
         )
-        for item in unable
+        for index, item in enumerate(unable, start=1)
     )
     lines.append("请结合完整评分、Findings、论文证据和专家意见给出最终风险结论。")
     return "\n".join(lines)
 
 
-def _format_panel(panel: Any, source: Any) -> str:
+def _format_panel(
+    panel: Any, source: Any, presentation: ReportPresentation | None = None
+) -> str:
     panel = panel or source
     lines: list[str] = []
     for phase, field in (("初评", "initial_opinions"), ("复评", "supplemental_opinions")):
@@ -1604,7 +1750,10 @@ def _format_panel(panel: Any, source: Any) -> str:
             if isinstance(values, Sequence) and not isinstance(values, (str, bytes))
             else [values]
         )
-        lines.extend(_format_opinion(item, phase) for item in values)
+        lines.extend(
+            _format_opinion(item, phase, index, presentation)
+            for index, item in enumerate(values, start=1)
+        )
     opinions = _first(panel, "expert_opinions", "opinions", "reviewer_opinions")
     if opinions is None and panel is not source:
         opinions = _first(source, "expert_opinions", "opinions", "reviewer_opinions")
@@ -1614,16 +1763,29 @@ def _format_panel(panel: Any, source: Any) -> str:
             if isinstance(opinions, Sequence) and not isinstance(opinions, (str, bytes))
             else [opinions]
         )
-        lines.extend(
-            _format_opinion(item, _display_value(_first(item, "phase", "round", default="专家")))
-            for item in opinions
-        )
+        round_counts: dict[str, int] = {}
+        for item in opinions:
+            phase = _display_value(_first(item, "phase", "round", default="专家"))
+            round_counts[phase] = round_counts.get(phase, 0) + 1
+            lines.append(
+                _format_opinion(item, phase, round_counts[phase], presentation)
+            )
     decision = _first(panel, "decision", "risk_conclusion", "verdict", "outcome")
     if decision is not None:
-        lines.append(f"面板结论：{_display_value(decision)}")
+        rendered_decision = (
+            presentation.panel_outcome(decision)
+            if presentation is not None
+            else _display_value(decision)
+        )
+        lines.append(f"面板结论：{rendered_decision}")
     reason = _first(panel, "reason", "rationale")
     if reason is not None:
-        lines.append(f"面板理由：{_display_value(reason)}")
+        rendered_reason = (
+            presentation.panel_reason(reason)
+            if presentation is not None
+            else _display_value(reason)
+        )
+        lines.append(f"面板理由：{rendered_reason}")
     initial_count = _first(panel, "initial_unqualified")
     supplemental_count = _first(panel, "supplemental_unqualified")
     if initial_count is not None or supplemental_count is not None:
@@ -1634,18 +1796,45 @@ def _format_panel(panel: Any, source: Any) -> str:
     return "\n".join(lines) or "暂无独立专家面板数据。"
 
 
-def _format_opinion(opinion: Any, phase: str) -> str:
+def _format_opinion(
+    opinion: Any,
+    phase: str,
+    index: int = 1,
+    presentation: ReportPresentation | None = None,
+) -> str:
     reviewer = _display_value(_first(opinion, "reviewer_id", "expert_id", "id", default="专家"))
-    verdict = _display_value(_first(opinion, "verdict", "decision", "outcome", default="未提供"))
-    summary = _display_value(_first(opinion, "summary", "explanation", "rationale", default=""))
+    raw_verdict = _first(opinion, "verdict", "decision", "outcome", default="未提供")
+    verdict = (
+        presentation.expert_verdict(raw_verdict)
+        if presentation is not None
+        else _display_value(raw_verdict)
+    )
+    raw_summary = _first(opinion, "summary", "explanation", "rationale", default="")
     evidence = "; ".join(_evidence_lines(_first(opinion, "paper_evidence", "evidence")))
     phase = {"initial": "初评", "supplemental": "复评"}.get(phase, phase)
-    result = f"{phase} · {reviewer}：{verdict}"
+    finding_ids = _first(opinion, "finding_ids") or []
+    aliases = {str(item): "对应问题" for item in finding_ids}
+    summary = (
+        presentation.narrative(raw_summary, extra_aliases=aliases)
+        if presentation is not None
+        else _display_value(raw_summary)
+    )
+    reviewer_label = (
+        presentation.expert_label(
+            _first(opinion, "round", "phase", default=phase), index, reviewer
+        )
+        if presentation is not None
+        else reviewer
+    )
+    result = f"{phase} · {reviewer_label}：{verdict}"
     if summary and summary != "未提供":
         result += f" · {summary}"
-    finding_ids = _first(opinion, "finding_ids")
     if finding_ids:
-        result += f" · Finding：{', '.join(str(item) for item in finding_ids)}"
+        result += (
+            f" · 关联问题：{len(finding_ids)} 项"
+            if presentation is not None
+            else f" · Finding：{', '.join(str(item) for item in finding_ids)}"
+        )
     return result + (f" · 证据：{evidence}" if evidence else "")
 
 

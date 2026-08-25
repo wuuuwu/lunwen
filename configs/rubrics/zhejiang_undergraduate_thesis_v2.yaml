@@ -1,6 +1,6 @@
 schema_version: "2"
 rubric_id: zhejiang-undergraduate-thesis-dual-advisory
-version: "0.1.0-experimental"
+version: "0.1.1-experimental"
 title: 浙江省本科毕业论文 AI 辅助诊断与抽检风险评议（实验版）
 applicable_levels: [undergraduate]
 applicable_paper_types: [ordinary_thesis_pdf]
@@ -186,12 +186,14 @@ dimensions:
 
 hard_rules:
   - rule_id: political_direction
+    title: 政治方向
     description: 疑似存在违背政策法规、社会主义核心价值观、立德树人要求或社会公序良俗的内容。
     outcome: 人工确认后触发存在问题风险
     evidence_required: true
     requires_human_confirmation: true
     ai_allowed_statuses: [not_detected, suspected, not_assessable]
   - rule_id: academic_integrity
+    title: 学术诚信
     description: 疑似存在抄袭、剽窃、伪造、篡改、买卖、代写等学术不端行为。
     outcome: 人工确认后触发存在问题风险
     evidence_required: true

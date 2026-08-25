@@ -43,6 +43,7 @@ async def run_bounded_agent[OutputT: BaseModel](
     budget: AgentBudget,
     event_sink: EventSink | None = None,
     output_validator: Callable[[OutputT], None] | None = None,
+    repair_guidance: str | None = None,
 ) -> OutputT:
     if budget.max_model_turns < 1:
         raise AgentBudgetExceeded("model turn budget must be at least one")
@@ -60,6 +61,7 @@ async def run_bounded_agent[OutputT: BaseModel](
     repair_count = 0
     last_error: str | None = None
     last_truncation_error: str | None = None
+    last_invalid_submission: object | None = None
 
     async def complete(
         *,
@@ -122,20 +124,29 @@ async def run_bounded_agent[OutputT: BaseModel](
         return response
 
     def validate_output(value: object) -> tuple[OutputT | None, str | None]:
+        nonlocal last_invalid_submission
         try:
             output = output_type.model_validate(value)
+        except (ValidationError, ValueError) as error:
+            last_invalid_submission = value
+            return None, str(error)
+        try:
             if output_validator is not None:
                 output_validator(output)
-            return output, None
         except (ValidationError, ValueError) as error:
+            last_invalid_submission = output.model_dump(mode="json")
             return None, str(error)
+        last_invalid_submission = None
+        return output, None
 
     def parse_output(response: ModelResponse) -> tuple[OutputT | None, str | None]:
+        nonlocal last_invalid_submission
         if not response.content:
             return None, "model returned neither content nor tool calls"
         try:
             value = json.loads(_extract_json(response.content))
         except (ValidationError, ValueError) as error:
+            last_invalid_submission = response.content
             return None, str(error)
         return validate_output(value)
 
@@ -270,6 +281,7 @@ async def run_bounded_agent[OutputT: BaseModel](
 
     output_limit_exhausted = exhausted_output_limit(response, requested_limit)
     if output_limit_exhausted:
+        last_invalid_submission = None
         last_truncation_error = (
             f"model output was truncated at the requested token limit ({requested_limit})"
         )
@@ -301,11 +313,10 @@ async def run_bounded_agent[OutputT: BaseModel](
         messages.append(
             Message(
                 role="user",
-                content=(
-                    "Your previous final submission did not validate or was truncated. "
-                    f"Call {FINAL_OUTPUT_TOOL_NAME} exactly once with complete corrected "
-                    "arguments and do not return ordinary prose. "
-                    f"Validation error: {last_error}"
+                content=_repair_instruction(
+                    error=last_error,
+                    invalid_submission=last_invalid_submission,
+                    repair_guidance=repair_guidance,
                 ),
             )
         )
@@ -322,6 +333,7 @@ async def run_bounded_agent[OutputT: BaseModel](
         last_error = error
         output_limit_exhausted = exhausted_output_limit(response, requested_limit)
         if output_limit_exhausted:
+            last_invalid_submission = None
             last_truncation_error = (
                 f"model output was truncated at the requested token limit ({requested_limit})"
             )
@@ -332,17 +344,55 @@ async def run_bounded_agent[OutputT: BaseModel](
                 f"({budget.max_output_tokens_limit}) without valid JSON (trace_id={trace_id})"
             )
 
-    if tool_collection_turns == collection_turns and collection_turns > 0:
-        detail = "tool collection turns exhausted without a final JSON response"
-        if last_error:
-            detail = f"{detail}; last error: {last_error}"
-    else:
-        detail = last_error or "agent did not produce valid output"
-        if last_truncation_error:
-            detail = last_truncation_error
-            if last_error and last_error != last_truncation_error:
-                detail = f"{detail}; subsequent repair failed: {last_error}"
+    detail = last_error or "agent did not produce valid output"
+    if last_truncation_error:
+        detail = last_truncation_error
+        if last_error and last_error != last_truncation_error:
+            detail = f"{detail}; subsequent repair failed: {last_error}"
+    elif repair_count:
+        detail = (
+            "final result still failed validation after "
+            f"{repair_count} repair attempts: {detail}"
+        )
+    elif tool_collection_turns == collection_turns and collection_turns > 0:
+        detail = f"final result failed validation after evidence collection: {detail}"
     raise InvalidAgentOutput(f"{detail} (trace_id={trace_id})")
+
+
+def _repair_instruction(
+    *,
+    error: str | None,
+    invalid_submission: object | None,
+    repair_guidance: str | None,
+) -> str:
+    parts = [
+        "Your previous final submission did not validate or was truncated.",
+        "Correct the previous submission instead of starting over.",
+        f"Call {FINAL_OUTPUT_TOOL_NAME} exactly once with complete corrected arguments and "
+        "do not return ordinary prose.",
+        f"Validation error: {error or 'unknown validation error'}",
+    ]
+    if repair_guidance:
+        parts.append(f"Task-specific repair rules: {repair_guidance}")
+    candidate = _bounded_invalid_submission(invalid_submission)
+    if candidate is not None:
+        parts.extend(
+            [
+                "Previous invalid submission (preserve its valid content and correct only the "
+                "reported defects):",
+                candidate,
+            ]
+        )
+    return "\n\n".join(parts)
+
+
+def _bounded_invalid_submission(value: object | None, *, max_chars: int = 160_000) -> str | None:
+    if value is None:
+        return None
+    rendered = json.dumps(value, ensure_ascii=False, default=str)
+    if len(rendered) > max_chars:
+        return None
+    return rendered
 
 
 def _extract_json(content: str) -> str:

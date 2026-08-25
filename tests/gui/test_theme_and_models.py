@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
 from paper_reviewer.application.models import RunSummary
+from paper_reviewer.config import load_rubric
+from paper_reviewer.domain.review import ReviewFinding
 from paper_reviewer.domain.run import RunStatus
 from paper_reviewer.gui.icons import FluentIconService
-from paper_reviewer.gui.models import RunsFilterProxyModel, RunsTableModel
+from paper_reviewer.gui.models import FindingsTableModel, RunsFilterProxyModel, RunsTableModel
 from paper_reviewer.gui.theme import FluentThemeManager, ThemeMode, TokenRepository
+from paper_reviewer.reporting.presentation import (
+    ReportPresentation,
+    ReportPresentationProfile,
+)
 
 
 def test_token_repository_has_traceable_source_and_both_themes() -> None:
@@ -90,6 +97,38 @@ def test_runs_table_model_exposes_chinese_status() -> None:
     assert model.rowCount() == 1
     assert model.data(model.index(0, 4)) == "已完成"
     assert model.run_id(0) == "run-1"
+
+
+def test_findings_model_uses_localized_dimension_and_accessible_text(
+    qapp: QApplication,
+) -> None:
+    del qapp
+    rubric = load_rubric(Path("configs/rubrics/zhejiang_undergraduate_thesis_v2.yaml"))
+    model = FindingsTableModel()
+    model.set_presentation(
+        ReportPresentation(rubric, ReportPresentationProfile.ZH_CN_V1)
+    )
+    model.set_items(
+        [
+            ReviewFinding(
+                finding_id="finding-1",
+                reviewer_id="logic-specialist",
+                dimension_id="hierarchy_system",
+                severity="suggestion",
+                confidence=0.8,
+                claim="层次安排需要改进",
+                rationale="hierarchy_system 的章节重点不够突出",
+                recommendation="调整章节层级",
+            )
+        ]
+    )
+
+    assert model.data(model.index(0, 0)) == "建议"
+    assert model.data(model.index(0, 1)) == "层次体系"
+    accessible = model.data(
+        model.index(0, 0), Qt.ItemDataRole.AccessibleTextRole
+    )
+    assert accessible == "建议；层次体系；层次安排需要改进"
 
 
 def test_runs_table_model_exposes_v2_status_text_and_accessible_icon(qapp: QApplication) -> None:
