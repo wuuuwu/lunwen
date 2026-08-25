@@ -341,8 +341,10 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        if answer is not QMessageBox.StandardButton.Yes:
+        if answer != QMessageBox.StandardButton.Yes:
             return
+        self.run_detail_page.set_cancel_pending(run_id, True)
+        self.global_status.setText("正在安全取消评测")
         if (
             self._review_worker is not None
             and self._review_worker.isRunning()
@@ -350,11 +352,19 @@ class MainWindow(QMainWindow):
         ):
             self._review_worker.cancel_task()
         else:
+            self._persist_cancelled_run(run_id)
 
-            async def operation(_emit: EventEmitter) -> RunRecord:
-                return await self.service.cancel_review(run_id)
+    def _persist_cancelled_run(self, run_id: str) -> None:
+        """Persist cancellation after the live worker has safely stopped."""
 
-            self._run_async(operation, lambda _value: self.open_run(run_id))
+        async def operation(_emit: EventEmitter) -> RunRecord:
+            return await self.service.cancel_review(run_id)
+
+        self._run_async(
+            operation,
+            self._cancel_review_completed,
+            lambda message, trace: self._cancel_review_failed(run_id, message, trace),
+        )
 
     def refresh_runs(self) -> None:
         self.runs_page.set_loading(True)
@@ -513,11 +523,34 @@ class MainWindow(QMainWindow):
 
     def _review_cancelled(self) -> None:
         self.new_review_page.set_busy(False)
+        run_id = self._active_run_id or self.run_detail_page.run_id
+        if run_id:
+            # The orchestrator normally persists cancellation while unwinding.
+            # Calling the idempotent service here also covers cancellation during
+            # service startup, before execution entered the orchestrator.
+            self._persist_cancelled_run(run_id)
+            return
         self._set_global_status("cancelled")
-        self._clear_active_run()
-        if self._active_run_id:
-            self.open_run(self._active_run_id)
+
+    def _cancel_review_completed(self, value: object) -> None:
+        if not isinstance(value, RunRecord):
+            self._cancel_review_failed(
+                self.run_detail_page.run_id,
+                "取消操作没有返回有效任务状态",
+                "",
+            )
+            return
+        self._active_run_id = value.run_id
+        self._remember_active_run(value.run_id, value.status)
+        self.run_detail_page.set_cancel_pending(value.run_id, False)
+        self._set_global_status(value.status, fallback="评测已取消")
+        self.open_run(value.run_id)
         self.refresh_runs()
+
+    def _cancel_review_failed(self, run_id: str, message: str, _trace: str) -> None:
+        self.run_detail_page.set_cancel_pending(run_id, False)
+        self.run_detail_page.show_cancel_error(run_id, message)
+        self._set_global_status("", fallback="取消评测失败，需要处理")
 
     def _runs_loaded(self, value: object) -> None:
         if isinstance(value, list):
@@ -757,7 +790,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
-            if answer is not QMessageBox.StandardButton.Yes:
+            if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
         running_workers = [worker for worker in self._workers if worker.isRunning()]

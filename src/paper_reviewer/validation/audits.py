@@ -39,10 +39,18 @@ def reviewer_reference_errors(
     result: ReviewerResult,
     block_ids: Collection[str],
     evidence_ids: Collection[str],
+    block_by_id: dict[str, DocumentBlock] | None = None,
 ) -> list[str]:
-    """Return deterministic reference errors for one reviewer result."""
+    """Return deterministic reference errors for one reviewer result.
+
+    ``block_ids`` keeps the lightweight legacy validation available to callers
+    that only have identifiers.  Supplying ``block_by_id`` additionally checks
+    page and verbatim quote integrity across findings, criterion assessments,
+    and hard-rule assessments.
+    """
 
     errors: list[str] = []
+    known_evidence_ids = set(evidence_ids)
     for finding in result.findings:
         if finding.reviewer_id != result.reviewer_id:
             errors.append(
@@ -72,6 +80,37 @@ def reviewer_reference_errors(
         is_major = finding.severity in {Severity.CRITICAL, Severity.MAJOR}
         if is_major and not finding.paper_evidence:
             errors.append(f"{finding.finding_id}: major finding lacks paper evidence")
+    if block_by_id is not None:
+        for finding in result.findings:
+            errors.extend(
+                _evidence_reference_errors(
+                    owner=f"finding {finding.finding_id}",
+                    paper_evidence=finding.paper_evidence,
+                    external_evidence=finding.external_evidence,
+                    block_by_id=block_by_id,
+                    evidence_ids=known_evidence_ids,
+                )
+            )
+        for criterion_assessment in result.criterion_assessments:
+            errors.extend(
+                _evidence_reference_errors(
+                    owner=f"criterion {criterion_assessment.criterion_id}",
+                    paper_evidence=criterion_assessment.paper_evidence,
+                    external_evidence=criterion_assessment.external_evidence,
+                    block_by_id=block_by_id,
+                    evidence_ids=known_evidence_ids,
+                )
+            )
+        for hard_rule_assessment in result.hard_rule_assessments:
+            errors.extend(
+                _evidence_reference_errors(
+                    owner=f"hard rule {hard_rule_assessment.rule_id}",
+                    paper_evidence=hard_rule_assessment.paper_evidence,
+                    external_evidence=hard_rule_assessment.external_evidence,
+                    block_by_id=block_by_id,
+                    evidence_ids=known_evidence_ids,
+                )
+            )
     return errors
 
 
@@ -84,6 +123,7 @@ def audit_reviews(
 ) -> AuditReport:
     report = AuditReport()
     block_ids = {block.block_id for block in blocks}
+    block_by_id = {block.block_id: block for block in blocks}
     evidence_ids = {item.evidence_id for item in evidence}
     covered: set[str] = set()
     for result in results:
@@ -92,6 +132,7 @@ def audit_reviews(
                 result=result,
                 block_ids=block_ids,
                 evidence_ids=evidence_ids,
+                block_by_id=block_by_id,
             )
         )
         covered.update(result.dimension_scores)

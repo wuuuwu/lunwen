@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from collections import deque
 
 import pytest
 from pydantic import BaseModel
 
 from paper_reviewer.agents.loop import (
+    FINAL_OUTPUT_TOOL_NAME,
     AgentBudget,
     AgentBudgetExceeded,
     InvalidAgentOutput,
@@ -46,7 +48,41 @@ async def test_agent_without_tools_uses_one_regular_final_call() -> None:
 
     assert result.value == "ok"
     assert len(model.requests) == 1
-    assert model.requests[0].tools == []
+    assert [tool.name for tool in model.requests[0].tools] == [FINAL_OUTPUT_TOOL_NAME]
+    assert model.requests[0].forced_tool_name == FINAL_OUTPUT_TOOL_NAME
+
+
+@pytest.mark.asyncio
+async def test_agent_accepts_forced_final_submission_tool() -> None:
+    model = FakeModel(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="final",
+                        name=FINAL_OUTPUT_TOOL_NAME,
+                        arguments={"value": "structured"},
+                    )
+                ]
+            )
+        ]
+    )
+
+    result = await run_bounded_agent(
+        model=model,
+        registry=ToolRegistry(),
+        allowlist=[],
+        system_prompt="system",
+        user_prompt="user",
+        output_type=Output,
+        trace_id="trace",
+        budget=AgentBudget(max_model_turns=1, max_tool_calls=0, max_repairs=0),
+    )
+
+    assert result.value == "structured"
+    request = model.requests[0]
+    assert request.forced_tool_name == FINAL_OUTPUT_TOOL_NAME
+    assert request.tools[0].parameters == Output.model_json_schema()
 
 
 @pytest.mark.asyncio
@@ -75,9 +111,7 @@ async def test_semantic_output_validator_uses_the_existing_repair_loop() -> None
     )
 
     assert result.value == "source-id"
-    assert "value must be an exact source ID" in (
-        model.requests[1].messages[-1].content or ""
-    )
+    assert "value must be an exact source ID" in (model.requests[1].messages[-1].content or "")
 
 
 @pytest.mark.asyncio
@@ -365,6 +399,66 @@ async def test_agent_executes_allowed_tool_then_returns_valid_json() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_returns_invalid_tool_call_to_model_and_continues() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        name="read_blocks",
+        description="Read blocks",
+        parameters={
+            "type": "object",
+            "properties": {
+                "block_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 1,
+                }
+            },
+            "required": ["block_ids"],
+            "additionalProperties": False,
+        },
+        handler=lambda block_ids: block_ids,
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+    model = FakeModel(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="bad-read",
+                        name="read_blocks",
+                        arguments={"block_ids": ["private-id-1", "private-id-2"]},
+                    )
+                ]
+            ),
+            ModelResponse(content='{"value":"continued"}'),
+        ]
+    )
+
+    result = await run_bounded_agent(
+        model=model,
+        registry=registry,
+        allowlist=["read_blocks"],
+        system_prompt="system",
+        user_prompt="user",
+        output_type=Output,
+        trace_id="trace",
+        budget=AgentBudget(max_model_turns=2, max_tool_calls=1, max_repairs=0),
+        event_sink=lambda name, payload: events.append((name, payload)),
+    )
+
+    assert result.value == "continued"
+    tool_message = next(message for message in model.requests[1].messages if message.role == "tool")
+    tool_result = json.loads(tool_message.content or "{}")
+    assert tool_result["ok"] is False
+    assert tool_result["error"]["type"] == "invalid_tool_call"
+    assert "at most 1 items" in tool_result["error"]["message"]
+    assert "private-id" not in tool_result["error"]["message"]
+    failed = next(payload for name, payload in events if name == "tool_call_failed")
+    assert failed["tool"] == "read_blocks"
+    assert "private-id" not in str(failed)
+
+
+@pytest.mark.asyncio
 async def test_agent_enforces_tool_budget() -> None:
     registry = ToolRegistry()
     registry.register(
@@ -420,7 +514,8 @@ async def test_agent_reserves_last_model_turn_for_final_json() -> None:
         registry.specs(["lookup"]),
         registry.specs(["lookup"]),
     ]
-    assert model.requests[-1].tools == []
+    assert [tool.name for tool in model.requests[-1].tools] == [FINAL_OUTPUT_TOOL_NAME]
+    assert model.requests[-1].forced_tool_name == FINAL_OUTPUT_TOOL_NAME
     assert "Tool collection is complete" in (model.requests[-1].messages[-1].content or "")
 
 
@@ -452,7 +547,11 @@ async def test_repairs_are_extra_no_tool_turns() -> None:
     )
 
     assert result.value == "repaired"
-    assert [request.tools for request in model.requests] == [[], []]
+    assert all(
+        [tool.name for tool in request.tools] == [FINAL_OUTPUT_TOOL_NAME]
+        for request in model.requests
+    )
+    assert all(request.forced_tool_name == FINAL_OUTPUT_TOOL_NAME for request in model.requests)
     assert "Validation error" in (model.requests[-1].messages[-1].content or "")
 
 
@@ -508,3 +607,39 @@ async def test_tool_arguments_are_validated_against_json_schema() -> None:
             ToolCall(id="bad", name="lookup", arguments={"unexpected": True}),
             ["lookup"],
         )
+
+
+@pytest.mark.asyncio
+async def test_tool_schema_error_does_not_echo_oversized_argument_values() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        name="read_blocks",
+        description="Read blocks",
+        parameters={
+            "type": "object",
+            "properties": {
+                "block_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 12,
+                }
+            },
+            "required": ["block_ids"],
+            "additionalProperties": False,
+        },
+        handler=lambda block_ids: block_ids,
+    )
+
+    with pytest.raises(ToolExecutionError) as caught:
+        await registry.execute(
+            ToolCall(
+                id="bad",
+                name="read_blocks",
+                arguments={"block_ids": [f"private-id-{index}" for index in range(13)]},
+            ),
+            ["read_blocks"],
+        )
+
+    message = str(caught.value)
+    assert message == "invalid call to read_blocks: block_ids must contain at most 12 items"
+    assert "private-id" not in message

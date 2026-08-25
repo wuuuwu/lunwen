@@ -101,6 +101,7 @@ async def run_reviewer(
     user_prompt = json.dumps(user_payload, ensure_ascii=False)
 
     block_ids = {block.block_id for block in blocks}
+    block_by_id = {block.block_id: block for block in blocks}
     block_pages = {block.block_id: block.page for block in blocks}
     repair_baseline = (
         ReviewerResult.model_validate(repair_source.model_dump(mode="python"))
@@ -156,6 +157,7 @@ async def run_reviewer(
             result=result,
             block_ids=block_ids,
             evidence_ids=evidence_ids,
+            block_by_id=block_by_id,
         )
         errors.extend(reference_errors)
         if errors:

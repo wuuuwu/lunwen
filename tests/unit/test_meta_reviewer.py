@@ -4,6 +4,7 @@ from collections import deque
 
 import pytest
 
+from paper_reviewer.agents.loop import FINAL_OUTPUT_TOOL_NAME
 from paper_reviewer.agents.meta_reviewer import run_meta_reviewer
 from paper_reviewer.domain.evidence import EvidenceKind, EvidenceRef
 from paper_reviewer.domain.review import ReviewerResult, ReviewFinding, Severity
@@ -57,7 +58,11 @@ async def test_meta_reviewer_uses_raised_output_budget_and_bounded_retry() -> No
 
     assert result.run_id == "run-1"
     assert [request.max_output_tokens for request in model.requests] == [8192, 16384]
-    assert all(request.tools == [] for request in model.requests)
+    assert all(
+        [tool.name for tool in request.tools] == [FINAL_OUTPUT_TOOL_NAME]
+        for request in model.requests
+    )
+    assert all(request.forced_tool_name == FINAL_OUTPUT_TOOL_NAME for request in model.requests)
 
 
 def _source_result() -> tuple[ReviewerResult, ReviewFinding]:

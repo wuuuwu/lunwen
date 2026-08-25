@@ -105,6 +105,7 @@ class RunDetailPage(QWidget):
         self._submitted_hard_rules: set[str] = set()
         self._operation_threads: list[Any] = []
         self._review_busy = False
+        self._cancel_pending = False
         self._export_busy = False
         self._export_format = ""
         self._report_available = False
@@ -189,6 +190,7 @@ class RunDetailPage(QWidget):
         )
         self.events.clear()
         self._update_stages([], "created")
+        self.set_cancel_pending(run_id, False)
         self.cancel_button.setVisible(bool(run_id))
         self.resume_button.hide()
         self._show_hard_rule_review([])
@@ -548,6 +550,7 @@ class RunDetailPage(QWidget):
             or detail
         )
         self.completed_stages = set(run.completed_stages)
+        self.set_cancel_pending(run.run_id, False)
         self.stack.setCurrentWidget(self.progress_page)
         self.run_metadata.setText(
             f"{Path(run.input_path).name} · "
@@ -807,7 +810,7 @@ class RunDetailPage(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
-            if answer is not QMessageBox.StandardButton.Yes:
+            if answer != QMessageBox.StandardButton.Yes:
                 return
         self._export_trigger_button = (
             self.export_markdown_button if export_format == "markdown" else self.export_pdf_button
@@ -1256,8 +1259,28 @@ class RunDetailPage(QWidget):
         )
 
     def _cancel(self) -> None:
-        if self.run_id:
+        if self.run_id and not self._cancel_pending:
             self.cancel_requested.emit(self.run_id)
+
+    def set_cancel_pending(self, run_id: str, pending: bool) -> None:
+        if run_id and self.run_id and run_id != self.run_id:
+            return
+        self._cancel_pending = pending
+        self.cancel_button.setEnabled(not pending)
+        self.cancel_button.setText("正在取消…" if pending else "取消评测")
+        self.cancel_button.setAccessibleName("正在取消当前评测" if pending else "取消当前评测")
+        set_fluent_property(self.cancel_button, "fluentBusy", pending)
+        if pending:
+            self.message.show_message(
+                "正在安全停止评测并保存已完成的检查点…",
+                severity="info",
+            )
+
+    def show_cancel_error(self, run_id: str, message: str) -> None:
+        if run_id and self.run_id != run_id:
+            return
+        self.set_cancel_pending(run_id, False)
+        self.message.show_message(f"取消评测失败：{message}", severity="danger")
 
     def _resume(self) -> None:
         if self.run_id:

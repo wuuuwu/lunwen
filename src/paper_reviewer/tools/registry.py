@@ -59,9 +59,29 @@ class ToolRegistry:
             if inspect.isawaitable(result):
                 return await _await_result(result)
             return result
-        except (JsonSchemaValidationError, TypeError, ValueError) as error:
+        except JsonSchemaValidationError as error:
+            detail = _schema_validation_detail(error)
+            raise ToolExecutionError(f"invalid call to {call.name}: {detail}") from error
+        except (TypeError, ValueError) as error:
             raise ToolExecutionError(f"invalid call to {call.name}: {error}") from error
 
 
 async def _await_result(result: Awaitable[Any]) -> Any:
     return await result
+
+
+def _schema_validation_detail(error: JsonSchemaValidationError) -> str:
+    """Return a bounded schema error without echoing model-supplied arguments."""
+
+    path = ".".join(str(part) for part in error.absolute_path) or "arguments"
+    if error.validator == "maxItems":
+        return f"{path} must contain at most {error.validator_value} items"
+    if error.validator == "minItems":
+        return f"{path} must contain at least {error.validator_value} items"
+    if error.validator == "required":
+        return "a required argument is missing"
+    if error.validator == "additionalProperties":
+        return "arguments contain unsupported fields"
+    if error.validator == "type":
+        return f"{path} must have type {error.validator_value}"
+    return f"{path} does not match the tool schema"

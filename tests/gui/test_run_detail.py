@@ -53,6 +53,74 @@ def test_prepare_run_rebinds_detail_and_cancel_action(qapp: QApplication, qtbot:
     assert cancelled == ["new-run"]
 
 
+def test_cancel_button_busy_state_blocks_duplicate_requests(
+    qapp: QApplication, qtbot: object
+) -> None:
+    theme = FluentThemeManager(qapp)
+    page = RunDetailPage(FluentIconService(theme))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    page.prepare_run("active-run")
+    cancelled: list[str] = []
+    page.cancel_requested.connect(cancelled.append)
+
+    page.set_cancel_pending("active-run", True)
+    page._cancel()
+
+    assert cancelled == []
+    assert not page.cancel_button.isEnabled()
+    assert page.cancel_button.text() == "正在取消…"
+    assert page.cancel_button.property("fluentBusy") is True
+    assert page.cancel_button.accessibleName() == "正在取消当前评测"
+
+    page.set_cancel_pending("active-run", False)
+    page._cancel()
+
+    assert cancelled == ["active-run"]
+    assert page.cancel_button.isEnabled()
+    assert page.cancel_button.text() == "取消评测"
+
+
+def test_cancel_confirmation_accepts_qt_integer_button_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Worker:
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+
+        def isRunning(self) -> bool:
+            return True
+
+        def cancel_task(self) -> None:
+            self.cancel_calls += 1
+
+    class DetailPage:
+        def __init__(self) -> None:
+            self.pending: list[tuple[str, bool]] = []
+
+        def set_cancel_pending(self, run_id: str, pending: bool) -> None:
+            self.pending.append((run_id, pending))
+
+    worker = Worker()
+    page = DetailPage()
+    window = SimpleNamespace(
+        _review_worker=worker,
+        _active_run_id="active-run",
+        run_detail_page=page,
+        global_status=SimpleNamespace(setText=lambda _value: None),
+        _persist_cancelled_run=lambda _run_id: None,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes.value,
+    )
+
+    MainWindow.cancel_review(window, "active-run")  # type: ignore[arg-type]
+
+    assert worker.cancel_calls == 1
+    assert page.pending == [("active-run", True)]
+
+
 def test_report_export_controls_emit_sanitized_default_and_block_duplicates(
     qapp: QApplication,
     qtbot: object,

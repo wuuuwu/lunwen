@@ -432,7 +432,11 @@ class ReviewApplicationService:
             await engine.dispose()
             raise ValueError(f"未知任务：{run_id}")
         pending = await self._pending_hard_rules(run_id)
-        if pending:
+        # Audit inputs are checkpointed before the deterministic audit is
+        # declared complete.  A failed audit may therefore leave provisional
+        # hard-rule artifacts behind; those must not masquerade as an active
+        # human-review gate when the run is resumed and repaired.
+        if pending and "audit" in run.completed_stages:
             await engine.dispose()
             raise ValueError("仍有否决项等待人工确认，不能恢复评测。")
         rubric, profile = load_run_snapshots(self.settings.runs_dir / run_id)

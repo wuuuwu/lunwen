@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ValidationError
 
 from paper_reviewer.ports.model import Message, ModelPort, ModelRequest, ModelResponse, ToolSpec
-from paper_reviewer.tools.registry import ToolRegistry
+from paper_reviewer.tools.registry import ToolExecutionError, ToolRegistry
 
 
 class AgentBudgetExceeded(RuntimeError):
@@ -28,6 +28,7 @@ class AgentBudget:
 
 
 EventSink = Callable[[str, dict[str, object]], None]
+FINAL_OUTPUT_TOOL_NAME = "submit_final_result"
 
 
 async def run_bounded_agent[OutputT: BaseModel](
@@ -61,7 +62,12 @@ async def run_bounded_agent[OutputT: BaseModel](
     last_truncation_error: str | None = None
 
     async def complete(
-        *, phase: str, turn: int | str, tools: list[ToolSpec], max_output_tokens: int
+        *,
+        phase: str,
+        turn: int | str,
+        tools: list[ToolSpec],
+        max_output_tokens: int,
+        forced_tool_name: str | None = None,
     ) -> ModelResponse:
         if event_sink:
             event_sink(
@@ -77,6 +83,7 @@ async def run_bounded_agent[OutputT: BaseModel](
             ModelRequest(
                 messages=messages,
                 tools=tools,
+                forced_tool_name=forced_tool_name,
                 max_output_tokens=max_output_tokens,
                 trace_id=trace_id,
                 idempotency_key=f"{trace_id}:turn:{turn}",
@@ -114,16 +121,36 @@ async def run_bounded_agent[OutputT: BaseModel](
 
         return response
 
-    def parse_output(response: ModelResponse) -> tuple[OutputT | None, str | None]:
-        if not response.content:
-            return None, "model returned neither content nor tool calls"
+    def validate_output(value: object) -> tuple[OutputT | None, str | None]:
         try:
-            output = output_type.model_validate_json(_extract_json(response.content))
+            output = output_type.model_validate(value)
             if output_validator is not None:
                 output_validator(output)
             return output, None
         except (ValidationError, ValueError) as error:
             return None, str(error)
+
+    def parse_output(response: ModelResponse) -> tuple[OutputT | None, str | None]:
+        if not response.content:
+            return None, "model returned neither content nor tool calls"
+        try:
+            value = json.loads(_extract_json(response.content))
+        except (ValidationError, ValueError) as error:
+            return None, str(error)
+        return validate_output(value)
+
+    def parse_final_output(response: ModelResponse) -> tuple[OutputT | None, str | None]:
+        submissions = [call for call in response.tool_calls if call.name == FINAL_OUTPUT_TOOL_NAME]
+        if len(submissions) == 1 and len(response.tool_calls) == 1:
+            return validate_output(submissions[0].arguments)
+        if response.tool_calls:
+            if len(submissions) > 1:
+                return None, "model submitted more than one final result"
+            names = sorted({call.name for call in response.tool_calls})
+            return None, f"model called unexpected final-phase tools: {names}"
+        # Compatibility fallback for providers that ignore forced tool choice
+        # but still honor the prompt and return a valid JSON object as text.
+        return parse_output(response)
 
     def exhausted_output_limit(response: ModelResponse, requested_limit: int) -> bool:
         if (response.finish_reason or "").casefold() == "length":
@@ -138,6 +165,14 @@ async def run_bounded_agent[OutputT: BaseModel](
     # prevents a model that keeps gathering evidence from consuming the entire
     # budget before it ever gets a chance to produce the required JSON.
     collection_turns = budget.max_model_turns - 1 if allowed_tool_specs else 0
+    final_tool = ToolSpec(
+        name=FINAL_OUTPUT_TOOL_NAME,
+        description=(
+            "Submit the complete final result exactly once. The arguments must match "
+            "the required output schema; do not return the result as prose."
+        ),
+        parameters=output_type.model_json_schema(),
+    )
     tool_collection_turns = 0
     for turn in range(collection_turns):
         response = await complete(
@@ -156,12 +191,41 @@ async def run_bounded_agent[OutputT: BaseModel](
                         "tool_call_started",
                         {"trace_id": trace_id, "tool": call.name, "tool_call_id": call.id},
                     )
-                result = await registry.execute(call, allowlist)
-                if event_sink:
-                    event_sink(
-                        "tool_call_completed",
-                        {"trace_id": trace_id, "tool": call.name, "tool_call_id": call.id},
-                    )
+                try:
+                    result = await registry.execute(call, allowlist)
+                except ToolExecutionError as tool_error:
+                    # Tool arguments are model output and can be malformed even when
+                    # the provider accepted the JSON schema. Return a structured error
+                    # to the same agent so one invalid call does not abort every
+                    # concurrently running reviewer.
+                    result = {
+                        "ok": False,
+                        "error": {
+                            "type": "invalid_tool_call",
+                            "message": str(tool_error),
+                        },
+                    }
+                    if event_sink:
+                        event_sink(
+                            "tool_call_failed",
+                            {
+                                "trace_id": trace_id,
+                                "tool": call.name,
+                                "tool_call_id": call.id,
+                                "error_type": "invalid_tool_call",
+                                "message": str(tool_error),
+                            },
+                        )
+                else:
+                    if event_sink:
+                        event_sink(
+                            "tool_call_completed",
+                            {
+                                "trace_id": trace_id,
+                                "tool": call.name,
+                                "tool_call_id": call.id,
+                            },
+                        )
                 messages.append(
                     Message(
                         role="tool",
@@ -179,12 +243,14 @@ async def run_bounded_agent[OutputT: BaseModel](
 
     if allowed_tool_specs:
         final_instruction = (
-            "Tool collection is complete. Do not call any tools. Return only the final "
-            "JSON object that conforms to the requested output schema."
+            f"Tool collection is complete. Call {FINAL_OUTPUT_TOOL_NAME} exactly once "
+            "with the complete result matching the requested output schema. Do not call "
+            "evidence tools and do not return ordinary prose."
         )
     else:
         final_instruction = (
-            "Return only the final JSON object that conforms to the requested output schema."
+            f"Call {FINAL_OUTPUT_TOOL_NAME} exactly once with the complete result matching "
+            "the requested output schema. Do not return ordinary prose."
         )
     messages.append(Message(role="user", content=final_instruction))
     final_turn = collection_turns
@@ -193,21 +259,14 @@ async def run_bounded_agent[OutputT: BaseModel](
     response = await complete(
         phase="final",
         turn=final_turn,
-        tools=[],
+        tools=[final_tool],
         max_output_tokens=requested_limit,
+        forced_tool_name=FINAL_OUTPUT_TOOL_NAME,
     )
-    if response.tool_calls:
-        # A model should not be able to call tools in this phase because the
-        # request has no tool definitions. Treat a provider that nevertheless
-        # returns tool calls as invalid output, without executing them.
-        if tool_count + len(response.tool_calls) > budget.max_tool_calls:
-            raise AgentBudgetExceeded("tool call budget exceeded")
-        last_error = "final response requested tools after tool collection was disabled"
-    else:
-        parsed, error = parse_output(response)
-        if parsed is not None:
-            return parsed
-        last_error = error
+    parsed, error = parse_final_output(response)
+    if parsed is not None:
+        return parsed
+    last_error = error
 
     output_limit_exhausted = exhausted_output_limit(response, requested_limit)
     if output_limit_exhausted:
@@ -243,8 +302,9 @@ async def run_bounded_agent[OutputT: BaseModel](
             Message(
                 role="user",
                 content=(
-                    "Your previous final response did not validate or was truncated. "
-                    "Return only complete corrected JSON. "
+                    "Your previous final submission did not validate or was truncated. "
+                    f"Call {FINAL_OUTPUT_TOOL_NAME} exactly once with complete corrected "
+                    "arguments and do not return ordinary prose. "
                     f"Validation error: {last_error}"
                 ),
             )
@@ -252,15 +312,11 @@ async def run_bounded_agent[OutputT: BaseModel](
         response = await complete(
             phase="repair",
             turn=f"repair:{repair_count}",
-            tools=[],
+            tools=[final_tool],
             max_output_tokens=requested_limit,
+            forced_tool_name=FINAL_OUTPUT_TOOL_NAME,
         )
-        if response.tool_calls:
-            if tool_count + len(response.tool_calls) > budget.max_tool_calls:
-                raise AgentBudgetExceeded("tool call budget exceeded")
-            last_error = "repair response requested tools after tool collection was disabled"
-            continue
-        parsed, error = parse_output(response)
+        parsed, error = parse_final_output(response)
         if parsed is not None:
             return parsed
         last_error = error

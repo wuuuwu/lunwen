@@ -413,6 +413,77 @@ async def test_policy_reviewer_returns_criterion_and_hard_rule_assessments() -> 
 
 
 @pytest.mark.asyncio
+async def test_policy_reviewer_repairs_mismatched_criterion_quote() -> None:
+    block = DocumentBlock.create(document_id="doc", page=1, text="Research purpose.")
+    invalid = _policy_reviewer_response(block.block_id)
+    invalid_payload = json.loads(invalid.content or "{}")
+    invalid_payload["criterion_assessments"][0]["paper_evidence"][0]["quote"] = (
+        "Research…"
+    )
+    valid = _policy_reviewer_response(block.block_id)
+    valid_payload = json.loads(valid.content or "{}")
+    valid_payload["criterion_assessments"][0]["paper_evidence"][0]["quote"] = (
+        "Research purpose."
+    )
+    model = RecordingModel(
+        [
+            ModelResponse(content=json.dumps(invalid_payload)),
+            ModelResponse(content=json.dumps(valid_payload)),
+        ]
+    )
+
+    result = await run_reviewer(
+        run_id="run-policy",
+        model=model,
+        reviewer=ReviewerProfile(
+            reviewer_id="policy-reviewer",
+            title="Policy reviewer",
+            description="Review purpose and integrity.",
+            allowed_tools=[],
+            max_model_turns=1,
+            max_tool_calls=0,
+        ),
+        dimensions=[
+            RubricDimension(
+                dimension_id="topic-purpose",
+                title="Topic purpose",
+                description="Assess the research purpose.",
+                weight=10,
+                minimum_score=0,
+                maximum_score=4,
+                checks=["Purpose is explicit"],
+                evidence_policy=EvidencePolicy(paper_evidence_required=True),
+            )
+        ],
+        hard_rules=[
+            HardRule(
+                rule_id="integrity",
+                description="Academic integrity",
+                outcome="human_confirmation",
+            )
+        ],
+        document=DocumentInfo(
+            document_id="doc",
+            source_path="paper.pdf",
+            sha256="a" * 64,
+            title="Paper",
+            page_count=1,
+        ),
+        blocks=[block],
+        evidence=[],
+        scoring_enabled=True,
+        max_repairs=1,
+        discipline_name="Computer Science",
+    )
+
+    assert result.criterion_assessments[0].paper_evidence[0].quote == "Research purpose."
+    assert len(model.requests) == 2
+    repair_message = model.requests[1].messages[-1].content or ""
+    assert "criterion topic-purpose" in repair_message
+    assert "quote does not match its block" in repair_message
+
+
+@pytest.mark.asyncio
 async def test_policy_reviewer_cannot_confirm_hard_rule() -> None:
     block = DocumentBlock.create(document_id="doc", page=1, text="Research purpose.")
     model = RecordingModel(

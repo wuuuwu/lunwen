@@ -389,6 +389,7 @@ class ReviewOrchestrator:
                     }
                     reference_audit = AuditReport()
                     block_ids = {item.block_id for item in blocks}
+                    block_by_id = {item.block_id: item for item in blocks}
                     evidence_ids = {item.evidence_id for item in evidence}
                     for result in results:
                         reference_audit.errors.extend(
@@ -396,6 +397,7 @@ class ReviewOrchestrator:
                                 result=result,
                                 block_ids=block_ids,
                                 evidence_ids=evidence_ids,
+                                block_by_id=block_by_id,
                             )
                         )
                     criterion_audit = audit_criterion_assessments(
@@ -949,29 +951,44 @@ class ReviewOrchestrator:
         discipline_profile: str | None = None,
     ) -> list[ReviewerResult]:
         block_ids = {block.block_id for block in blocks}
+        block_by_id = {block.block_id: block for block in blocks}
         evidence_ids = {item.evidence_id for item in evidence}
-        invalid_reviewer_ids = {
-            result.reviewer_id
+        invalid_results = {
+            result.reviewer_id: result
             for result in results
             if reviewer_reference_errors(
                 result=result,
                 block_ids=block_ids,
                 evidence_ids=evidence_ids,
+                block_by_id=block_by_id,
             )
         }
+        invalid_reviewer_ids = set(invalid_results)
         if not invalid_reviewer_ids:
             return results
+
+        # The legacy evidence-repair contract only rewrites Findings.  A
+        # checkpoint with invalid criterion/hard-rule evidence (or a page/quote
+        # mismatch) must therefore be rerun as a complete isolated Reviewer;
+        # all other valid Reviewer checkpoints remain untouched.
         repair_sources = {
-            result.reviewer_id: result
-            for result in results
-            if result.reviewer_id in invalid_reviewer_ids
+            reviewer_id: result
+            for reviewer_id, result in invalid_results.items()
+            if _can_use_legacy_finding_repair(
+                result=result,
+                block_by_id=block_by_id,
+                evidence_ids=evidence_ids,
+            )
         }
 
         ordered_ids = sorted(invalid_reviewer_ids)
         self._append_trace(
             run.run_id,
             "review_reference_repair_started",
-            {"reviewer_ids": ordered_ids},
+            {
+                "reviewer_ids": ordered_ids,
+                "full_rerun_ids": sorted(invalid_reviewer_ids - set(repair_sources)),
+            },
         )
         repaired = await self._run_reviewers(
             run=run,
@@ -1209,6 +1226,43 @@ def _combine_audits(*reports: AuditReport) -> AuditReport:
         covered.update(report.covered_dimensions)
     combined.covered_dimensions = sorted(covered)
     return combined
+
+
+def _can_use_legacy_finding_repair(
+    *,
+    result: ReviewerResult,
+    block_by_id: dict[str, DocumentBlock],
+    evidence_ids: set[str],
+) -> bool:
+    """Return whether the old Findings-only repair contract is sufficient."""
+
+    block_ids = set(block_by_id)
+    policy_only = result.model_copy(update={"findings": []}, deep=True)
+    if reviewer_reference_errors(
+        result=policy_only,
+        block_ids=block_ids,
+        evidence_ids=evidence_ids,
+        block_by_id=block_by_id,
+    ):
+        return False
+    for finding in result.findings:
+        for reference in finding.paper_evidence:
+            if reference.block_id is None:
+                continue
+            block = block_by_id.get(reference.block_id)
+            if block is None:
+                continue
+            if reference.page is not None and reference.page != block.page:
+                return False
+            if reference.quote and reference.quote not in block.text:
+                return False
+    return bool(
+        reviewer_reference_errors(
+            result=result,
+            block_ids=block_ids,
+            evidence_ids=evidence_ids,
+        )
+    )
 
 
 def _merge_expert_opinions(
