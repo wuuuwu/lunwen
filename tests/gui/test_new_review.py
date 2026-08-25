@@ -9,7 +9,13 @@ from paper_reviewer.application.app_state import GuiPreferences
 from paper_reviewer.application.models import RubricValidationResult
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.gui.icons import FluentIconService
+from paper_reviewer.gui.models import ProviderDisplay
 from paper_reviewer.gui.pages.new_review import NewReviewPage
+from paper_reviewer.gui.pages.new_review_validation import (
+    evaluate_start_state,
+    model_choices,
+    validate_discipline_profile,
+)
 from paper_reviewer.gui.resource_paths import bundled_config
 from paper_reviewer.gui.theme import FluentThemeManager
 
@@ -72,6 +78,62 @@ class ProviderReviewService(StubReviewService):
 
     def provider_has_key(self, provider_ref: str) -> bool:
         return provider_ref in self._keys
+
+
+def test_new_review_validation_helpers_keep_form_policy_deterministic(tmp_path: Path) -> None:
+    profile = tmp_path / "profile.yaml"
+    profile.write_text("schema_version: 2\n", encoding="utf-8")
+
+    assert validate_discipline_profile(None) is None
+    assert validate_discipline_profile(profile) is None
+    assert validate_discipline_profile(tmp_path / "missing.yaml") is not None
+
+    state = evaluate_start_state(
+        discipline_name="计算机科学与技术",
+        paper=tmp_path / "paper.pdf",
+        rubric_valid=True,
+        discipline_profile_valid=True,
+        model_name="gpt-5-mini",
+        provider_ref="openai",
+        provider_key_available=True,
+        cloud_authorized=True,
+        non_classified=True,
+        busy=False,
+    )
+    assert state.configuration_ready is False
+    assert state.valid is False
+
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(b"%PDF-1.4\n")
+    state = evaluate_start_state(
+        discipline_name="计算机科学与技术",
+        paper=paper,
+        rubric_valid=True,
+        discipline_profile_valid=True,
+        model_name="gpt-5-mini",
+        provider_ref="openai",
+        provider_key_available=True,
+        cloud_authorized=True,
+        non_classified=True,
+        busy=False,
+    )
+    assert state.configuration_ready is True
+    assert state.valid is True
+
+
+def test_model_choices_prioritize_recent_and_provider_defaults() -> None:
+    provider = ProviderDisplay(
+        "custom:abc", "校内模型", "chat_completions", default_model="campus-model"
+    )
+    choices, current = model_choices(
+        provider,
+        recent_models=["recent-model", "campus-model", "recent-model"],
+        default_provider="openai",
+        default_model="gpt-5-mini",
+        provider_ref="custom:abc",
+    )
+    assert choices == ["recent-model", "campus-model"]
+    assert current == "campus-model"
 
 def test_development_defaults_use_top_level_canonical_configs() -> None:
     project_root = Path(__file__).resolve().parents[2]

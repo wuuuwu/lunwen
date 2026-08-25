@@ -118,6 +118,23 @@ def test_zh_cn_report_contains_labels_without_machine_identifiers() -> None:
         assert value not in markdown
 
 
+def test_zh_cn_evaluation_markdown_matches_golden_bytes() -> None:
+    rubric, evaluation = _evaluation()
+    markdown = render_markdown(
+        rubric,  # type: ignore[arg-type]
+        evaluation,
+        AuditReport(),
+        presentation_profile=ReportPresentationProfile.ZH_CN_V1,
+    )
+    expected = (
+        Path(__file__).parents[1] / "fixtures" / "reporting" / "evaluation_zh_cn_v1.md"
+    ).read_bytes().replace(b"\r\n", b"\n")
+
+    assert expected.endswith(b"\n")
+    assert b"\r" not in expected
+    assert markdown.encode("utf-8") == expected
+
+
 def test_pending_human_review_marker_is_at_top_of_markdown() -> None:
     rubric, evaluation = _evaluation()
     pending = evaluation.model_copy(

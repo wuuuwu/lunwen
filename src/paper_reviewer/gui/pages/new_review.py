@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from paper_reviewer.application.app_state import GuiPreferences
-from paper_reviewer.application.models import ReviewRequest, RubricValidationResult
+from paper_reviewer.application.models import RubricValidationResult
 from paper_reviewer.application.service import ReviewApplicationService
 from paper_reviewer.gui.icons import FluentIconService
 from paper_reviewer.gui.models import (
@@ -26,6 +26,15 @@ from paper_reviewer.gui.models import (
     provider_display,
     provider_has_key,
     provider_protocol_text,
+)
+from paper_reviewer.gui.pages.new_review_validation import (
+    build_review_request,
+    evaluate_start_state,
+    is_valid_pdf,
+    model_choices,
+    paper_info_text,
+    resolve_profile_for_rubric,
+    validate_discipline_profile,
 )
 from paper_reviewer.gui.resource_paths import bundled_config
 from paper_reviewer.gui.theme import set_fluent_property
@@ -267,11 +276,8 @@ class NewReviewPage(QWidget):
 
     def _discipline_profile_changed(self, text: str) -> None:
         path = Path(text.strip()) if text.strip() else None
-        if path is None:
-            self.discipline_profile_picker.set_invalid(None)
-            self._set_error(self.discipline_profile_error, None)
-        elif not path.is_file() or path.suffix.lower() not in {".yaml", ".yml"}:
-            message = "专业培养目标 YAML 不存在或格式不正确"
+        message = validate_discipline_profile(path)
+        if message:
             self.discipline_profile_picker.set_invalid(message)
             self._set_error(self.discipline_profile_error, message)
         else:
@@ -391,22 +397,18 @@ class NewReviewPage(QWidget):
             (item for item in self._provider_catalog if item.provider_ref == provider),
             provider_display(provider),
         )
-        if connection.default_model:
-            defaults = [connection.default_model]
-        elif provider == "openai":
-            defaults = ["gpt-5-mini", "gpt-4.1-mini"]
-        else:
-            defaults = ["deepseek-chat"]
-        current = (
-            self.preferences.default_model
-            if provider == self.preferences.default_provider
-            else ""
+        choices, current = model_choices(
+            connection,
+            recent_models=recent,
+            default_provider=self.preferences.default_provider,
+            default_model=self.preferences.default_model,
+            provider_ref=provider,
         )
         self.model.blockSignals(True)
         self.model.clear()
-        for name in dict.fromkeys([*recent, *defaults]):
+        for name in choices:
             self.model.addItem(name)
-        self.model.setCurrentText(current or defaults[0])
+        self.model.setCurrentText(current)
         self.model.blockSignals(False)
 
     def _inputs_changed(self, _value: object = "") -> None:
@@ -423,14 +425,11 @@ class NewReviewPage(QWidget):
             self.discipline_name.setAccessibleDescription(message)
             self._set_error(self.discipline_name_error, message)
         paper = self.paper_picker.path()
-        if paper and paper.is_file() and paper.suffix.lower() == ".pdf":
+        self.paper_info.setText(paper_info_text(paper))
+        if is_valid_pdf(paper):
             self.paper_picker.set_invalid(None)
-            self.paper_info.setText(f"{paper.name} · {paper.stat().st_size / 1024 / 1024:.2f} MB")
         elif paper:
             self.paper_picker.set_invalid("请选择存在的 PDF 文件")
-            self.paper_info.setText("文件不可用")
-        else:
-            self.paper_info.setText("尚未选择文件")
         self._update_start_state()
 
     def _update_start_state(self) -> None:
@@ -452,31 +451,20 @@ class NewReviewPage(QWidget):
             if non_classified_ok
             else "必须确认论文不包含涉密材料后才能开始云端评测。"
         )
-        valid = bool(
-            self.discipline_name.text().strip()
-            and paper
-            and paper.is_file()
-            and paper.suffix.lower() == ".pdf"
-            and self.validation
-            and self.validation.valid
-            and self._discipline_profile_is_valid()
-            and self.model.currentText().strip()
-            and provider_has_key(self.service, provider)
-            and cloud_ok
-            and non_classified_ok
+        start_state = evaluate_start_state(
+            discipline_name=self.discipline_name.text(),
+            paper=paper,
+            rubric_valid=bool(self.validation and self.validation.valid),
+            discipline_profile_valid=self._discipline_profile_is_valid(),
+            model_name=self.model.currentText(),
+            provider_ref=provider,
+            provider_key_available=provider_has_key(self.service, provider),
+            cloud_authorized=cloud_ok,
+            non_classified=non_classified_ok,
+            busy=self._busy,
         )
-        self.start_button.setEnabled(valid and not self._busy)
-        configuration_ready = bool(
-            self.discipline_name.text().strip()
-            and paper
-            and paper.is_file()
-            and paper.suffix.lower() == ".pdf"
-            and self.validation
-            and self.validation.valid
-            and self._discipline_profile_is_valid()
-            and self.model.currentText().strip()
-        )
-        if configuration_ready and not provider_has_key(self.service, provider):
+        self.start_button.setEnabled(start_state.valid)
+        if start_state.configuration_ready and not provider_has_key(self.service, provider):
             display = provider_display(provider, self._selected_provider()).display_name
             self.message.show_message(
                 f"尚未配置 {display} API Key。", severity="warning", action_text="前往设置"
@@ -490,7 +478,7 @@ class NewReviewPage(QWidget):
 
     def _discipline_profile_is_valid(self) -> bool:
         path = self.discipline_profile_picker.path()
-        return path is None or (path.is_file() and path.suffix.lower() in {".yaml", ".yml"})
+        return validate_discipline_profile(path) is None
 
     @staticmethod
     def _optional_bundled_config(name: str, project_relative: str) -> Path | None:
@@ -509,24 +497,10 @@ class NewReviewPage(QWidget):
         return self._zhejiang_rubric_path or bundled_config("unscored_draft.yaml")
 
     def _profile_for_rubric(self, path: Path) -> Path:
-        if self._zhejiang_profile_path is None:
-            return self._legacy_profile_path
-        if path.name == "zhejiang_undergraduate_thesis_v2.yaml":
-            return self._zhejiang_profile_path
-        # Custom v2 Rubrics are allowed to use the same specialist profile. Keep
-        # legacy/v1 YAMLs on their original profile for backward compatibility.
-        try:
-            schema_line = next(
-                line.strip()
-                for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip().startswith("schema_version:")
-            )
-        except (OSError, StopIteration):
-            return self._legacy_profile_path
-        return (
-            self._zhejiang_profile_path
-            if schema_line.partition(":")[2].strip().strip("\"'") == "2"
-            else self._legacy_profile_path
+        return resolve_profile_for_rubric(
+            path,
+            zhejiang_profile_path=self._zhejiang_profile_path,
+            legacy_profile_path=self._legacy_profile_path,
         )
 
     def _start(self) -> None:
@@ -534,8 +508,7 @@ class NewReviewPage(QWidget):
         rubric = self.rubric_picker.path()
         if (
             paper is None
-            or not paper.is_file()
-            or paper.suffix.lower() != ".pdf"
+            or not is_valid_pdf(paper)
             or rubric is None
         ):
             self._inputs_changed()
@@ -588,14 +561,14 @@ class NewReviewPage(QWidget):
             recent.remove(model_name)
         recent.insert(0, model_name)
         del recent[8:]
-        request = ReviewRequest(
+        request = build_review_request(
             paper=paper,
             provider=provider,
             model=model_name,
             rubric=rubric,
             profile=self.profile_path,
             external_search=self.external_search.isChecked(),
-            discipline_name=self.discipline_name.text().strip(),
+            discipline_name=self.discipline_name.text(),
             discipline_profile=self.discipline_profile_picker.path(),
             cloud_processing_authorized=self.cloud_processing_authorized.isChecked(),
             contains_classified_material=not self.non_classified_confirmation.isChecked(),

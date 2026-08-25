@@ -7,16 +7,14 @@ import sys
 from importlib import resources
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
-from paper_reviewer.adapters.security.keyring_store import SystemCredentialStore
-from paper_reviewer.application.app_state import AppPaths, PreferencesStore
-from paper_reviewer.application.service import ReviewApplicationService
-from paper_reviewer.gui.main_window import MainWindow
-from paper_reviewer.gui.theme import FluentThemeManager
+if TYPE_CHECKING:
+    from paper_reviewer.application.app_state import AppPaths
 
 CREDENTIAL_SELF_TEST_FLAG = "--self-test-credentials"
 DATABASE_SELF_TEST_FLAG = "--self-test-database"
@@ -61,6 +59,9 @@ def configure_logging(paths: AppPaths) -> None:
 
 def run_database_self_test() -> None:
     """Create, query, and dispose a temporary SQLite database through the app service."""
+    from paper_reviewer.application.app_state import AppPaths
+    from paper_reviewer.application.service import ReviewApplicationService
+
     with TemporaryDirectory(prefix="paper-reviewer-db-probe-") as temporary:
         root = Path(temporary)
         paths = AppPaths(
@@ -235,6 +236,8 @@ def run_report_export_self_test() -> None:
 def main() -> int:
     if CREDENTIAL_SELF_TEST_FLAG in sys.argv[1:]:
         try:
+            from paper_reviewer.adapters.security.keyring_store import SystemCredentialStore
+
             SystemCredentialStore.self_test()
         except Exception:
             return 1
@@ -263,8 +266,19 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Paper Reviewer")
     app.setOrganizationName("PaperReviewer")
+    from paper_reviewer.application.app_state import AppPaths, PreferencesStore
+
     paths = AppPaths.for_current_user()
     configure_logging(paths)
+    # Keep module import and packaging self-tests independent from the full
+    # window graph.  Heavy model, parser, search, and PDF-export dependencies
+    # are themselves loaded lazily by the application service when used.
+    # Imports remain on the normal startup path so frozen builds still discover
+    # the same Python modules.
+    from paper_reviewer.application.service import ReviewApplicationService
+    from paper_reviewer.gui.main_window import MainWindow
+    from paper_reviewer.gui.theme import FluentThemeManager
+
     store = PreferencesStore(paths.preferences_path)
     preferences = store.load()
     theme = FluentThemeManager(app)

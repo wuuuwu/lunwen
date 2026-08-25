@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
@@ -13,10 +12,12 @@ from typing import Any
 from pydantic import BaseModel
 
 from paper_reviewer.domain.evidence import EvidenceItem
-from paper_reviewer.domain.provider import ModelApiProtocol, ProviderSnapshot
-from paper_reviewer.domain.review import MetaReview, Severity
+from paper_reviewer.domain.provider import ProviderSnapshot
+from paper_reviewer.domain.review import Severity
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord
+from paper_reviewer.reporting.adapters import adapt_report
+from paper_reviewer.reporting.document import ReportDocument
 from paper_reviewer.reporting.presentation import (
     REPORT_PRESENTATION_FILENAME,
     ReportPresentation,
@@ -109,14 +110,6 @@ def _write_text_atomic(path: Path, content: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def render_markdown(
     rubric: RubricProfile,
     report: Any,
@@ -127,24 +120,51 @@ def render_markdown(
     model: str | None = None,
     presentation_profile: ReportPresentationProfile = ReportPresentationProfile.LEGACY,
 ) -> str:
-    """Render a legacy MetaReview or the new EvaluationReport."""
-    provider_lines = _provider_report_lines(
+    """Render a legacy MetaReview or the new EvaluationReport.
+
+    The public facade keeps its historical signature; the renderer consumes a
+    read-only projection so future GUI/PDF consumers can share the same input
+    boundary without reimplementing report-shape detection.
+    """
+
+    document = adapt_report(
+        rubric,
+        report,
+        audit,
         provider_snapshot=provider_snapshot,
         provider_ref=provider_ref,
         model=model,
+        presentation_profile=presentation_profile,
     )
-    presentation = ReportPresentation(rubric, presentation_profile)
-    if _is_evaluation_report(report):
-        return _render_evaluation_markdown(
-            rubric, report, audit, provider_lines, presentation
-        )
+    return render_document(document)
+
+
+def render_document(document: ReportDocument) -> str:
+    """Render a previously adapted report projection."""
+
+    if document.is_evaluation:
+        return _render_evaluation_document(document)
+    return _render_legacy_document(document)
+
+
+def _render_legacy_document(document: ReportDocument) -> str:
     return _render_legacy_markdown(
-        rubric, report, audit, provider_lines, presentation
+        document.rubric,
+        document.report,
+        document.audit,
+        list(document.provider_lines),
+        document.presentation,
     )
 
 
-def _render_markdown(rubric: RubricProfile, review: Any, audit: AuditReport) -> str:
-    return render_markdown(rubric, review, audit)
+def _render_evaluation_document(document: ReportDocument) -> str:
+    return _render_evaluation_markdown(
+        document.rubric,
+        document.report,
+        document.audit,
+        list(document.provider_lines),
+        document.presentation,
+    )
 
 
 def _render_legacy_markdown(
@@ -754,65 +774,8 @@ def _json_text(value: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 
-def _is_evaluation_report(value: Any) -> bool:
-    if isinstance(value, MetaReview):
-        return False
-    return any(
-        _field(value, name, default=None) is not None
-        for name in (
-            "diagnostic_score",
-            "diagnostic_scores",
-            "hard_rule_assessments",
-            "human_rule_decisions",
-            "initial_expert_opinions",
-            "supplemental_expert_opinions",
-            "panel_decision",
-            "policy_context",
-            "evaluation_mode",
-        )
-    )
-
-
 def _load_provider_snapshot(run_dir: Path) -> ProviderSnapshot | None:
     path = run_dir / "provider.json"
     if not path.is_file():
         return None
     return ProviderSnapshot.model_validate_json(path.read_text(encoding="utf-8"))
-
-
-def _provider_report_lines(
-    *,
-    provider_snapshot: ProviderSnapshot | None,
-    provider_ref: str | None,
-    model: str | None,
-) -> list[str]:
-    """Render only safe provider identity; never expose an endpoint or custom UUID."""
-
-    selected_model: str | None
-    if provider_snapshot is not None:
-        display_name = provider_snapshot.display_name
-        protocol = provider_snapshot.protocol
-        selected_model = provider_snapshot.model
-    else:
-        builtins = {
-            "openai": ("OpenAI", ModelApiProtocol.CHAT_COMPLETIONS),
-            "openai_responses": ("OpenAI", ModelApiProtocol.RESPONSES),
-            "deepseek": ("DeepSeek", ModelApiProtocol.CHAT_COMPLETIONS),
-        }
-        display_name, protocol = builtins.get(
-            provider_ref or "",
-            ("自定义 Provider", ModelApiProtocol.CHAT_COMPLETIONS),
-        )
-        selected_model = model
-    protocol_name = (
-        "Responses API"
-        if protocol is ModelApiProtocol.RESPONSES
-        else "Chat Completions"
-    )
-    lines = [
-        f"- Provider：{_text(display_name)}",
-        f"- 接口协议：{_text(protocol_name)}",
-    ]
-    if selected_model:
-        lines.append(f"- 模型：{_text(selected_model)}")
-    return lines

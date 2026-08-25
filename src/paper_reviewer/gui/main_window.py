@@ -44,6 +44,7 @@ from paper_reviewer.gui.models import (
     NavigationModel,
     provider_label,
 )
+from paper_reviewer.gui.operations import AsyncOperationRegistry
 from paper_reviewer.gui.pages.new_review import NewReviewPage
 from paper_reviewer.gui.pages.rubrics import RubricsPage
 from paper_reviewer.gui.pages.run_detail import RunDetailPage
@@ -99,7 +100,11 @@ class MainWindow(QMainWindow):
         self.preferences_store = preferences_store
         self.theme = theme
         self.icons = FluentIconService(theme)
-        self._workers: list[AsyncTaskThread] = []
+        self._operation_registry = AsyncOperationRegistry()
+        # Keep the historical attribute as a live alias.  Apart from being
+        # useful to integrations, this preserves the shutdown behavior while
+        # the registry centralizes tracking and cleanup for every operation.
+        self._workers = self._operation_registry.workers
         self._review_worker: AsyncTaskThread | None = None
         self._active_run_id = ""
         self._active_run_status = ""
@@ -188,7 +193,13 @@ class MainWindow(QMainWindow):
         self.new_review_page = NewReviewPage(self.service, self.preferences, self.icons)
         self.runs_page = RunsPage(self.icons)
         self.rubrics_page = RubricsPage(self.service, self.preferences, self.icons)
-        self.settings_page = SettingsPage(self.service, self.preferences, self.paths, self.icons)
+        self.settings_page = SettingsPage(
+            self.service,
+            self.preferences,
+            self.paths,
+            self.icons,
+            operation_registry=self._operation_registry,
+        )
         self.run_detail_page = RunDetailPage(self.icons)
         self.page_by_id = {
             "new_review": self.new_review_page,
@@ -657,16 +668,13 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _track_worker(self, worker: AsyncTaskThread) -> None:
-        self._workers.append(worker)
+        self._operation_registry.track(worker, self._worker_finished)
 
-        def finished() -> None:
-            if worker in self._workers:
-                self._workers.remove(worker)
-            if self._review_worker is worker:
-                self._review_worker = None
-            worker.deleteLater()
+    def _worker_finished(self, worker: AsyncTaskThread) -> None:
+        """Clear role-specific references after the common registry cleanup."""
 
-        worker.finished.connect(finished)
+        if self._review_worker is worker:
+            self._review_worker = None
 
     def _navigation_clicked(self, index: QModelIndex) -> None:
         page_id = self.navigation_model.item_id(index)
@@ -825,9 +833,7 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-        running_workers = [worker for worker in self._workers if worker.isRunning()]
-        for worker in running_workers:
-            worker.cancel_task()
+        running_workers = self._operation_registry.cancel_running()
         deadline = monotonic() + 5.0
         for worker in running_workers:
             remaining_ms = max(0, int((deadline - monotonic()) * 1000))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -13,9 +14,11 @@ from paper_reviewer.application.models import (
 )
 from paper_reviewer.domain.provider import CustomProviderProfile, ModelApiProtocol
 from paper_reviewer.gui.icons import FluentIconService
+from paper_reviewer.gui.operations import AsyncOperationRegistry
 from paper_reviewer.gui.pages.settings import SettingsPage
 from paper_reviewer.gui.provider_widgets import ProviderEditorDialog, ProviderTableModel
 from paper_reviewer.gui.theme import FluentThemeManager
+from paper_reviewer.gui.worker import AsyncTaskThread
 
 
 class _Credentials:
@@ -175,4 +178,46 @@ def test_provider_compatibility_error_displays_only_sanitized_fields(qapp, tmp_p
     assert dialog.error_label.accessibleName() == "Provider 兼容性测试结果"
     assert dialog.error_label.accessibleDescription() == dialog.error_label.text()
     dialog.reject()
+    page.deleteLater()
+
+
+def test_settings_provider_worker_uses_window_registry_for_cancel_and_cleanup(
+    qapp, qtbot, tmp_path: Path
+) -> None:
+    profile = _profile()
+    service = _Service(profile)
+    paths = AppPaths(
+        root=tmp_path,
+        data_dir=tmp_path / "data",
+        runs_dir=tmp_path / "runs",
+        logs_dir=tmp_path / "logs",
+        config_dir=tmp_path / "config",
+    )
+    theme = FluentThemeManager(qapp)
+    registry = AsyncOperationRegistry()
+    page = SettingsPage(
+        service,
+        GuiPreferences(),
+        paths,
+        FluentIconService(theme),
+        operation_registry=registry,
+    )
+
+    async def operation(_emit: object) -> None:
+        await asyncio.Event().wait()
+
+    worker = AsyncTaskThread(operation)
+    page._register_provider_worker(worker)
+    assert page._provider_test_workers == [worker]
+    assert registry.workers == [worker]
+    worker.start()
+    qtbot.waitUntil(worker.isRunning, timeout=3000)
+
+    with qtbot.waitSignal(worker.task_cancelled, timeout=3000):
+        cancelled = registry.cancel_running()
+        assert cancelled == [worker]
+    assert worker.wait(3000)
+    qapp.processEvents()
+    assert page._provider_test_workers == []
+    assert registry.workers == []
     page.deleteLater()
