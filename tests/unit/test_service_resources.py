@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from paper_reviewer.application import service as service_module
 from paper_reviewer.application.runtime import review_runtime
+from paper_reviewer.application.service import ReviewApplicationService
 from paper_reviewer.application.unit_of_work import ApplicationUnitOfWork
 from paper_reviewer.config import Settings
 from paper_reviewer.domain.provider import (
@@ -15,6 +19,7 @@ from paper_reviewer.domain.provider import (
     ProviderSnapshot,
     endpoint_fingerprint,
 )
+from paper_reviewer.domain.run import RunRecord
 
 
 def test_importing_application_service_does_not_load_optional_heavy_modules() -> None:
@@ -42,6 +47,81 @@ print(json.dumps(blocked))
     )
 
     assert json.loads(completed.stdout) == []
+
+
+@pytest.mark.asyncio
+async def test_service_resume_rejects_snapshot_model_change_before_key_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run = RunRecord(
+        run_id="run-provider",
+        input_path="paper.pdf",
+        input_hash="input",
+        config_hash="config",
+        rubric_id="rubric",
+        provider="openai",
+        model="recorded-model",
+    )
+    base_url = "https://api.openai.com/v1"
+    tampered = ProviderSnapshot(
+        provider_ref="openai",
+        display_name="OpenAI",
+        protocol=ModelApiProtocol.CHAT_COMPLETIONS,
+        base_url=base_url,
+        endpoint_fingerprint=endpoint_fingerprint(
+            base_url, ModelApiProtocol.CHAT_COMPLETIONS
+        ),
+        model="different-model",
+    )
+    key_requested = False
+
+    class FakeUnitOfWork:
+        def __init__(self, _database_url: str) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeUnitOfWork:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        @staticmethod
+        def require_sessions() -> object:
+            return object()
+
+    class FakeRunRepository:
+        def __init__(self, _sessions: object) -> None:
+            pass
+
+        async def get(self, _run_id: str) -> RunRecord:
+            return run
+
+    class FakeProviders:
+        def get_snapshot_api_key(self, _snapshot: ProviderSnapshot) -> str:
+            nonlocal key_requested
+            key_requested = True
+            raise AssertionError("API Key must not be requested")
+
+    service = ReviewApplicationService.__new__(ReviewApplicationService)
+    service.settings = SimpleNamespace(
+        database_url="sqlite+aiosqlite://",
+        runs_dir=tmp_path,
+    )
+    service.providers = FakeProviders()  # type: ignore[assignment]
+    monkeypatch.setattr(service_module, "ApplicationUnitOfWork", FakeUnitOfWork)
+    monkeypatch.setattr(service_module, "RunRepository", FakeRunRepository)
+    monkeypatch.setattr(
+        service_module,
+        "load_run_snapshots",
+        lambda _run_dir: (object(), object()),
+    )
+    monkeypatch.setattr(service_module, "load_provider_snapshot", lambda _run_dir: tampered)
+
+    with pytest.raises(ValueError, match="Provider 或模型不一致"):
+        await service.resume_review(run.run_id)
+
+    assert not key_requested
 
 
 class _FakeEngine:

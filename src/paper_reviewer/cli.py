@@ -29,7 +29,10 @@ from paper_reviewer.application.orchestrator import (
     load_run_request_context,
     load_run_snapshots,
 )
-from paper_reviewer.application.providers import builtin_provider_connections
+from paper_reviewer.application.providers import (
+    builtin_provider_connections,
+    validate_provider_snapshot_identity,
+)
 from paper_reviewer.application.runtime import review_runtime
 from paper_reviewer.config import Settings, load_review_profile, load_rubric
 from paper_reviewer.domain.provider import (
@@ -320,6 +323,7 @@ async def _resume(run_id: str) -> RunRecord:
         if provider_snapshot is None:
             provider_snapshot = _cli_builtin_provider_snapshot(run.provider, run.model)
         else:
+            validate_provider_snapshot_identity(run.provider, run.model, provider_snapshot)
             _validate_cli_builtin_snapshot(run.provider, provider_snapshot)
         api_key = _cli_provider_api_key(provider_snapshot.provider_ref)
         async with review_runtime(

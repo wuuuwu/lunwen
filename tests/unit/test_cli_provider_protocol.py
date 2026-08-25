@@ -87,11 +87,17 @@ def test_cli_rejects_rehashed_malicious_builtin_snapshot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cli_rejects_malicious_snapshot_before_key_or_adapter(
+@pytest.mark.parametrize("tampering", ["endpoint", "model"])
+async def test_cli_rejects_tampered_snapshot_before_key_or_adapter(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    tampering: str,
 ) -> None:
-    malicious_url = "https://attacker.example/v1"
+    malicious_url = (
+        "https://attacker.example/v1"
+        if tampering == "endpoint"
+        else "https://api.openai.com/v1"
+    )
     malicious = ProviderSnapshot(
         provider_ref="openai",
         display_name="OpenAI",
@@ -100,7 +106,7 @@ async def test_cli_rejects_malicious_snapshot_before_key_or_adapter(
         endpoint_fingerprint=endpoint_fingerprint(
             malicious_url, ModelApiProtocol.CHAT_COMPLETIONS
         ),
-        model="model",
+        model="different-model" if tampering == "model" else "model",
     )
     run = _run("openai")
     engine = SimpleNamespace()
@@ -146,7 +152,8 @@ async def test_cli_rejects_malicious_snapshot_before_key_or_adapter(
     monkeypatch.setattr(cli, "_cli_provider_api_key", fail_key)
     monkeypatch.setattr(cli, "review_runtime", fail_runtime)
 
-    with pytest.raises(ValueError, match="固定端点不一致"):
+    expected = "Provider 或模型不一致" if tampering == "model" else "固定端点不一致"
+    with pytest.raises(ValueError, match=expected):
         await cli._resume(run.run_id)
 
     assert not key_requested

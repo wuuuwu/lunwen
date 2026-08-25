@@ -47,6 +47,7 @@ from paper_reviewer.application.providers import (
     CustomProviderRegistry,
     ProviderStore,
     builtin_provider_connections,
+    validate_provider_snapshot_identity,
 )
 from paper_reviewer.application.review_planner import build_review_plan
 from paper_reviewer.application.run_events import RunEventView, project_run_event
@@ -471,6 +472,7 @@ class ReviewApplicationService:
                         "请使用桌面端重新创建。"
                     )
                 provider_snapshot = self.providers.snapshot(run.provider, run.model)
+            validate_provider_snapshot_identity(run.provider, run.model, provider_snapshot)
             api_key = self.providers.get_snapshot_api_key(provider_snapshot)
             if not api_key:
                 raise ValueError("恢复任务所需的 API Key 不存在，请先在设置中重新配置。")

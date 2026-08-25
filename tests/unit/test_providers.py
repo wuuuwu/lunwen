@@ -10,6 +10,7 @@ from paper_reviewer.application.providers import (
     ProviderCatalog,
     ProviderCatalogError,
     ProviderStore,
+    validate_provider_snapshot_identity,
 )
 from paper_reviewer.domain.provider import (
     CustomProviderProfile,
@@ -93,6 +94,26 @@ def test_snapshot_rejects_mismatched_endpoint_fingerprint() -> None:
             endpoint_fingerprint="0" * 64,
             model="gpt-5-mini",
         )
+
+
+def test_snapshot_identity_rejects_provider_or_model_changes() -> None:
+    base_url = "https://api.openai.com/v1"
+    snapshot = ProviderSnapshot(
+        provider_ref="openai",
+        display_name="OpenAI",
+        protocol=ModelApiProtocol.CHAT_COMPLETIONS,
+        base_url=base_url,
+        endpoint_fingerprint=endpoint_fingerprint(
+            base_url, ModelApiProtocol.CHAT_COMPLETIONS
+        ),
+        model="recorded-model",
+    )
+
+    validate_provider_snapshot_identity("openai", "recorded-model", snapshot)
+    with pytest.raises(ValueError, match="Provider 或模型不一致"):
+        validate_provider_snapshot_identity("deepseek", "recorded-model", snapshot)
+    with pytest.raises(ValueError, match="Provider 或模型不一致"):
+        validate_provider_snapshot_identity("openai", "different-model", snapshot)
 
 
 def test_store_rejects_corruption_without_overwriting_it(tmp_path: Path) -> None:

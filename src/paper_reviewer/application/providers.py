@@ -359,3 +359,20 @@ class CustomProviderRegistry:
 
 def builtin_provider_connections() -> tuple[ProviderConnection, ...]:
     return tuple(_BUILTIN_CONNECTIONS.values())
+
+
+def validate_provider_snapshot_identity(
+    provider_ref: str,
+    model: str,
+    snapshot: ProviderSnapshot,
+) -> None:
+    """Bind a persisted connection snapshot to its immutable run identity.
+
+    Endpoint and credential validation is handled by the provider registry.
+    This separate check prevents a modified task artifact from changing the
+    provider or model while the database, report, and configuration hash still
+    attribute the run to the original values.
+    """
+
+    if snapshot.provider_ref != provider_ref or snapshot.model != model:
+        raise ValueError("Provider 快照与任务 Provider 或模型不一致。")

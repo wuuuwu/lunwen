@@ -25,7 +25,10 @@ from paper_reviewer.application.artifacts import RunArtifactStore
 from paper_reviewer.application.evidence_builder import build_external_evidence
 from paper_reviewer.application.models import RunEvent
 from paper_reviewer.application.pipeline import PipelineContext
-from paper_reviewer.application.providers import builtin_provider_connections
+from paper_reviewer.application.providers import (
+    builtin_provider_connections,
+    validate_provider_snapshot_identity,
+)
 from paper_reviewer.application.reference_checker import (
     MAX_EXTRACTED_REFERENCES,
     check_references,
@@ -138,10 +141,8 @@ class ReviewOrchestrator:
     ) -> RunRecord:
         if provider_snapshot is None:
             provider_snapshot = _builtin_provider_snapshot(provider, model_name)
-        if provider_snapshot is not None and (
-            provider_snapshot.provider_ref != provider or provider_snapshot.model != model_name
-        ):
-            raise ValueError("Provider 快照与任务 Provider 或模型不一致。")
+        if provider_snapshot is not None:
+            validate_provider_snapshot_identity(provider, model_name, provider_snapshot)
         if provider.startswith("custom:") and provider_snapshot is None:
             raise ValueError("自定义 Provider 任务必须由桌面端提供不可变 Provider 快照。")
         if _is_dual_advisory(rubric):
