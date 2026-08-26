@@ -7,7 +7,8 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 
-from paper_reviewer.application.models import ReportView, RunEvent
+from paper_reviewer.application.models import ReportView, RunDetail, RunEvent
+from paper_reviewer.config import load_rubric
 from paper_reviewer.domain.review import (
     CriterionAssessment,
     DiagnosticScore,
@@ -17,6 +18,8 @@ from paper_reviewer.domain.review import (
     PanelDecision,
     PanelOutcome,
     PolicyContext,
+    ReviewFinding,
+    Severity,
 )
 from paper_reviewer.domain.rubric import (
     AggregationPolicy,
@@ -25,9 +28,16 @@ from paper_reviewer.domain.rubric import (
     RubricProfile,
 )
 from paper_reviewer.domain.run import RunRecord, RunStatus
+from paper_reviewer.domain.submission import (
+    SUBMISSION_METADATA_FIELDS,
+    SubmissionFieldEvidence,
+    SubmissionMetadata,
+    SubmissionMetadataSource,
+)
 from paper_reviewer.gui.icons import FluentIconService
 from paper_reviewer.gui.main_window import MainWindow
 from paper_reviewer.gui.pages.run_detail import RunDetailPage
+from paper_reviewer.gui.pages.run_detail_presenter import _course_grade
 from paper_reviewer.gui.theme import FluentThemeManager
 from paper_reviewer.reporting.presentation import ReportPresentationProfile
 from paper_reviewer.validation.audits import AuditReport
@@ -57,6 +67,131 @@ def test_prepare_run_rebinds_detail_and_cancel_action(qapp: QApplication, qtbot:
     assert page.run_id == "new-run"
     assert page.events.toPlainText() == "新任务正在评测"
     assert cancelled == ["new-run"]
+
+
+def test_course_progress_uses_metadata_and_reviews_without_thesis_panel(
+    qapp: QApplication,
+    qtbot: object,
+) -> None:
+    theme = FluentThemeManager(qapp)
+    page = RunDetailPage(FluentIconService(theme))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    page.prepare_run("course-run")
+
+    page.append_event(
+        RunEvent(
+            run_id="course-run",
+            event_type="submission_metadata_started",
+            status=RunStatus.INGESTED,
+            stage="metadata",
+            message="正在提取姓名、学号、专业和论文题目",
+        )
+    )
+
+    labels = [
+        page.stage_model.item(row).text()
+        for row in range(page.stage_model.rowCount())
+    ]
+    assert len(labels) == 7
+    assert any("进行中 · 提取学生与论文信息" in label for label in labels)
+    assert any("课程专项 Reviewer 评阅" in label for label in labels)
+    assert all("专业化评分" not in label for label in labels)
+    assert all("独立专家面板" not in label for label in labels)
+
+    page.append_event(
+        RunEvent(
+            run_id="course-run",
+            event_type="submission_metadata_completed",
+            stage="metadata",
+            message="学生与论文信息提取完成",
+        )
+    )
+    page.append_event(
+        RunEvent(
+            run_id="course-run",
+            event_type="reviews_started",
+            status=RunStatus.REVIEWING,
+            stage="reviews",
+            message="多位 Reviewer 正在评测",
+        )
+    )
+
+    labels = [
+        page.stage_model.item(row).text()
+        for row in range(page.stage_model.rowCount())
+    ]
+    assert any("已完成 · 提取学生与论文信息" in label for label in labels)
+    assert any("进行中 · 课程专项 Reviewer 评阅" in label for label in labels)
+    assert page.stage_progress.maximum() == 7
+    assert page.stage_progress.value() == 1
+
+
+def test_course_progress_is_recovered_from_trace_while_non_course_stays_legacy(
+    qapp: QApplication,
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    theme = FluentThemeManager(qapp)
+    page = RunDetailPage(FluentIconService(theme))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    run = RunRecord(
+        run_id="course-run",
+        status=RunStatus.AUDITING,
+        input_path="paper.pdf",
+        input_hash="a" * 64,
+        config_hash="b" * 64,
+        rubric_id="custom-course-rubric@1",
+        provider="fake",
+        model="fake",
+        completed_stages=["ingest", "evidence", "reviews"],
+    )
+    detail = RunDetail(
+        run=run,
+        events=[
+            RunEvent(
+                run_id=run.run_id,
+                event_type="submission_metadata_started",
+                status=RunStatus.INGESTED,
+                stage="metadata",
+                message="正在提取信息",
+            ),
+            RunEvent(
+                run_id=run.run_id,
+                event_type="evidence_collection_started",
+                status=RunStatus.BUILDING_EVIDENCE,
+                stage="evidence",
+                message="正在收集证据",
+            ),
+        ],
+    )
+
+    page.show_detail(detail, run_dir=tmp_path)
+
+    course_labels = [
+        page.stage_model.item(row).text()
+        for row in range(page.stage_model.rowCount())
+    ]
+    assert any("已完成 · 提取学生与论文信息" in label for label in course_labels)
+    assert any("进行中 · 确定性审计" in label for label in course_labels)
+    assert all("独立专家面板" not in label for label in course_labels)
+
+    page.prepare_run("legacy-run")
+    page.append_event(
+        RunEvent(
+            run_id="legacy-run",
+            event_type="reviews_started",
+            status=RunStatus.REVIEWING,
+            stage="reviews",
+            message="Reviewer 评测开始",
+        )
+    )
+    legacy_labels = [
+        page.stage_model.item(row).text()
+        for row in range(page.stage_model.rowCount())
+    ]
+    assert any("进行中 · 专业化评分" in label for label in legacy_labels)
+    assert any("独立专家面板" in label for label in legacy_labels)
+    assert all("提取学生与论文信息" not in label for label in legacy_labels)
 
 
 def test_cancel_button_busy_state_blocks_duplicate_requests(
@@ -547,6 +682,155 @@ def test_v2_report_uses_experimental_score_without_legacy_verdict_card(
     assert "risk_not_triggered" not in page.decision_path.toPlainText()
     assert "初评专家 1" in page.panel_report.toPlainText()
     assert "expert-1" not in page.panel_report.toPlainText()
+
+
+@pytest.mark.parametrize(
+    ("score", "expected"),
+    [
+        (0, "核心任务明显缺失"),
+        (39, "核心任务明显缺失"),
+        (40, "完成不足"),
+        (59, "完成不足"),
+        (60, "达到基本要求"),
+        (74, "达到基本要求"),
+        (75, "良好"),
+        (89, "良好"),
+        (90, "优秀"),
+        (100, "优秀"),
+    ],
+)
+def test_course_grade_uses_the_five_rubric_anchors(score: int, expected: str) -> None:
+    assert _course_grade(score) == expected
+
+
+def test_course_report_shows_student_metadata_and_course_only_sections(
+    qapp: QApplication,
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    theme = FluentThemeManager(qapp)
+    theme.set_mode("light")
+    page = RunDetailPage(FluentIconService(theme))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    rubric = load_rubric(Path("configs/rubrics/course_paper_v1.yaml"))
+    scores = {
+        dimension.dimension_id: score
+        for dimension, score in zip(
+            rubric.dimensions,
+            (86.0, 82.0, 78.0, 80.0, 88.0, 76.0),
+            strict=True,
+        )
+    }
+    metadata = SubmissionMetadata(
+        student_name="张三",
+        student_id="20260001",
+        major="公共管理",
+        paper_title="数字政务课程论文",
+        field_evidence={
+            field: SubmissionFieldEvidence(
+                source=SubmissionMetadataSource.COVER_LABEL,
+                confidence=0.99,
+                page=1,
+                evidence=f"{field} 封面标签",
+            )
+            for field in SUBMISSION_METADATA_FIELDS
+        },
+    )
+    finding = ReviewFinding(
+        finding_id="course-finding-1",
+        reviewer_id="course-reviewer",
+        dimension_id="argument_evidence",
+        severity=Severity.MINOR,
+        confidence=0.8,
+        claim="个别论断支撑不足",
+        rationale="关键论断需要增加课程材料依据。",
+        recommendation="补充课程案例或文献。",
+    )
+    review = MetaReview(
+        run_id="course-report-run",
+        overall_summary="论文已较好完成课程任务。",
+        findings=[finding],
+        total_score=82.0,
+        verdict="pass",
+    )
+    run = RunRecord(
+        run_id="course-report-run",
+        status=RunStatus.REPORTED,
+        input_path="raw_upload_001.pdf",
+        input_hash="a" * 64,
+        config_hash="b" * 64,
+        rubric_id=f"{rubric.rubric_id}@{rubric.version}",
+        provider="fake",
+        model="fake",
+    )
+    report = ReportView(
+        run=run,
+        rubric=rubric,
+        review=review,
+        audit=AuditReport(),
+        dimension_scores=scores,
+        report_markdown=tmp_path / "report.md",
+        report_json=tmp_path / "report.json",
+        presentation_profile=ReportPresentationProfile.COURSE_ZH_CN_V1,
+        submission_metadata=metadata,
+    )
+
+    page.show_report(report, run_dir=tmp_path)
+
+    metadata_text = page.report_metadata.text()
+    assert "题目：数字政务课程论文" in metadata_text
+    assert "姓名：张三" in metadata_text
+    assert "学号：20260001" in metadata_text
+    assert "专业：公共管理" in metadata_text
+    assert page.total_score.text() == "课程总分\n82 分"
+    assert "五级等级：良好" in page.dimension_scores.text()
+    assert "课程要求结论：达到课程论文基本要求" in page.dimension_scores.text()
+    assert "pass" not in page.dimension_scores.text().casefold()
+    assert page.diagnostic_title.text() == "六项课程评价维度"
+    assert page.diagnostic_scores_model.rowCount() == 6
+    assert page.diagnostic_scores_model.columnCount() == 4
+    assert page.diagnostic_scores_model.headerData(0, Qt.Orientation.Horizontal) == "课程评价维度"
+    assert [
+        page.diagnostic_scores_model.item(row, 0).text()
+        for row in range(page.diagnostic_scores_model.rowCount())
+    ] == [dimension.title for dimension in rubric.dimensions]
+    assert page.overall_summary.text() == "论文已较好完成课程任务。"
+    assert page.findings_model.rowCount() == 1
+    assert not page.findings_frame.isHidden()
+    assert page.hard_rule_review_frame.isHidden()
+    assert page.hard_rule_report_frame.isHidden()
+    assert page.panel_report_frame.isHidden()
+    assert page.decision_frame.isHidden()
+    assert page.notes_title.text() == "分歧与审计说明"
+    visible_course_text = "\n".join(
+        (
+            page.diagnostic_title.text(),
+            page.disclaimers.text(),
+            page.notes_title.text(),
+        )
+    )
+    for policy_term in ("浙江", "抽检风险", "否决项", "专家面板", "人工复核"):
+        assert policy_term not in visible_course_text
+    assert page.diagnostic_scores.objectName() == "diagnosticScores"
+    assert page.diagnostic_scores.accessibleName() == "六项课程评价维度得分"
+
+
+def test_report_mode_restores_policy_sections_after_course_report(
+    qapp: QApplication,
+    qtbot: object,
+) -> None:
+    theme = FluentThemeManager(qapp)
+    page = RunDetailPage(FluentIconService(theme))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+
+    page._configure_report_mode(True)
+    page._configure_report_mode(False)
+
+    assert page.diagnostic_title.text() == "九项诊断评分（0–4）"
+    assert not page.hard_rule_report_frame.isHidden()
+    assert not page.panel_report_frame.isHidden()
+    assert not page.decision_frame.isHidden()
+    assert page.notes_title.text() == "分歧、人工复核与审计说明"
 
 
 @pytest.mark.parametrize(("width", "height"), [(900, 600), (1180, 760)])

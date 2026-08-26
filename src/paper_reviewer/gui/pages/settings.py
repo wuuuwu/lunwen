@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -57,13 +59,16 @@ class SettingsPage(
         paths: AppPaths,
         icons: FluentIconService,
         operation_registry: AsyncOperationRegistry | None = None,
+        *,
+        profile_path: Path | None = None,
+        default_rubric_path: Path | None = None,
     ) -> None:
         super().__init__()
         self.service = service
         self.preferences = preferences
         self.paths = paths
         self.operation_registry = operation_registry
-        self.profile_path = bundled_config("three_reviewer.yaml")
+        self.profile_path = profile_path or bundled_config("three_reviewer.yaml")
         self._provider_dialog: ProviderEditorDialog | None = None
         self._provider_test_workers: list[AsyncTaskThread] = []
         self._provider_action_busy = False
@@ -213,6 +218,8 @@ class SettingsPage(
         self.default_rubric = PathPicker(suffix=".yaml", placeholder="默认 Rubric YAML")
         if preferences.default_rubric:
             self.default_rubric.set_path(preferences.default_rubric)
+        elif default_rubric_path is not None:
+            self.default_rubric.set_path(default_rubric_path)
         self.default_rubric.browse_requested.connect(self._browse_rubric)
         self.external_search = QCheckBox("默认启用联网检索与参考文献自动核验")
         self.external_search.setChecked(preferences.external_search)

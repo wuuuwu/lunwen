@@ -139,7 +139,7 @@ class RubricProfile(BaseModel):
     groups: list[RubricGroup] = Field(default_factory=list)
     rating_scale: RatingScale | None = None
     panel_strategy: PanelStrategy | None = None
-    evaluation_mode: Literal["dual_advisory"] | None = None
+    evaluation_mode: Literal["dual_advisory", "course_assessment"] | None = None
     experimental: bool = False
     validation_notice: str | None = None
 
@@ -173,6 +173,8 @@ class RubricProfile(BaseModel):
                 raise ValueError("each scored dimension requires score anchors")
         if self.schema_version == "2":
             self._check_v2_profile()
+        elif self.evaluation_mode == "course_assessment":
+            _check_course_profile_requirements(self)
         return self
 
     def _check_v2_profile(self) -> None:
@@ -220,6 +222,21 @@ def _check_v2_profile_requirements(profile: RubricProfile) -> None:
         raise ValueError(
             "schema v2 hard rules must restrict AI to not_detected/suspected/not_assessable"
         )
+
+
+def _check_course_profile_requirements(profile: RubricProfile) -> None:
+    """Validate only the stable aggregation contract for course rubrics.
+
+    Course-specific dimensions, weights, anchors, and passing thresholds remain
+    configurable so an instructor can replace the bundled general template.
+    """
+
+    if not profile.scoring_enabled:
+        raise ValueError("course assessment rubrics must enable scoring")
+    if profile.aggregation is None or profile.aggregation.method != "weighted_mean":
+        raise ValueError("course assessment requires aggregation.method=weighted_mean")
+    if abs(profile.aggregation.maximum_total - 100) > 0.001:
+        raise ValueError("course assessment maximum_total must be 100")
 
 
 def _check_v2_group_structure(profile: RubricProfile) -> None:

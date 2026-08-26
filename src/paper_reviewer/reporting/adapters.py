@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from paper_reviewer.domain.provider import ProviderSnapshot
 from paper_reviewer.domain.review import MetaReview
 from paper_reviewer.domain.rubric import RubricProfile
+from paper_reviewer.domain.submission import SubmissionMetadata
 from paper_reviewer.reporting.document import ReportDocument, ReportKind
 from paper_reviewer.reporting.presentation import ReportPresentationProfile
 from paper_reviewer.validation.audits import AuditReport
@@ -28,6 +30,8 @@ class LegacyReportAdapter:
         provider_ref: str | None = None,
         model: str | None = None,
         presentation_profile: ReportPresentationProfile = ReportPresentationProfile.LEGACY,
+        submission_metadata: SubmissionMetadata | None = None,
+        dimension_scores: Mapping[str, float] | None = None,
     ) -> ReportDocument:
         return ReportDocument(
             rubric=rubric,
@@ -38,6 +42,8 @@ class LegacyReportAdapter:
             provider_snapshot=provider_snapshot,
             provider_ref=provider_ref,
             model=model,
+            submission_metadata=submission_metadata,
+            dimension_scores=(dict(dimension_scores) if dimension_scores is not None else None),
         )
 
     from_report = adapt
@@ -79,6 +85,8 @@ def adapt_report(
     provider_ref: str | None = None,
     model: str | None = None,
     presentation_profile: ReportPresentationProfile = ReportPresentationProfile.LEGACY,
+    submission_metadata: SubmissionMetadata | None = None,
+    dimension_scores: Mapping[str, float] | None = None,
 ) -> ReportDocument:
     """Select the compatible adapter while preserving legacy detection rules."""
 
@@ -91,6 +99,8 @@ def adapt_report(
         provider_ref=provider_ref,
         model=model,
         presentation_profile=presentation_profile,
+        submission_metadata=submission_metadata,
+        dimension_scores=dimension_scores,
     )
 
 

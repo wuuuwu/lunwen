@@ -26,6 +26,53 @@ def _display_value(value: Any) -> str:
     return ("是" if value else "否") if isinstance(value, bool) else str(value)
 
 
+def _score_text(value: float | int | None) -> str:
+    """以适合界面阅读的精度显示课程分数。"""
+
+    if value is None:
+        return "暂无"
+    numeric = float(value)
+    return f"{numeric:.0f}" if numeric.is_integer() else f"{numeric:.1f}"
+
+
+def _course_grade(total_score: float | int | None) -> str:
+    """把课程总分映射到 Rubric 约定的五级锚点。"""
+
+    if total_score is None:
+        return "暂无"
+    score = float(total_score)
+    if score < 40:
+        return "核心任务明显缺失"
+    if score < 60:
+        return "完成不足"
+    if score < 75:
+        return "达到基本要求"
+    if score < 90:
+        return "良好"
+    return "优秀"
+
+
+def _course_conclusion(
+    total_score: float | int | None,
+    passing_score: float | int | None,
+    verdict: Any = None,
+) -> str:
+    """生成不暴露 ``pass``/``fail`` 机器值的课程结论。"""
+
+    if total_score is not None and passing_score is not None:
+        return (
+            "达到课程论文基本要求"
+            if float(total_score) >= float(passing_score)
+            else "未达到课程论文基本要求"
+        )
+    normalized = _status_value(verdict)
+    if normalized in {"pass", "passed", "qualified"}:
+        return "达到课程论文基本要求"
+    if normalized in {"fail", "failed", "unqualified"}:
+        return "未达到课程论文基本要求"
+    return "未设置结论"
+
+
 def _first(source: Any, *names: str, default: Any = None) -> Any:
     if source is None:
         return default

@@ -35,6 +35,7 @@ class RunEventDescriptor:
 
 _STAGE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("ingest", "ingest"),
+    ("submission_metadata", "metadata"),
     ("evidence", "evidence"),
     ("reference", "evidence"),
     ("scoring", "scoring"),
@@ -72,6 +73,12 @@ RUN_EVENT_CATALOG: Mapping[str, RunEventDescriptor] = {
     "run_created": _descriptor("run_created", "已创建评测任务"),
     "ingest_started": _descriptor("ingest_started", "正在解析论文"),
     "ingest_completed": _descriptor("ingest_completed", "论文解析完成"),
+    "submission_metadata_started": _descriptor(
+        "submission_metadata_started", "正在提取姓名、学号、专业和论文题目"
+    ),
+    "submission_metadata_completed": _descriptor(
+        "submission_metadata_completed", "学生与论文信息提取完成"
+    ),
     "evidence_collection_started": _descriptor(
         "evidence_collection_started", "正在收集外部学术证据"
     ),

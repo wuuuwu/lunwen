@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from paper_reviewer.application.orchestrator import (
     ReviewOrchestrator,
     SanitizedDatabaseError,
+    SanitizedReviewError,
     _safe_error_message,
 )
 from paper_reviewer.config import ReviewerProfile, ReviewProfile, Settings
@@ -174,3 +175,40 @@ def test_unknown_database_reason_is_collapsed() -> None:
     assert message == "IntegrityError: database operation failed"
     assert "paper secret" not in message
     assert "INSERT INTO" not in message
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_never_crosses_worker_boundary_with_raw_response(
+    tmp_path: Path,
+) -> None:
+    class ProviderFailure(RuntimeError):
+        status_code = 400
+
+    secret = "Bearer sk-provider-secret raw response body"
+    runs_dir = tmp_path / "runs"
+    run_id = "run-with-provider-error"
+    (runs_dir / run_id).mkdir(parents=True)
+    run = _run(run_id)
+
+    class FailingParser:
+        def parse(self, _path: Path) -> ParsedDocument:
+            raise ProviderFailure(secret)
+
+    orchestrator = ReviewOrchestrator(
+        settings=Settings(runs_dir=runs_dir),
+        model=_UnusedRepository(),  # type: ignore[arg-type]
+        parser=FailingParser(),  # type: ignore[arg-type]
+        run_repository=_RunRepository(),  # type: ignore[arg-type]
+        document_repository=_UnusedRepository(),  # type: ignore[arg-type]
+        evidence_repository=_UnusedRepository(),  # type: ignore[arg-type]
+        review_repository=_UnusedRepository(),  # type: ignore[arg-type]
+    )
+    rubric, profile = _profile()
+
+    with pytest.raises(SanitizedReviewError) as caught:
+        await orchestrator.execute(run, rubric=rubric, profile=profile)  # type: ignore[arg-type]
+
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert str(caught.value) == "ProviderFailure: provider rejected the request (HTTP 400)"
+    assert secret not in rendered
+    assert caught.value.__cause__ is None

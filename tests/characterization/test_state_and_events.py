@@ -107,3 +107,24 @@ def test_live_and_trace_projection_preserve_historical_repair_text_difference() 
     assert live.message == "正在修复 Reviewer 的无效证据引用"
     assert trace.message == "review reference repair started"
     assert live.stage == trace.stage == "reviews"
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected_message"),
+    [
+        ("submission_metadata_started", "正在提取姓名、学号、专业和论文题目"),
+        ("submission_metadata_completed", "学生与论文信息提取完成"),
+    ],
+)
+def test_course_metadata_events_have_a_localized_stage_and_message(
+    event_type: str,
+    expected_message: str,
+) -> None:
+    event = project_run_event(
+        run_id="course-run",
+        event_type=event_type,
+        payload={"status": "ingested"},
+    )
+
+    assert event.stage == "metadata"
+    assert event.message == expected_message

@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 import uuid
 from collections.abc import Callable, Collection, Mapping
 from datetime import UTC, datetime
@@ -23,6 +24,10 @@ from paper_reviewer.agents.panel_reviewer import run_panel_reviewer
 from paper_reviewer.agents.reviewer import run_reviewer
 from paper_reviewer.application.artifacts import RunArtifactStore
 from paper_reviewer.application.evidence_builder import build_external_evidence
+from paper_reviewer.application.metadata_extractor import (
+    extract_submission_metadata,
+    filter_identity_blocks,
+)
 from paper_reviewer.application.models import RunEvent
 from paper_reviewer.application.pipeline import PipelineContext
 from paper_reviewer.application.providers import (
@@ -38,7 +43,7 @@ from paper_reviewer.application.review_planner import ReviewPlan, build_review_p
 from paper_reviewer.application.run_events import project_run_event
 from paper_reviewer.application.state_machine import transition
 from paper_reviewer.config import ReviewerProfile, ReviewProfile, Settings
-from paper_reviewer.domain.document import DocumentBlock, DocumentInfo
+from paper_reviewer.domain.document import DocumentBlock, DocumentInfo, normalize_text
 from paper_reviewer.domain.evidence import EvidenceItem
 from paper_reviewer.domain.provider import ProviderSnapshot
 from paper_reviewer.domain.reference import ReferenceCheckReport
@@ -59,6 +64,7 @@ from paper_reviewer.domain.review import (
 )
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
+from paper_reviewer.domain.submission import SubmissionMetadata, SubmissionMetadataSource
 from paper_reviewer.ports.document_parser import DocumentParserPort
 from paper_reviewer.ports.model import ModelPort
 from paper_reviewer.ports.scholarly_search import ScholarlySearchPort
@@ -91,6 +97,14 @@ class SanitizedDatabaseError(RuntimeError):
     raised from the orchestrator: the GUI worker renders a full traceback, and
     a normal exception chain would include SQL parameters and document text.
     """
+
+    def __init__(self, message: str, *, original_error: BaseException) -> None:
+        super().__init__(message)
+        self.original_error = original_error
+
+
+class SanitizedReviewError(RuntimeError):
+    """Public review failure whose traceback cannot expose a provider response."""
 
     def __init__(self, message: str, *, original_error: BaseException) -> None:
         super().__init__(message)
@@ -138,7 +152,14 @@ class ReviewOrchestrator:
         contains_classified_material: bool = False,
         external_search: bool = True,
         provider_snapshot: ProviderSnapshot | None = None,
+        expected_input_hash: str | None = None,
     ) -> RunRecord:
+        course_assessment = _is_course_assessment(rubric)
+        if course_assessment:
+            # Course scoring is intentionally blind to professional context.
+            discipline_name = ""
+            discipline_profile = None
+            panel_profile = None
         if provider_snapshot is None:
             provider_snapshot = _builtin_provider_snapshot(provider, model_name)
         if provider_snapshot is not None:
@@ -146,12 +167,16 @@ class ReviewOrchestrator:
         if provider.startswith("custom:") and provider_snapshot is None:
             raise ValueError("自定义 Provider 任务必须由桌面端提供不可变 Provider 快照。")
         if _is_dual_advisory(rubric):
+            if not discipline_name.strip():
+                raise ValueError("discipline_name is required for dual-advisory evaluation")
             if cloud_processing_authorized is not True:
                 raise ValueError("cloud processing authorization is required")
             if contains_classified_material:
                 raise ValueError("classified material cannot be processed in the cloud")
         resolved_input = await asyncio.to_thread(input_path.resolve)
         input_hash = await asyncio.to_thread(_file_hash, input_path)
+        if expected_input_hash is not None and input_hash != expected_input_hash:
+            raise ValueError("课程论文源 PDF 在批次创建后发生变化，请重新创建批次。")
         discipline_profile_text = (
             await asyncio.to_thread(discipline_profile.read_text, encoding="utf-8")
             if discipline_profile is not None
@@ -192,6 +217,7 @@ class ReviewOrchestrator:
                 "cloud_processing_authorized": bool(cloud_processing_authorized),
                 "contains_classified_material": contains_classified_material,
                 "external_search": external_search,
+                "expected_input_hash": expected_input_hash,
             },
         )
         self._append_trace(run.run_id, "run_created", {"status": run.status.value})
@@ -213,11 +239,22 @@ class ReviewOrchestrator:
         run_dir = self.settings.runs_dir / run.run_id
         plan = build_review_plan(rubric, profile)
         dual_advisory = _is_dual_advisory(rubric)
+        course_assessment = _is_course_assessment(rubric)
         context = load_run_request_context(run_dir)
         discipline_name = str(context.get("discipline_name", ""))
         discipline_profile = context.get("discipline_profile")
         if discipline_profile is not None and not isinstance(discipline_profile, str):
             discipline_profile = None
+        if course_assessment:
+            discipline_name = ""
+            discipline_profile = None
+            panel_profile = None
+        expected_input_hash_value = context.get("expected_input_hash")
+        expected_input_hash = (
+            str(expected_input_hash_value)
+            if isinstance(expected_input_hash_value, str)
+            else None
+        )
         pipeline = PipelineContext(
             run=run,
             run_dir=run_dir,
@@ -225,11 +262,14 @@ class ReviewOrchestrator:
             panel_profile=panel_profile,
             plan=plan,
             dual_advisory=dual_advisory,
+            course_assessment=course_assessment,
             discipline_name=discipline_name,
             discipline_profile=discipline_profile,
+            expected_input_hash=expected_input_hash,
         )
         try:
             await self._execute_ingest_stage(pipeline)
+            await self._execute_submission_metadata_stage(pipeline)
             await self._execute_evidence_stage(pipeline)
             await self._execute_reviews_stage(pipeline)
             await self._execute_audit_stage(pipeline)
@@ -278,7 +318,7 @@ class ReviewOrchestrator:
                 )
             if _is_database_error(error):
                 raise SanitizedDatabaseError(safe_message, original_error=error) from None
-            raise
+            raise SanitizedReviewError(safe_message, original_error=error) from None
 
     async def _execute_ingest_stage(self, pipeline: PipelineContext) -> None:
         run = pipeline.run
@@ -286,6 +326,13 @@ class ReviewOrchestrator:
         if "ingest" not in run.completed_stages:
             await self._set_status(run, RunStatus.INGESTING, "ingest_started")
             parsed = await asyncio.to_thread(self.parser.parse, Path(run.input_path))
+            if (
+                pipeline.expected_input_hash is not None
+                and parsed.info.sha256 != pipeline.expected_input_hash
+            ):
+                raise ValueError(
+                    "课程论文源 PDF 在解析期间发生变化，请重新创建批次。"
+                )
             await self.documents.add_blocks(run.run_id, parsed.blocks)
             artifacts.write_model("document.json", parsed.info)
             await self._complete_stage(run, "ingest", RunStatus.INGESTED)
@@ -293,6 +340,46 @@ class ReviewOrchestrator:
         else:
             pipeline.document = artifacts.load_model("document.json", DocumentInfo)
         pipeline.blocks = await self.documents.list_blocks(run.run_id)
+
+    async def _execute_submission_metadata_stage(self, pipeline: PipelineContext) -> None:
+        """Extract course submission metadata once, then blind downstream reviewers.
+
+        The artifact itself is the checkpoint.  It is deliberately separate from
+        ``completed_stages`` so thesis-edition state strings and stage ordering stay
+        unchanged.  Only non-sensitive extraction diagnostics enter the trace.
+        """
+
+        if not pipeline.course_assessment:
+            return
+        assert pipeline.document is not None
+        artifacts = RunArtifactStore(pipeline.run_dir)
+        metadata_path = pipeline.run_dir / "submission-metadata.json"
+        if metadata_path.is_file():
+            metadata = artifacts.load_model("submission-metadata.json", SubmissionMetadata)
+        else:
+            self._append_trace(
+                pipeline.run.run_id,
+                "submission_metadata_started",
+                {"status": pipeline.run.status.value},
+            )
+            metadata = await extract_submission_metadata(
+                model=self.model,
+                document=pipeline.document,
+                blocks=pipeline.blocks,
+                run_id=pipeline.run.run_id,
+            )
+            artifacts.write_model("submission-metadata.json", metadata)
+            self._append_trace(
+                pipeline.run.run_id,
+                "submission_metadata_completed",
+                {
+                    "needs_review": metadata.needs_review,
+                    "warning_count": len(metadata.warnings),
+                },
+            )
+        pipeline.submission_metadata = metadata
+        pipeline.blocks = _blind_course_blocks(pipeline.blocks, metadata)
+        pipeline.document = _blind_course_document(pipeline.document, metadata)
 
     async def _execute_evidence_stage(self, pipeline: PipelineContext) -> None:
         run = pipeline.run
@@ -751,6 +838,13 @@ class ReviewOrchestrator:
             else RunStatus.REPORTED
         )
         projected_run.status = transition(projected_run.status, target_status)
+        report_dimension_scores = (
+            aggregate_scores(pipeline.rubric, pipeline.results).dimension_scores
+            if pipeline.rubric.scoring_enabled and not pipeline.dual_advisory
+            else None
+        )
+        if pipeline.course_assessment and report_dimension_scores is not None:
+            artifacts.write_json("dimension-scores.json", report_dimension_scores)
         write_report_bundle(
             run_dir=pipeline.run_dir,
             run=projected_run,
@@ -758,6 +852,8 @@ class ReviewOrchestrator:
             review=evaluation or pipeline.meta,
             audit=pipeline.audit,
             evidence=pipeline.evidence,
+            submission_metadata=pipeline.submission_metadata,
+            dimension_scores=report_dimension_scores,
         )
         run.completed_stages = projected_run.completed_stages
         run.status = projected_run.status
@@ -810,12 +906,16 @@ class ReviewOrchestrator:
                     evidence=evidence,
                     scoring_enabled=rubric.scoring_enabled,
                     hard_rules=(
-                        rubric.hard_rules if _reviews_hard_rules(assignment.reviewer) else []
+                        rubric.hard_rules
+                        if not _is_course_assessment(rubric)
+                        and _reviews_hard_rules(assignment.reviewer)
+                        else []
                     ),
                     discipline_name=discipline_name,
                     discipline_profile=discipline_profile,
                     max_repairs=self.settings.max_output_repairs,
                     web_search_tools=web_search_tools,
+                    require_dimension_scores=_is_course_assessment(rubric),
                     repair_source=(
                         repair_sources.get(assignment.reviewer.reviewer_id)
                         if repair_sources is not None
@@ -946,15 +1046,23 @@ class ReviewOrchestrator:
         # checkpoint with invalid criterion/hard-rule evidence (or a page/quote
         # mismatch) must therefore be rerun as a complete isolated Reviewer;
         # all other valid Reviewer checkpoints remain untouched.
-        repair_sources = {
-            reviewer_id: result
-            for reviewer_id, result in invalid_results.items()
-            if _can_use_legacy_finding_repair(
-                result=result,
-                block_by_id=block_by_id,
-                evidence_ids=evidence_ids,
-            )
-        }
+        # Course-paper reviewers must remain identity-blind even while repairing
+        # an invalid checkpoint.  A legacy repair embeds the previous complete
+        # ReviewerResult in the next prompt, so course assessments deliberately
+        # rerun the isolated reviewer from the already blinded document instead.
+        repair_sources = (
+            {}
+            if _is_course_assessment(rubric)
+            else {
+                reviewer_id: result
+                for reviewer_id, result in invalid_results.items()
+                if _can_use_legacy_finding_repair(
+                    result=result,
+                    block_by_id=block_by_id,
+                    evidence_ids=evidence_ids,
+                )
+            }
+        )
 
         ordered_ids = sorted(invalid_reviewer_ids)
         self._append_trace(
@@ -1112,6 +1220,99 @@ def _is_dual_advisory(rubric: RubricProfile) -> bool:
     return (
         getattr(rubric, "evaluation_mode", None) == "dual_advisory" or rubric.schema_version == "2"
     )
+
+
+def _is_course_assessment(rubric: RubricProfile) -> bool:
+    return getattr(rubric, "evaluation_mode", None) == "course_assessment"
+
+
+def _blind_course_document(
+    document: DocumentInfo,
+    metadata: SubmissionMetadata,
+) -> DocumentInfo:
+    """Return the identity-free document projection supplied to reviewers."""
+
+    return document.model_copy(
+        update={
+            "source_path": "course-paper.pdf",
+            # The extracted title stays available to the local report layer.  A
+            # generic title here prevents filename-derived identity from leaking
+            # when a non-standard filename was used as the metadata fallback.
+            "title": "课程论文",
+        }
+    )
+
+
+def _blind_course_blocks(
+    blocks: list[DocumentBlock],
+    metadata: SubmissionMetadata,
+) -> list[DocumentBlock]:
+    """Remove identity front matter, including mixed title/identity cover blocks."""
+
+    filtered = filter_identity_blocks(blocks, metadata)
+    identity_values = [
+        normalize_text(value)
+        for field, value in (
+            ("student_name", metadata.student_name),
+            ("student_id", metadata.student_id),
+            ("major", metadata.major),
+        )
+        if metadata.field_evidence[field].source is not SubmissionMetadataSource.PLACEHOLDER
+        and normalize_text(value)
+    ]
+    blinded: list[DocumentBlock] = []
+    identity_label = re.compile(
+        r"(?:学生姓名|姓名|作者|学生学号|学号|学生编号|专业名称|所学专业|专业)\s*[:：]",
+        re.IGNORECASE,
+    )
+    identity_field_only = re.compile(
+        r"^\s*(?:学生姓名|姓名|作者|学生学号|学号|学生编号|专业名称|所学专业|专业)"
+        r"\s*[:：]?\s*$",
+        re.IGNORECASE,
+    )
+    drop_indexes: set[int] = set()
+    identity_pages: set[int] = set()
+    for index, block in enumerate(filtered):
+        normalized_text = unicodedata.normalize("NFKC", block.text)
+        if identity_label.search(normalized_text) or identity_field_only.fullmatch(
+            normalized_text
+        ):
+            identity_pages.add(block.page)
+        if identity_field_only.fullmatch(normalized_text):
+            drop_indexes.add(index)
+            if index + 1 < len(filtered):
+                value_block = filtered[index + 1]
+                if value_block.page == block.page and len(value_block.text) <= 300:
+                    # PDF cover forms often extract the label and its value as
+                    # adjacent blocks.  When the label is explicit, fail closed
+                    # and remove the short neighbouring value even on a late
+                    # cover page that metadata extraction did not inspect.
+                    drop_indexes.add(index + 1)
+
+    for index, block in enumerate(filtered):
+        if index in drop_indexes:
+            continue
+        # Match and redact in one NFKC projection.  Comparing normalized
+        # metadata with the unnormalised PDF text would otherwise let fullwidth
+        # digits and compatibility characters bypass identity blinding.
+        text = unicodedata.normalize("NFKC", block.text)
+        normalized_section_path = [
+            unicodedata.normalize("NFKC", part) for part in block.section_path
+        ]
+        # Drop mixed cover blocks too.  The title is already available in the
+        # local metadata artifact and is not needed as reviewer identity context.
+        if identity_label.search(text) or (
+            block.page in identity_pages and len(text) <= 500
+        ):
+            continue
+        section_path = [
+            part for part in normalized_section_path if not identity_label.search(part)
+        ]
+        for value in identity_values:
+            text = text.replace(value, "[已隐藏身份信息]")
+            section_path = [part.replace(value, "[已隐藏身份信息]") for part in section_path]
+        blinded.append(block.model_copy(update={"text": text, "section_path": section_path}))
+    return blinded
 
 
 def _reviews_hard_rules(reviewer: ReviewerProfile) -> bool:
@@ -1279,8 +1480,8 @@ def _safe_error_message(error: BaseException) -> str:
 
 def _safe_external_reason(error: BaseException) -> str:
     module = type(error).__module__
-    if module == "openai" or module.startswith("openai."):
-        status = getattr(error, "status_code", None)
+    status = getattr(error, "status_code", None)
+    if module == "openai" or module.startswith("openai.") or isinstance(status, int):
         if isinstance(status, int):
             reason = {
                 400: "provider rejected the request",

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "paper-reviewer"
 version = "0.1.0"
-description = "A rubric-driven, evidence-grounded academic paper review harness."
+description = "A rubric-driven, evidence-grounded course paper review harness."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = { text = "MIT" }
@@ -47,6 +47,7 @@ dev = [
 [project.scripts]
 paper-review = "paper_reviewer.cli:app"
 paper-review-app = "paper_reviewer.gui.app:main"
+course-paper-review-app = "paper_reviewer.gui.app:main"
 paper-review-gallery = "paper_reviewer.gui.gallery:main"
 
 [tool.hatch.build]
@@ -69,6 +70,8 @@ packages = ["src/paper_reviewer"]
 "configs/rubrics/zhejiang_undergraduate_thesis_v2.yaml" = "paper_reviewer/resources/configs/zhejiang_undergraduate_thesis_v2.yaml"
 "configs/review_profiles/zhejiang_undergraduate_specialists_v1.yaml" = "paper_reviewer/resources/configs/zhejiang_undergraduate_specialists_v1.yaml"
 "configs/review_profiles/zhejiang_independent_panel_v1.yaml" = "paper_reviewer/resources/configs/zhejiang_independent_panel_v1.yaml"
+"configs/rubrics/course_paper_v1.yaml" = "paper_reviewer/resources/configs/course_paper_v1.yaml"
+"configs/review_profiles/course_paper_reviewers_v1.yaml" = "paper_reviewer/resources/configs/course_paper_reviewers_v1.yaml"
 
 [tool.pytest.ini_options]
 addopts = "-q"

@@ -16,6 +16,7 @@ REPORT_PRESENTATION_FILENAME = "report-presentation.json"
 class ReportPresentationProfile(StrEnum):
     LEGACY = "legacy"
     ZH_CN_V1 = "zh_cn_v1"
+    COURSE_ZH_CN_V1 = "course_zh_cn_v1"
 
 
 class ReportPresentationMetadata(BaseModel):
@@ -153,7 +154,14 @@ class ReportPresentation:
 
     @property
     def localized(self) -> bool:
-        return self.profile is ReportPresentationProfile.ZH_CN_V1
+        return self.profile in {
+            ReportPresentationProfile.ZH_CN_V1,
+            ReportPresentationProfile.COURSE_ZH_CN_V1,
+        }
+
+    @property
+    def course(self) -> bool:
+        return self.profile is ReportPresentationProfile.COURSE_ZH_CN_V1
 
     def dimension(self, value: Any) -> str:
         raw = _value(value)

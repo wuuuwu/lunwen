@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import uuid
+from collections.abc import Mapping
 from hmac import compare_digest
 from typing import ClassVar
 
@@ -28,6 +29,17 @@ class SystemCredentialStore:
         "deepseek": "DEEPSEEK_API_KEY",
     }
 
+    def __init__(
+        self,
+        *,
+        service_name: str | None = None,
+        environments: Mapping[str, str] | None = None,
+    ) -> None:
+        self.service_name = service_name or self.SERVICE_NAME
+        self.environments = dict(
+            self.ENVIRONMENTS if environments is None else environments
+        )
+
     def get(self, provider: str) -> str | None:
         normalized = provider.lower()
         if normalized == "openai_responses":
@@ -36,10 +48,11 @@ class SystemCredentialStore:
         if account is None:
             return None
         try:
-            stored = keyring.get_password(self.SERVICE_NAME, account)
+            stored = keyring.get_password(self.service_name, account)
         except KeyringError:
             stored = None
-        return stored or os.environ.get(self.ENVIRONMENTS[normalized])
+        environment_name = self.environments.get(normalized)
+        return stored or (os.environ.get(environment_name) if environment_name else None)
 
     def has(self, provider: str) -> bool:
         return bool(self.get(provider))
@@ -53,7 +66,7 @@ class SystemCredentialStore:
             raise ValueError(f"unsupported credential provider: {provider}")
         if not secret.strip():
             raise ValueError("API Key 不能为空")
-        keyring.set_password(self.SERVICE_NAME, account, secret.strip())
+        keyring.set_password(self.service_name, account, secret.strip())
 
     def delete(self, provider: str) -> None:
         normalized = provider.lower()
@@ -63,7 +76,7 @@ class SystemCredentialStore:
         if account is None:
             raise ValueError(f"unsupported credential provider: {provider}")
         try:
-            keyring.delete_password(self.SERVICE_NAME, account)
+            keyring.delete_password(self.service_name, account)
         except PasswordDeleteError:
             return
 
@@ -91,7 +104,7 @@ class SystemCredentialStore:
         if not secret.strip():
             raise ValueError("API Key 不能为空")
         keyring.set_password(
-            self.SERVICE_NAME,
+            self.service_name,
             self._custom_account(
                 profile.provider_id, profile.protocol, profile.endpoint_fingerprint
             ),
@@ -103,7 +116,7 @@ class SystemCredentialStore:
             profile.provider_id, profile.protocol, profile.endpoint_fingerprint
         )
         try:
-            keyring.delete_password(self.SERVICE_NAME, account)
+            keyring.delete_password(self.service_name, account)
         except PasswordDeleteError:
             return
 
@@ -115,7 +128,7 @@ class SystemCredentialStore:
     ) -> str | None:
         account = self._custom_account(provider_id, protocol, endpoint_fingerprint)
         try:
-            return keyring.get_password(self.SERVICE_NAME, account)
+            return keyring.get_password(self.service_name, account)
         except KeyringError:
             return None
 
@@ -140,9 +153,9 @@ class SystemCredentialStore:
         return f"custom:{profile.provider_id}:{protocol.value}:{endpoint_fingerprint}"
 
     @classmethod
-    def self_test(cls) -> None:
+    def self_test(cls, *, service_name: str | None = None) -> None:
         """Verify the active keyring with a short-lived, randomly named credential."""
-        service = f"{cls.SERVICE_NAME}.SelfTest.{uuid.uuid4().hex}"
+        service = f"{service_name or cls.SERVICE_NAME}.SelfTest.{uuid.uuid4().hex}"
         account = "temporary_probe"
         secret = secrets.token_urlsafe(32)
         credential_exists = False

@@ -5,7 +5,13 @@ import os
 from pathlib import Path
 
 from platformdirs import user_data_path
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+COURSE_APP_ID = "CoursePaperReviewer"
+COURSE_APP_DISPLAY_NAME = "Course Paper Reviewer"
+COURSE_ORGANIZATION_NAME = "CoursePaperReviewer"
+COURSE_SETTINGS_NAME = "CoursePaperReviewer"
+COURSE_CREDENTIAL_SERVICE_NAME = "CoursePaperReviewer"
 
 # Run states that represent a run which can still make progress.  Keep these
 # values as strings rather than importing ``RunStatus`` here: the GUI is also
@@ -69,16 +75,32 @@ class AppPaths(BaseModel):
     runs_dir: Path
     logs_dir: Path
     config_dir: Path
+    batches_dir: Path
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_batches_dir(cls, value: object) -> object:
+        """Keep explicit pre-batch ``AppPaths`` fixtures source compatible."""
+
+        if not isinstance(value, dict) or "batches_dir" in value:
+            return value
+        root = value.get("root")
+        if root is None:
+            return value
+        updated = dict(value)
+        updated["batches_dir"] = Path(root) / "batches"
+        return updated
 
     @classmethod
     def for_current_user(cls) -> AppPaths:
-        root = user_data_path("PaperReviewer", "PaperReviewer", roaming=False)
+        root = user_data_path(COURSE_APP_ID, COURSE_ORGANIZATION_NAME, roaming=False)
         return cls(
             root=root,
             data_dir=root / "data",
             runs_dir=root / "runs",
             logs_dir=root / "logs",
             config_dir=root / "config",
+            batches_dir=root / "batches",
         )
 
     @property
@@ -98,7 +120,14 @@ class AppPaths(BaseModel):
         return self.config_dir / "providers.json"
 
     def ensure(self) -> None:
-        for path in (self.root, self.data_dir, self.runs_dir, self.logs_dir, self.config_dir):
+        for path in (
+            self.root,
+            self.data_dir,
+            self.runs_dir,
+            self.logs_dir,
+            self.config_dir,
+            self.batches_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -110,12 +139,13 @@ class GuiPreferences(BaseModel):
     default_provider: str = "openai"
     default_model: str = "gpt-5-mini"
     default_rubric: str = ""
-    external_search: bool = True
+    external_search: bool = False
     recent_models: dict[str, list[str]] = Field(default_factory=dict)
     # The id is persisted so an interrupted desktop session can reopen the
     # latest in-progress run.  It intentionally contains no paper path or
     # inspection-report path.
     active_run_id: str | None = None
+    active_batch_id: str | None = None
 
     @field_validator("theme", mode="before")
     @classmethod

@@ -5,7 +5,10 @@ import os
 import re
 import shutil
 import tempfile
+import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,19 @@ from paper_reviewer.adapters.persistence.repositories import (
 from paper_reviewer.adapters.security.keyring_store import SystemCredentialStore
 from paper_reviewer.application.app_state import AppPaths, PreferencesStore, read_json_lines
 from paper_reviewer.application.artifacts import RunArtifactStore
+from paper_reviewer.application.batch_errors import classify_batch_error
+from paper_reviewer.application.batch_output import (
+    allocate_report_path,
+    build_report_filename,
+    write_batch_summary_csv,
+)
+from paper_reviewer.application.batch_store import (
+    BatchLoadError,
+    BatchSourceChangedError,
+    BatchStore,
+    scan_batch_sources,
+    validate_source_snapshot,
+)
 from paper_reviewer.application.models import (
     ProviderCompatibilityResult,
     ProviderErrorDetails,
@@ -53,7 +69,15 @@ from paper_reviewer.application.review_planner import build_review_plan
 from paper_reviewer.application.run_events import RunEventView, project_run_event
 from paper_reviewer.application.state_machine import transition
 from paper_reviewer.application.unit_of_work import ApplicationUnitOfWork
-from paper_reviewer.config import Settings, load_review_profile, load_rubric
+from paper_reviewer.config import ReviewProfile, Settings, load_review_profile, load_rubric
+from paper_reviewer.domain.batch import (
+    BatchEvent,
+    BatchItem,
+    BatchItemStatus,
+    BatchRecord,
+    BatchReviewRequest,
+    BatchStatus,
+)
 from paper_reviewer.domain.document import DocumentInfo
 from paper_reviewer.domain.evidence import EvidenceItem
 from paper_reviewer.domain.provider import (
@@ -76,6 +100,7 @@ from paper_reviewer.domain.review import (
 )
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
+from paper_reviewer.domain.submission import SubmissionMetadata
 from paper_reviewer.ports.model import Message, ModelRequest, ToolSpec
 from paper_reviewer.reporting.presentation import load_presentation_profile
 from paper_reviewer.reporting.renderer import render_markdown, write_report_bundle
@@ -88,6 +113,11 @@ from paper_reviewer.validation.panel import (
 from paper_reviewer.validation.scoring import aggregate_scores
 
 EventSink = Callable[[RunEvent], None]
+BatchEventSink = Callable[[BatchEvent], None]
+
+
+class _BatchReportOutputError(OSError):
+    """Internal marker for report destination failures; text is never persisted."""
 
 
 # Keep these names as stable patch/injection points while delaying optional,
@@ -417,12 +447,41 @@ class ReviewApplicationService:
         build_review_plan(rubric, profile)
         panel_profile = None
         if _is_dual_advisory_rubric(rubric):
+            if not request.discipline_name:
+                raise ValueError("浙江双层评测必须填写专业名称。")
             panel_profile = load_review_profile(_resolve_panel_profile_path(request.profile))
         if request.provider.startswith("custom:"):
             profile_entry = self.providers.get(request.provider)
             if profile_entry.is_archived:
                 raise ValueError("归档的自定义 Provider 不能用于创建新任务。")
         provider_snapshot = self.providers.snapshot(request.provider, request.model)
+        return await self._start_review_from_snapshots(
+            request,
+            rubric=rubric,
+            profile=profile,
+            panel_profile=panel_profile,
+            provider_snapshot=provider_snapshot,
+            event_sink=event_sink,
+        )
+
+    async def _start_review_from_snapshots(
+        self,
+        request: ReviewRequest,
+        *,
+        rubric: RubricProfile,
+        profile: ReviewProfile,
+        panel_profile: ReviewProfile | None,
+        provider_snapshot: ProviderSnapshot,
+        event_sink: EventSink | None,
+        expected_input_hash: str | None = None,
+    ) -> RunRecord:
+        """Start one run from immutable configuration snapshots.
+
+        The public single-run entry point resolves current configuration first;
+        course batches call this helper with the snapshots frozen in batch.json.
+        """
+
+        validate_provider_snapshot_identity(request.provider, request.model, provider_snapshot)
         api_key = self.providers.get_snapshot_api_key(provider_snapshot)
         if not api_key:
             raise ValueError("所选 Provider 未配置 API Key。")
@@ -452,7 +511,599 @@ class ReviewApplicationService:
                 contains_classified_material=request.contains_classified_material,
                 external_search=request.external_search,
                 provider_snapshot=provider_snapshot,
+                expected_input_hash=expected_input_hash,
             )
+
+    async def create_batch(self, request: BatchReviewRequest) -> BatchRecord:
+        """Validate and atomically create a frozen course-paper batch."""
+
+        _validate_batch_cloud_request(request)
+        rubric = load_rubric(request.rubric)
+        if getattr(rubric, "evaluation_mode", None) != "course_assessment":
+            raise ValueError("课程批量版只支持 evaluation_mode=course_assessment 的 Rubric。")
+        profile = load_review_profile(request.profile)
+        build_review_plan(rubric, profile)
+        if request.provider.startswith("custom:"):
+            provider_profile = self.providers.get(request.provider)
+            if provider_profile.is_archived:
+                raise ValueError("归档的自定义 Provider 不能用于创建新批次。")
+        provider_snapshot = self.providers.snapshot(request.provider, request.model)
+        validate_provider_snapshot_identity(request.provider, request.model, provider_snapshot)
+        if not self.providers.get_snapshot_api_key(provider_snapshot):
+            raise ValueError("所选 Provider 未配置 API Key。")
+        await asyncio.to_thread(_ensure_batch_output_directory, request.output_dir)
+        items = await asyncio.to_thread(scan_batch_sources, request)
+        record = BatchRecord(
+            batch_id=uuid.uuid4().hex,
+            request=request,
+            rubric_snapshot=rubric,
+            profile_snapshot=profile,
+            provider_snapshot=provider_snapshot,
+            items=items,
+        )
+        _ensure_batch_summary_path(record)
+        store = self._batch_store()
+        await asyncio.to_thread(store.create, record)
+        try:
+            await asyncio.to_thread(_write_batch_csv, record)
+        except Exception as error:
+            classified = classify_batch_error(error, context="output directory")
+            record.status = BatchStatus.PAUSED
+            record.error = classified.summary
+            record.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save, record)
+        return record
+
+    async def run_batch(
+        self,
+        batch_id: str,
+        *,
+        event_sink: BatchEventSink | None = None,
+    ) -> BatchRecord:
+        """Run queued course papers sequentially and persist after every item."""
+
+        lock_store = BatchStore(self.paths.batches_dir)
+        with lock_store.execution_lock(batch_id):
+            return await self._run_batch_locked(batch_id, event_sink=event_sink)
+
+    async def _run_batch_locked(
+        self,
+        batch_id: str,
+        *,
+        event_sink: BatchEventSink | None,
+        store: BatchStore | None = None,
+    ) -> BatchRecord:
+        store = store or self._batch_store()
+        record = await asyncio.to_thread(store.load, batch_id)
+        resumable_item_statuses = {
+            BatchItemStatus.QUEUED,
+            BatchItemStatus.RUNNING,
+            BatchItemStatus.CANCELLED,
+        }
+        if record.status in {BatchStatus.COMPLETED, BatchStatus.COMPLETED_WITH_ERRORS} and not any(
+            item.status in resumable_item_statuses
+            for item in record.items
+        ) and record.retry_item_ids is None:
+            try:
+                await asyncio.to_thread(_write_batch_csv, record)
+                await asyncio.to_thread(store.save, record)
+            except Exception as error:
+                classified = classify_batch_error(error, context="output directory")
+                record.status = BatchStatus.PAUSED
+                record.error = classified.summary
+                record.updated_at = datetime.now(UTC)
+                await asyncio.to_thread(store.save, record)
+                _emit_batch_event(
+                    event_sink,
+                    record,
+                    event_type="batch_paused",
+                    message=classified.summary,
+                )
+            return record
+        preflight_steps: tuple[tuple[str, Callable[[], object]], ...] = (
+            ("authorization", lambda: _validate_batch_cloud_request(record.request)),
+            ("rubric", lambda: _validate_batch_rubric_snapshot(record)),
+            ("protocol", lambda: _validate_batch_provider_snapshot(record)),
+            ("credentials", lambda: _require_batch_api_key(self, record)),
+            (
+                "output directory",
+                lambda: _ensure_batch_output_directory(record.request.output_dir),
+            ),
+        )
+        for context, operation in preflight_steps:
+            try:
+                await asyncio.to_thread(operation)
+            except Exception as error:
+                classified = classify_batch_error(error, context=context)
+                record.status = BatchStatus.PAUSED
+                record.error = classified.summary
+                record.updated_at = datetime.now(UTC)
+                await asyncio.to_thread(store.save, record)
+                _emit_batch_event(
+                    event_sink,
+                    record,
+                    event_type="batch_paused",
+                    message=classified.summary,
+                )
+                return record
+
+        _ensure_batch_summary_path(record)
+        try:
+            await asyncio.to_thread(_write_batch_csv, record)
+        except Exception as error:
+            classified = classify_batch_error(error, context="output directory")
+            record.status = BatchStatus.PAUSED
+            record.error = classified.summary
+            record.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save, record)
+            _emit_batch_event(
+                event_sink,
+                record,
+                event_type="batch_paused",
+                message=classified.summary,
+            )
+            return record
+
+        record.status = BatchStatus.RUNNING
+        record.error = None
+        record.updated_at = datetime.now(UTC)
+        await asyncio.to_thread(store.save, record)
+        _emit_batch_event(
+            event_sink,
+            record,
+            event_type="batch_started",
+            message="课程论文批次已开始。",
+        )
+
+        selected_item_ids = (
+            set(record.retry_item_ids) if record.retry_item_ids is not None else None
+        )
+        for item in record.items:
+            if selected_item_ids is not None and item.item_id not in selected_item_ids:
+                continue
+            if item.status not in {
+                BatchItemStatus.QUEUED,
+                BatchItemStatus.RUNNING,
+                BatchItemStatus.CANCELLED,
+            }:
+                continue
+            record.current_item_id = item.item_id
+            item.status = BatchItemStatus.RUNNING
+            item.error = None
+            item.updated_at = datetime.now(UTC)
+            record.updated_at = item.updated_at
+            await asyncio.to_thread(store.save, record)
+            _emit_batch_event(
+                event_sink,
+                record,
+                item=item,
+                event_type="batch_item_started",
+                message=f"正在评测：{item.source.filename}",
+            )
+            try:
+                await asyncio.to_thread(validate_source_snapshot, item.source)
+                await self._run_batch_item(record, item, store=store, event_sink=event_sink)
+            except asyncio.CancelledError:
+                item.status = BatchItemStatus.CANCELLED
+                item.error = None
+                item.updated_at = datetime.now(UTC)
+                record.status = BatchStatus.PAUSED
+                record.current_item_id = item.item_id
+                record.error = None
+                record.updated_at = item.updated_at
+                await asyncio.to_thread(store.save, record)
+                _emit_batch_event(
+                    event_sink,
+                    record,
+                    item=item,
+                    event_type="batch_paused",
+                    message="批次已安全停止；当前任务检查点已保留。",
+                )
+                raise
+            except BatchSourceChangedError:
+                item.status = BatchItemStatus.SOURCE_CHANGED
+                item.error = "源 PDF 在批次创建后发生变化，请重新创建批次。"
+            except Exception as error:
+                classified = classify_batch_error(
+                    error,
+                    context=_batch_item_error_context(error, record),
+                )
+                item.error = classified.summary
+                item.updated_at = datetime.now(UTC)
+                if classified.is_shared:
+                    record.status = BatchStatus.PAUSED
+                    record.error = classified.summary
+                    record.current_item_id = item.item_id
+                    record.updated_at = item.updated_at
+                    await asyncio.to_thread(store.save, record)
+                    try:
+                        await asyncio.to_thread(_write_batch_csv, record)
+                    except OSError:
+                        # The shared failure is already durably recorded.  A
+                        # later resume retries the summary before completion.
+                        pass
+                    _emit_batch_event(
+                        event_sink,
+                        record,
+                        item=item,
+                        event_type="batch_paused",
+                        message=classified.summary,
+                    )
+                    return record
+                item.status = BatchItemStatus.FAILED
+            item.updated_at = datetime.now(UTC)
+            record.updated_at = item.updated_at
+            record.current_item_id = None
+            await asyncio.to_thread(store.save, record)
+            try:
+                await asyncio.to_thread(_write_batch_csv, record)
+            except Exception as error:
+                classified = classify_batch_error(error, context="output directory")
+                record.status = BatchStatus.PAUSED
+                record.error = classified.summary
+                record.updated_at = datetime.now(UTC)
+                await asyncio.to_thread(store.save, record)
+                _emit_batch_event(
+                    event_sink,
+                    record,
+                    item=item,
+                    event_type="batch_paused",
+                    message=classified.summary,
+                )
+                return record
+            _emit_batch_event(
+                event_sink,
+                record,
+                item=item,
+                event_type="batch_item_completed",
+                message=_batch_item_completion_message(item),
+            )
+
+        final_record = record.model_copy(deep=True)
+        final_record.current_item_id = None
+        final_record.retry_item_ids = None
+        final_record.error = None
+        has_remaining = any(
+            item.status
+            in {BatchItemStatus.QUEUED, BatchItemStatus.RUNNING, BatchItemStatus.CANCELLED}
+            for item in final_record.items
+        )
+        has_errors = any(
+            item.status in {BatchItemStatus.FAILED, BatchItemStatus.SOURCE_CHANGED}
+            for item in final_record.items
+        )
+        final_record.status = (
+            BatchStatus.PAUSED
+            if has_remaining
+            else BatchStatus.COMPLETED_WITH_ERRORS
+            if has_errors
+            else BatchStatus.COMPLETED
+        )
+        final_record.updated_at = datetime.now(UTC)
+        try:
+            await asyncio.to_thread(_write_batch_csv, final_record)
+        except Exception as error:
+            classified = classify_batch_error(error, context="output directory")
+            record.status = BatchStatus.PAUSED
+            record.current_item_id = None
+            record.error = classified.summary
+            record.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save, record)
+            _emit_batch_event(
+                event_sink,
+                record,
+                event_type="batch_paused",
+                message=classified.summary,
+            )
+            return record
+        await asyncio.to_thread(store.save, final_record)
+        _emit_batch_event(
+            event_sink,
+            final_record,
+            event_type="batch_completed",
+            message=(
+                "批次仍有排队论文，可继续执行。"
+                if final_record.status is BatchStatus.PAUSED
+                else "批次已完成，部分论文需要处理。"
+                if final_record.status is BatchStatus.COMPLETED_WITH_ERRORS
+                else "批次已全部完成。"
+            ),
+        )
+        return final_record
+
+    async def pause_batch(self, batch_id: str) -> BatchRecord:
+        lock_store = BatchStore(self.paths.batches_dir)
+        with lock_store.execution_lock(batch_id):
+            store = self._batch_store()
+            record = await asyncio.to_thread(store.load, batch_id)
+            record.status = BatchStatus.PAUSED
+            if record.current_item_id:
+                current = _batch_item(record, record.current_item_id)
+                if current.status is BatchItemStatus.RUNNING:
+                    current.status = BatchItemStatus.CANCELLED
+                    current.updated_at = datetime.now(UTC)
+            record.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save, record)
+            return record
+
+    async def resume_batch(
+        self,
+        batch_id: str,
+        *,
+        event_sink: BatchEventSink | None = None,
+    ) -> BatchRecord:
+        return await self.run_batch(batch_id, event_sink=event_sink)
+
+    async def retry_failed_items(
+        self,
+        batch_id: str,
+        *,
+        event_sink: BatchEventSink | None = None,
+    ) -> BatchRecord:
+        lock_store = BatchStore(self.paths.batches_dir)
+        with lock_store.execution_lock(batch_id):
+            store = self._batch_store()
+            record = await asyncio.to_thread(store.load, batch_id)
+            if record.retry_item_ids is None:
+                failed_item_ids = [
+                    item.item_id for item in record.items if item.status is BatchItemStatus.FAILED
+                ]
+                if not failed_item_ids:
+                    return record
+                record.retry_item_ids = failed_item_ids
+                for item in record.items:
+                    if item.item_id in failed_item_ids:
+                        item.status = BatchItemStatus.QUEUED
+                        item.error = None
+                        item.updated_at = datetime.now(UTC)
+                record.status = BatchStatus.PAUSED
+                record.error = None
+                record.current_item_id = None
+                record.updated_at = datetime.now(UTC)
+                await asyncio.to_thread(store.save, record)
+            return await self._run_batch_locked(
+                batch_id,
+                event_sink=event_sink,
+                store=store,
+            )
+
+    async def get_batch(self, batch_id: str) -> BatchRecord:
+        return await asyncio.to_thread(self._batch_store().load, batch_id)
+
+    async def list_batches(self) -> list[BatchRecord]:
+        return await asyncio.to_thread(self._batch_store().list_records)
+
+    async def list_batch_load_errors(self) -> list[BatchLoadError]:
+        """Return safe diagnostics for manifests omitted from ``list_batches``."""
+
+        return await asyncio.to_thread(self._batch_store().list_load_errors)
+
+    async def _run_batch_item(
+        self,
+        record: BatchRecord,
+        item: BatchItem,
+        *,
+        store: BatchStore,
+        event_sink: BatchEventSink | None,
+    ) -> None:
+        def run_event_sink(event: RunEvent) -> None:
+            if item.run_id is None:
+                item.run_id = event.run_id
+                item.updated_at = datetime.now(UTC)
+                record.updated_at = item.updated_at
+                store.save(record)
+            _emit_batch_event(
+                event_sink,
+                record,
+                item=item,
+                event_type="batch_run_event",
+                message=event.message,
+                payload={
+                    "run_id": event.run_id,
+                    "run_event_type": event.event_type,
+                    "run_status": event.status.value if event.status is not None else None,
+                    "stage": event.stage,
+                },
+            )
+
+        run: RunRecord | None = None
+        if item.run_id is not None:
+            detail = await self.get_run(item.run_id)
+            run = detail.run
+            if run.status not in {
+                RunStatus.REPORTED,
+                RunStatus.REPORTED_PENDING_HUMAN_REVIEW,
+                RunStatus.FATAL_FAILURE,
+            }:
+                run = await self.resume_review(item.run_id, event_sink=run_event_sink)
+        else:
+            request = ReviewRequest(
+                paper=item.source.path,
+                provider=record.request.provider,
+                model=record.request.model,
+                rubric=record.request.rubric,
+                profile=record.request.profile,
+                discipline_name="",
+                discipline_profile=None,
+                cloud_processing_authorized=True,
+                contains_classified_material=False,
+                external_search=record.request.external_search,
+            )
+            run = await self._start_review_from_snapshots(
+                request,
+                rubric=record.rubric_snapshot,
+                profile=record.profile_snapshot,
+                panel_profile=None,
+                provider_snapshot=record.provider_snapshot,
+                event_sink=run_event_sink,
+                expected_input_hash=item.source.sha256,
+            )
+        if item.run_id is None:
+            item.run_id = run.run_id
+        if run.status is RunStatus.FATAL_FAILURE:
+            raise RuntimeError("course paper run entered a fatal failure state")
+        if run.status not in {RunStatus.REPORTED, RunStatus.REPORTED_PENDING_HUMAN_REVIEW}:
+            raise RuntimeError("course paper run did not produce a report")
+
+        report = await self.load_report(run.run_id)
+        metadata = report.submission_metadata
+        if metadata is None:
+            raise ValueError("course submission metadata checkpoint is missing")
+        item.metadata = metadata
+        item.dimension_scores = dict(report.dimension_scores)
+        item.total_score = report.review.total_score
+        item.grade = _course_grade(record.rubric_snapshot, item.total_score)
+        item.conclusion = _course_conclusion(record.rubric_snapshot, item.total_score)
+        for warning in metadata.warnings:
+            if warning not in item.warnings:
+                item.warnings.append(warning)
+
+        if item.report_path is None:
+            item.report_path = allocate_report_path(
+                record.request.output_dir,
+                metadata,
+                run.run_id,
+            )
+            item.updated_at = datetime.now(UTC)
+            record.updated_at = item.updated_at
+            # Reserve the exact destination before exporting.  If the process
+            # stops after the atomic PDF publish but before the terminal item
+            # save, recovery reuses this path instead of allocating a suffixed
+            # duplicate report.
+            await asyncio.to_thread(store.save, record)
+        destination = _validate_batch_output_path(
+            record.request.output_dir,
+            item.report_path,
+            suffix=".pdf",
+        )
+
+        if not destination.is_file():
+            try:
+                result = await self.export_report(
+                    run.run_id,
+                    ReportExportFormat.PDF,
+                    destination,
+                    overwrite=False,
+                )
+            except OSError as error:
+                raise _BatchReportOutputError("batch report output failed") from error
+            item.report_path = result.path
+        item.status = BatchItemStatus.COMPLETED
+        item.error = None
+        item.updated_at = datetime.now(UTC)
+        record.updated_at = item.updated_at
+        await asyncio.to_thread(store.save, record)
+
+    async def update_submission_metadata(
+        self,
+        batch_id: str,
+        item_id: str,
+        metadata: SubmissionMetadata,
+    ) -> BatchRecord:
+        """Apply a local correction and rebuild Markdown, PDF and CSV without an LLM."""
+
+        lock_store = BatchStore(self.paths.batches_dir)
+        with lock_store.execution_lock(batch_id):
+            return await self._update_submission_metadata_locked(
+                batch_id,
+                item_id,
+                metadata,
+            )
+
+    async def _update_submission_metadata_locked(
+        self,
+        batch_id: str,
+        item_id: str,
+        metadata: SubmissionMetadata,
+    ) -> BatchRecord:
+        """Stage and atomically publish one metadata correction."""
+
+        store = self._batch_store()
+        record = await asyncio.to_thread(store.load, batch_id)
+        original_record = record.model_copy(deep=True)
+        item = _batch_item(record, item_id)
+        if item.run_id is None:
+            raise ValueError("该论文尚未创建评测任务，不能修改报告信息。")
+
+        run_dir = _validated_run_dir(self.settings.runs_dir, item.run_id)
+        if not run_dir.is_dir():
+            raise ValueError("该论文的任务快照目录不存在，不能修改报告信息。")
+        report = await self.load_report(item.run_id)
+        selected_report = report.evaluation or report.review
+        output_dir = record.request.output_dir.resolve()
+        await asyncio.to_thread(_ensure_batch_output_directory, output_dir)
+
+        old_report_path = _managed_item_report_path(record, item)
+        desired_name = build_report_filename(metadata, item.run_id)
+        same_destination = (
+            old_report_path is not None
+            and old_report_path.name.casefold() == desired_name.casefold()
+        )
+        destination = (
+            old_report_path
+            if same_destination and old_report_path is not None
+            else allocate_report_path(output_dir, metadata, item.run_id)
+        )
+        destination = _validated_export_destination(
+            destination,
+            export_format=ReportExportFormat.PDF,
+            runs_dir=self.settings.runs_dir,
+            overwrite=same_destination,
+        )
+
+        item.metadata = metadata
+        item.report_path = destination
+        item.error = None
+        item.updated_at = datetime.now(UTC)
+        record.updated_at = item.updated_at
+
+        transaction = _MetadataUpdateFileTransaction()
+        manifest_save_started = False
+        try:
+            await _metadata_update_to_thread(
+                _stage_metadata_update_files,
+                transaction=transaction,
+                run_dir=run_dir,
+                output_dir=output_dir,
+                old_report_path=(
+                    old_report_path
+                    if old_report_path is not None and old_report_path != destination
+                    else None
+                ),
+                destination=destination,
+                run=report.run,
+                rubric=report.rubric,
+                selected_report=selected_report,
+                audit=report.audit,
+                evidence=report.evidence,
+                presentation_profile=report.presentation_profile,
+                metadata=metadata,
+                dimension_scores=report.dimension_scores,
+                batch=record,
+            )
+            await _metadata_update_to_thread(transaction.commit)
+            manifest_save_started = True
+            await _save_batch_manifest_for_metadata_update(store, record)
+        except BaseException as error:
+            restore_errors: list[BaseException] = []
+            if manifest_save_started:
+                try:
+                    await _metadata_update_to_thread(
+                        _restore_batch_manifest_if_needed,
+                        store,
+                        original_record,
+                    )
+                except BaseException as restore_error:
+                    restore_errors.append(restore_error)
+            restore_errors.extend(await _metadata_update_to_thread(transaction.rollback))
+            if restore_errors:
+                raise RuntimeError(
+                    "元数据修正失败，且自动回滚未完全完成；旧文件备份已保留，请勿继续操作该批次。"
+                ) from error
+            raise
+        else:
+            await _metadata_update_to_thread(transaction.finalize)
+            return record
 
     async def resume_review(self, run_id: str, *, event_sink: EventSink | None = None) -> RunRecord:
         async with ApplicationUnitOfWork(self.settings.database_url) as unit_of_work:
@@ -759,6 +1410,9 @@ class ReviewApplicationService:
                 else selected_report
             )
             document = artifacts.load_optional_model("document.json", DocumentInfo)
+            submission_metadata = artifacts.load_optional_model(
+                "submission-metadata.json", SubmissionMetadata
+            )
             evidence = artifacts.load_model_list("evidence.json", EvidenceItem)
             results = await ReviewRepository(sessions).list_results(run_id)
         dimension_scores = (
@@ -786,6 +1440,7 @@ class ReviewApplicationService:
             pending_hard_rules=detail.pending_hard_rules,
             human_panel_decision=detail.human_panel_decision,
             presentation_profile=load_presentation_profile(run_dir),
+            submission_metadata=submission_metadata,
         )
 
     async def _get_run_detail(
@@ -855,6 +1510,20 @@ class ReviewApplicationService:
         reconstructed = not source.is_file()
         if reconstructed:
             rubric, selected_report, audit = _load_export_report_snapshot(run_dir)
+            artifacts = RunArtifactStore(run_dir)
+            metadata = artifacts.load_optional_model(
+                "submission-metadata.json", SubmissionMetadata
+            )
+            raw_dimension_scores = (
+                artifacts.read_json("dimension-scores.json")
+                if artifacts.exists("dimension-scores.json")
+                else None
+            )
+            dimension_scores = (
+                {str(key): float(value) for key, value in raw_dimension_scores.items()}
+                if isinstance(raw_dimension_scores, dict)
+                else None
+            )
             markdown_bytes = render_markdown(
                 rubric,
                 selected_report,
@@ -863,6 +1532,8 @@ class ReviewApplicationService:
                 provider_ref=run.provider,
                 model=run.model,
                 presentation_profile=load_presentation_profile(run_dir),
+                submission_metadata=metadata,
+                dimension_scores=dimension_scores,
             ).encode("utf-8")
         else:
             markdown_bytes = source.read_bytes()
@@ -927,6 +1598,9 @@ class ReviewApplicationService:
             web_search_client=web_search,
             event_sink=event_sink,
         )
+
+    def _batch_store(self) -> BatchStore:
+        return BatchStore(self.paths.batches_dir)
 
     async def _require_run(
         self,
@@ -1040,6 +1714,419 @@ class ReviewApplicationService:
                 and human_panel_decision is None
             ),
         )
+
+
+def _validate_batch_cloud_request(request: BatchReviewRequest) -> None:
+    if not request.cloud_processing_authorized:
+        raise ValueError("开始云端批量评测前必须确认已获得全部论文的处理授权。")
+    if request.contains_classified_material:
+        raise ValueError("涉密材料不得提交云端批量评测。")
+    if not request.pii_output_authorized:
+        raise ValueError("必须确认批次输出将包含姓名、学号、专业和论文题目。")
+
+
+def _validate_batch_snapshots(record: BatchRecord) -> None:
+    """Compatibility helper validating every immutable batch prerequisite."""
+
+    _validate_batch_cloud_request(record.request)
+    _validate_batch_rubric_snapshot(record)
+    _validate_batch_provider_snapshot(record)
+
+
+def _validate_batch_rubric_snapshot(record: BatchRecord) -> None:
+    if getattr(record.rubric_snapshot, "evaluation_mode", None) != "course_assessment":
+        raise ValueError("batch rubric snapshot is not a course assessment rubric")
+    build_review_plan(record.rubric_snapshot, record.profile_snapshot)
+
+
+def _validate_batch_provider_snapshot(record: BatchRecord) -> None:
+    validate_provider_snapshot_identity(
+        record.request.provider,
+        record.request.model,
+        record.provider_snapshot,
+    )
+
+
+def _ensure_batch_output_directory(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not output_dir.is_dir():
+        raise NotADirectoryError("batch output path is not a directory")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".course-output-", dir=output_dir)
+    os.close(descriptor)
+    Path(temporary_name).unlink(missing_ok=True)
+
+
+def _require_batch_api_key(service: ReviewApplicationService, record: BatchRecord) -> None:
+    if not service.providers.get_snapshot_api_key(record.provider_snapshot):
+        raise ValueError("批次 Provider 的 API Key 不存在。")
+
+
+def _validate_batch_output_path(output_dir: Path, path: Path, *, suffix: str) -> Path:
+    root = output_dir.resolve(strict=False)
+    candidate = path.resolve(strict=False)
+    if candidate.parent != root or candidate.suffix.casefold() != suffix.casefold():
+        raise ValueError("batch output path escapes the configured output directory")
+    return candidate
+
+
+def _ensure_batch_summary_path(record: BatchRecord) -> Path:
+    if record.summary_path is not None:
+        return _validate_batch_output_path(
+            record.request.output_dir, record.summary_path, suffix=".csv"
+        )
+    output_dir = record.request.output_dir.resolve(strict=False)
+    record.summary_path = output_dir / "课程论文评测汇总.csv"
+    return record.summary_path
+
+
+def _batch_item_error_context(error: BaseException, record: BatchRecord) -> str | None:
+    if isinstance(error, _BatchReportOutputError):
+        return "output directory"
+    if not isinstance(error, PermissionError):
+        return None
+    filename = getattr(error, "filename", None)
+    if isinstance(filename, (str, os.PathLike)):
+        candidate = Path(filename).resolve(strict=False)
+        if candidate == record.request.source_dir or candidate.parent == record.request.source_dir:
+            return "pdf"
+        if candidate == record.request.output_dir or candidate.parent == record.request.output_dir:
+            return "output directory"
+    return "pdf"
+
+
+def _write_batch_csv(record: BatchRecord) -> None:
+    dimensions = [
+        (dimension.dimension_id, dimension.title)
+        for dimension in record.rubric_snapshot.dimensions
+    ]
+    write_batch_summary_csv(
+        _ensure_batch_summary_path(record),
+        record,
+        dimensions,
+    )
+
+
+@dataclass(slots=True)
+class _MetadataFileOperation:
+    destination: Path
+    prepared: Path | None
+    backup: Path
+    original_moved: bool = False
+    replacement_installed: bool = False
+
+
+class _MetadataUpdateFileTransaction:
+    """Best-effort multi-file commit with same-directory rollback copies."""
+
+    def __init__(self) -> None:
+        self._token = uuid.uuid4().hex
+        self._operations: list[_MetadataFileOperation] = []
+        self._destinations: set[str] = set()
+
+    def stage_copy(self, destination: Path, source: Path) -> None:
+        prepared = self.prepare_replacement(destination)
+        try:
+            with source.open("rb") as source_handle, prepared.open("xb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
+        except BaseException:
+            prepared.unlink(missing_ok=True)
+            raise
+
+    def prepare_replacement(self, destination: Path) -> Path:
+        destination = Path(os.path.abspath(destination))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._reserve_destination(destination)
+        prepared = destination.with_name(f".{destination.name}.{self._token}.new")
+        if _path_present(prepared):
+            raise FileExistsError(f"metadata update staging path already exists: {prepared.name}")
+        self._operations.append(
+            _MetadataFileOperation(
+                destination=destination,
+                prepared=prepared,
+                backup=destination.with_name(f".{destination.name}.{self._token}.bak"),
+            )
+        )
+        return prepared
+
+    def stage_removal(self, destination: Path) -> None:
+        destination = Path(os.path.abspath(destination))
+        self._reserve_destination(destination)
+        self._operations.append(
+            _MetadataFileOperation(
+                destination=destination,
+                prepared=None,
+                backup=destination.with_name(f".{destination.name}.{self._token}.bak"),
+            )
+        )
+
+    def commit(self) -> None:
+        for operation in self._operations:
+            destination = operation.destination
+            if destination.is_symlink():
+                raise ValueError(f"refusing to replace symbolic link: {destination.name}")
+            if _path_present(operation.backup):
+                raise FileExistsError(
+                    f"metadata update backup path already exists: {operation.backup.name}"
+                )
+            if _path_present(destination):
+                if not destination.is_file():
+                    raise ValueError(f"metadata update target is not a file: {destination.name}")
+                os.replace(destination, operation.backup)
+                operation.original_moved = True
+            if operation.prepared is not None:
+                if operation.prepared.is_symlink() or not operation.prepared.is_file():
+                    raise FileNotFoundError(
+                        f"metadata update staged file is missing: {destination.name}"
+                    )
+                os.replace(operation.prepared, destination)
+                operation.replacement_installed = True
+
+    def rollback(self) -> list[BaseException]:
+        errors: list[BaseException] = []
+        for operation in reversed(self._operations):
+            try:
+                if operation.original_moved and _path_present(operation.backup):
+                    os.replace(operation.backup, operation.destination)
+                    operation.original_moved = False
+                    operation.replacement_installed = False
+                elif operation.replacement_installed and _path_present(operation.destination):
+                    operation.destination.unlink()
+                    operation.replacement_installed = False
+            except BaseException as error:
+                errors.append(error)
+            try:
+                if operation.prepared is not None:
+                    operation.prepared.unlink(missing_ok=True)
+            except BaseException as error:
+                errors.append(error)
+        return errors
+
+    def finalize(self) -> None:
+        # A failed cleanup leaves an inert hidden backup rather than turning a
+        # fully committed correction into a false failure.
+        for operation in self._operations:
+            try:
+                operation.backup.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if operation.prepared is not None:
+                try:
+                    operation.prepared.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _reserve_destination(self, destination: Path) -> None:
+        key = str(destination).casefold()
+        if key in self._destinations:
+            raise ValueError(f"duplicate metadata update target: {destination.name}")
+        self._destinations.add(key)
+
+
+def _stage_metadata_update_files(
+    *,
+    transaction: _MetadataUpdateFileTransaction,
+    run_dir: Path,
+    output_dir: Path,
+    old_report_path: Path | None,
+    destination: Path,
+    run: RunRecord,
+    rubric: RubricProfile,
+    selected_report: Any,
+    audit: AuditReport,
+    evidence: list[EvidenceItem],
+    presentation_profile: Any,
+    metadata: SubmissionMetadata,
+    dimension_scores: Mapping[str, float],
+    batch: BatchRecord,
+) -> None:
+    """Build every replacement before exposing any of them to readers."""
+
+    with tempfile.TemporaryDirectory(prefix=".metadata-update-build-", dir=run_dir) as directory:
+        build_dir = Path(directory)
+        provider_source = run_dir / "provider.json"
+        if provider_source.is_file() and not provider_source.is_symlink():
+            shutil.copyfile(provider_source, build_dir / "provider.json")
+
+        RunArtifactStore(build_dir).write_model("submission-metadata.json", metadata)
+        write_report_bundle(
+            run_dir=build_dir,
+            run=run,
+            rubric=rubric,
+            review=selected_report,
+            audit=audit,
+            evidence=evidence,
+            presentation_profile=presentation_profile,
+            submission_metadata=metadata,
+            dimension_scores=dimension_scores,
+        )
+
+        artifact_names = (
+            "submission-metadata.json",
+            "report.json",
+            "report.md",
+            "evidence.json",
+            "run-summary.json",
+        )
+        for name in artifact_names:
+            source = build_dir / name
+            if not source.is_file():
+                raise FileNotFoundError(f"报告重建未生成必要文件：{name}")
+            transaction.stage_copy(run_dir / name, source)
+        presentation_source = build_dir / "report-presentation.json"
+        if presentation_source.is_file():
+            transaction.stage_copy(run_dir / presentation_source.name, presentation_source)
+
+        markdown = (build_dir / "report.md").read_text(encoding="utf-8")
+        staged_pdf = transaction.prepare_replacement(destination)
+        title = _markdown_title(markdown) or Path(run.input_path).stem
+        render_pdf(markdown, staged_pdf, title=title)
+        validate_pdf(staged_pdf, markdown)
+
+        if batch.summary_path is not None and batch.summary_path.expanduser().is_symlink():
+            raise ValueError("批次汇总文件不能是符号链接。")
+        csv_destination = _ensure_batch_summary_path(batch)
+        staged_csv = transaction.prepare_replacement(csv_destination)
+        dimensions = [
+            (dimension.dimension_id, dimension.title)
+            for dimension in batch.rubric_snapshot.dimensions
+        ]
+        write_batch_summary_csv(staged_csv, batch, dimensions)
+
+        if old_report_path is not None and old_report_path.is_file():
+            transaction.stage_removal(old_report_path)
+
+
+def _managed_item_report_path(record: BatchRecord, item: BatchItem) -> Path | None:
+    """Return only a report path that the batch can safely replace or retire."""
+
+    if item.report_path is None or item.run_id is None or item.metadata is None:
+        return None
+    requested = item.report_path.expanduser()
+    if requested.is_symlink():
+        return None
+    candidate = requested.resolve(strict=False)
+    output_dir = record.request.output_dir.resolve()
+    if candidate.parent != output_dir or candidate.is_symlink():
+        return None
+    expected_name = build_report_filename(item.metadata, item.run_id)
+    if candidate.name.casefold() != expected_name.casefold():
+        return None
+    if _path_present(candidate) and not candidate.is_file():
+        return None
+    return candidate
+
+
+def _restore_batch_manifest_if_needed(store: BatchStore, original: BatchRecord) -> None:
+    """Restore an old manifest if a save raised after replacing it."""
+
+    try:
+        current = store.load(original.batch_id)
+    except (OSError, UnicodeError, ValueError):
+        store.save(original)
+        return
+    if current != original:
+        store.save(original)
+
+
+async def _save_batch_manifest_for_metadata_update(
+    store: BatchStore,
+    record: BatchRecord,
+) -> None:
+    await _metadata_update_to_thread(store.save, record)
+
+
+async def _metadata_update_to_thread(
+    function: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Let an in-flight file operation settle before cancellation rollback."""
+
+    operation_task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(operation_task)
+    except asyncio.CancelledError:
+        try:
+            await operation_task
+        except BaseException:
+            pass
+        raise
+
+
+def _path_present(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _batch_item(record: BatchRecord, item_id: str) -> BatchItem:
+    for item in record.items:
+        if item.item_id == item_id:
+            return item
+    raise ValueError(f"未知批次论文：{item_id}")
+
+
+def _emit_batch_event(
+    sink: BatchEventSink | None,
+    record: BatchRecord,
+    *,
+    event_type: str,
+    message: str,
+    item: BatchItem | None = None,
+    payload: dict[str, object] | None = None,
+) -> None:
+    if sink is None:
+        return
+    event_payload = dict(payload or {})
+    if event_type != "batch_run_event":
+        event_payload["record"] = record.model_dump(mode="json")
+    sink(
+        BatchEvent(
+            batch_id=record.batch_id,
+            event_type=event_type,
+            status=record.status,
+            item_id=item.item_id if item is not None else None,
+            item_status=item.status if item is not None else None,
+            message=message,
+            payload=event_payload,
+        )
+    )
+
+
+def _batch_item_completion_message(item: BatchItem) -> str:
+    if item.status is BatchItemStatus.COMPLETED:
+        return f"已完成：{item.source.filename}"
+    if item.status is BatchItemStatus.SOURCE_CHANGED:
+        return f"源文件已变化：{item.source.filename}"
+    return f"评测失败：{item.source.filename}"
+
+
+def _course_grade(rubric: RubricProfile, total_score: float | None) -> str | None:
+    if total_score is None:
+        return None
+    if rubric.dimensions:
+        for anchor in rubric.dimensions[0].anchors:
+            if anchor.minimum <= total_score <= anchor.maximum:
+                return anchor.label
+    if total_score >= 90:
+        return "优秀"
+    if total_score >= 75:
+        return "良好"
+    if total_score >= 60:
+        return "达到基本要求"
+    if total_score >= 40:
+        return "完成不足"
+    return "核心任务明显缺失"
+
+
+def _course_conclusion(rubric: RubricProfile, total_score: float | None) -> str | None:
+    if total_score is None:
+        return None
+    passing_score = rubric.aggregation.passing_score if rubric.aggregation is not None else None
+    if passing_score is None:
+        return "仅提供诊断分，不设置及格结论"
+    return "达到课程论文基本要求" if total_score >= passing_score else "未达到课程论文基本要求"
 
 
 def _validation_messages(error: Exception) -> list[str]:

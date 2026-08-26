@@ -19,6 +19,7 @@ from paper_reviewer.domain.review import (
 )
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
+from paper_reviewer.domain.submission import SubmissionMetadata
 from paper_reviewer.reporting.presentation import ReportPresentationProfile
 from paper_reviewer.validation.audits import AuditReport
 
@@ -67,7 +68,7 @@ class ReviewRequest(BaseModel):
     model: str
     rubric: Path
     profile: Path
-    discipline_name: str
+    discipline_name: str = ""
     discipline_profile: Path | None = None
     cloud_processing_authorized: bool = False
     contains_classified_material: bool = False
@@ -76,10 +77,7 @@ class ReviewRequest(BaseModel):
     @field_validator("discipline_name")
     @classmethod
     def validate_discipline_name(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("discipline_name is required")
-        return normalized
+        return value.strip()
 
 
 class RubricValidationResult(BaseModel):
@@ -165,3 +163,4 @@ class ReportView(BaseModel):
     pending_hard_rules: list[HardRuleAssessment] = Field(default_factory=list)
     human_panel_decision: HumanPanelDecision | None = None
     presentation_profile: ReportPresentationProfile = ReportPresentationProfile.LEGACY
+    submission_metadata: SubmissionMetadata | None = None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -16,6 +17,7 @@ from paper_reviewer.domain.provider import ProviderSnapshot
 from paper_reviewer.domain.review import Severity
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord
+from paper_reviewer.domain.submission import SubmissionMetadata
 from paper_reviewer.reporting.adapters import adapt_report
 from paper_reviewer.reporting.document import ReportDocument
 from paper_reviewer.reporting.presentation import (
@@ -34,6 +36,14 @@ DISCLAIMER_LINES = (
     "模型置信度是未经校准的自评，不作为统计概率。",
 )
 
+COURSE_DISCLAIMER_LINES = (
+    "本结果仅供教师评阅参考，不是教师正式成绩。",
+    "当前通用课程论文 Rubric 是可替换的实验性模板，正式评分前应由任课教师依据课程大纲确认。",
+    "姓名、学号、专业和题目由系统自动提取，使用和归档前必须人工核对。",
+    "本系统仅检查引用对应关系与格式，不自动检测或认定抄袭、代写、伪造等学术不端。",
+    "模型置信度是未经校准的自评，不作为统计概率。",
+)
+
 
 def write_report_bundle(
     *,
@@ -45,6 +55,9 @@ def write_report_bundle(
     evidence: list[EvidenceItem],
     evaluation_report: Any | None = None,
     report: Any | None = None,
+    presentation_profile: ReportPresentationProfile | None = None,
+    submission_metadata: SubmissionMetadata | None = None,
+    dimension_scores: Mapping[str, float] | None = None,
 ) -> list[Path]:
     """Write JSON, Markdown, evidence and run summary artifacts."""
     selected = evaluation_report or report or review
@@ -57,20 +70,25 @@ def write_report_bundle(
     summary_json = run_dir / "run-summary.json"
     presentation_path = run_dir / REPORT_PRESENTATION_FILENAME
     existing_report = report_json.is_file() or report_markdown.is_file()
-    presentation_profile = (
+    selected_profile = (
         load_presentation_profile(run_dir)
         if presentation_path.is_file()
-        else (
-            ReportPresentationProfile.LEGACY
-            if existing_report
-            else ReportPresentationProfile.ZH_CN_V1
+        else _default_presentation_profile(
+            rubric,
+            existing_report=existing_report,
+            requested=presentation_profile,
         )
     )
-    if presentation_profile is ReportPresentationProfile.ZH_CN_V1:
+    if selected_profile is not ReportPresentationProfile.LEGACY:
         _write_text_atomic(
             presentation_path,
-            ReportPresentationMetadata(profile=presentation_profile).model_dump_json(indent=2),
+            ReportPresentationMetadata(profile=selected_profile).model_dump_json(indent=2),
         )
+    if (
+        submission_metadata is None
+        and selected_profile is ReportPresentationProfile.COURSE_ZH_CN_V1
+    ):
+        submission_metadata = _load_submission_metadata(run_dir)
     _write_text_atomic(report_json, _json_text(selected))
     provider_snapshot = _load_provider_snapshot(run_dir)
     _write_text_atomic(
@@ -82,7 +100,9 @@ def write_report_bundle(
             provider_snapshot=provider_snapshot,
             provider_ref=run.provider,
             model=run.model,
-            presentation_profile=presentation_profile,
+            presentation_profile=selected_profile,
+            submission_metadata=submission_metadata,
+            dimension_scores=dimension_scores,
         ),
     )
     _write_text_atomic(
@@ -93,6 +113,21 @@ def write_report_bundle(
     )
     _write_text_atomic(summary_json, run.model_dump_json(indent=2))
     return [report_markdown, report_json, evidence_json, summary_json]
+
+
+def _default_presentation_profile(
+    rubric: RubricProfile,
+    *,
+    existing_report: bool,
+    requested: ReportPresentationProfile | None,
+) -> ReportPresentationProfile:
+    if requested is not None:
+        return ReportPresentationProfile(requested)
+    if existing_report:
+        return ReportPresentationProfile.LEGACY
+    if getattr(rubric, "evaluation_mode", None) == "course_assessment":
+        return ReportPresentationProfile.COURSE_ZH_CN_V1
+    return ReportPresentationProfile.ZH_CN_V1
 
 
 def _write_text_atomic(path: Path, content: str) -> None:
@@ -119,6 +154,8 @@ def render_markdown(
     provider_ref: str | None = None,
     model: str | None = None,
     presentation_profile: ReportPresentationProfile = ReportPresentationProfile.LEGACY,
+    submission_metadata: SubmissionMetadata | None = None,
+    dimension_scores: Mapping[str, float] | None = None,
 ) -> str:
     """Render a legacy MetaReview or the new EvaluationReport.
 
@@ -135,6 +172,8 @@ def render_markdown(
         provider_ref=provider_ref,
         model=model,
         presentation_profile=presentation_profile,
+        submission_metadata=submission_metadata,
+        dimension_scores=dimension_scores,
     )
     return render_document(document)
 
@@ -142,6 +181,8 @@ def render_markdown(
 def render_document(document: ReportDocument) -> str:
     """Render a previously adapted report projection."""
 
+    if document.is_course_report:
+        return _render_course_document(document)
     if document.is_evaluation:
         return _render_evaluation_document(document)
     return _render_legacy_document(document)
@@ -165,6 +206,244 @@ def _render_evaluation_document(document: ReportDocument) -> str:
         list(document.provider_lines),
         document.presentation,
     )
+
+
+def _render_course_document(document: ReportDocument) -> str:
+    report = document.report
+    metadata = document.submission_metadata
+    presentation = document.presentation
+    scores = document.dimension_scores
+    if scores is None:
+        candidate = _field(report, "dimension_scores", default={})
+        scores = candidate if isinstance(candidate, Mapping) else {}
+    total = _number(_field(report, "total_score", default=None))
+    passing_score = 60.0
+    if document.rubric.aggregation is not None:
+        configured = document.rubric.aggregation.passing_score
+        if configured is not None:
+            passing_score = float(configured)
+    lines = [
+        "# 课程论文 AI 辅助评测报告",
+        "",
+        f"- 任务编号：{_code(_field(report, 'run_id', default='unknown'))}",
+        *document.provider_lines,
+        f"- 评分规则：{_text(document.rubric.title)}（{_text(document.rubric.version)}）",
+        f"- 证据审计：{'通过' if document.audit.passed else '未通过'}",
+        "",
+        "## 论文与学生信息",
+        "",
+        f"- 姓名：{_metadata_text(metadata, 'student_name', '未识别姓名')}",
+        f"- 学号：{_metadata_text(metadata, 'student_id', '未识别学号')}",
+        f"- 专业（仅用于识别与文件命名）：{_metadata_text(metadata, 'major', '未识别专业')}",
+        f"- 论文题目：{_metadata_text(metadata, 'paper_title', '未识别题目')}",
+        "- 元数据核对："
+        + (
+            "需要人工核对"
+            if metadata is None or metadata.needs_review
+            else "自动提取完成，使用前仍建议人工核对"
+        ),
+        "",
+    ]
+    if metadata is not None and metadata.warnings:
+        lines.extend([">自动提取提示：", ">"])
+        lines.extend(f"> - {_single_line(item)}" for item in metadata.warnings)
+        lines.append("")
+    lines.extend(
+        [
+            "## 总体评价",
+            "",
+            presentation.narrative(_field(report, "overall_summary", default="")),
+            "",
+            "## 课程评分",
+            "",
+            "| 评价维度 | 得分 | 权重 | 加权贡献 |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    for dimension in document.rubric.dimensions:
+        score = _number(scores.get(dimension.dimension_id))
+        contribution = _course_contribution(document.rubric, dimension, score)
+        lines.append(
+            f"| {presentation.dimension(dimension.dimension_id)} | "
+            f"{_score_text(score)} | {_percentage_text(dimension.weight)} | "
+            f"{_score_text(contribution)} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"- 总分：**{_score_text(total)}**",
+            f"- 五级等级：**{_course_grade(document.rubric, total)}**",
+            f"- 课程要求结论：**{_course_conclusion(total, passing_score)}**",
+            f"- 及格参考线：{_score_text(passing_score)} 分",
+            "",
+        ]
+    )
+    findings = _field(report, "findings", default=[])
+    _append_course_findings(lines, findings, presentation)
+    _append_legacy_notes(lines, report, document.audit, presentation)
+    lines.extend(["## 重要说明", ""])
+    lines.extend(f"- {item}" for item in COURSE_DISCLAIMER_LINES)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _metadata_text(
+    metadata: SubmissionMetadata | None,
+    field_name: str,
+    fallback: str,
+) -> str:
+    if metadata is None:
+        return fallback
+    value = getattr(metadata, field_name, "")
+    rendered = _single_line(value)
+    return rendered or fallback
+
+
+def _single_line(value: Any) -> str:
+    return " ".join(str(value).split())
+
+
+def _number(value: Any) -> float | None:
+    candidate = _field(value, "score", default=value)
+    if candidate is None or isinstance(candidate, bool):
+        return None
+    try:
+        converted = float(candidate)
+    except (TypeError, ValueError):
+        return None
+    return converted if math.isfinite(converted) else None
+
+
+def _score_text(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _percentage_text(value: float) -> str:
+    return f"{_score_text(float(value))}%"
+
+
+def _course_contribution(
+    rubric: RubricProfile,
+    dimension: Any,
+    score: float | None,
+) -> float | None:
+    if score is None:
+        return None
+    minimum = float(dimension.minimum_score)
+    maximum = float(dimension.maximum_score)
+    if score < minimum or score > maximum or maximum <= minimum:
+        return None
+    maximum_total = rubric.aggregation.maximum_total if rubric.aggregation else 100
+    normalized = (score - minimum) / (maximum - minimum)
+    return round(normalized * float(dimension.weight) / 100 * maximum_total, 2)
+
+
+def _course_grade(rubric: RubricProfile, total: float | None) -> str:
+    if total is None:
+        return "未评分"
+    if rubric.dimensions:
+        for anchor in rubric.dimensions[0].anchors:
+            if anchor.minimum <= total <= anchor.maximum:
+                return anchor.label
+    if total >= 90:
+        return "优秀"
+    if total >= 75:
+        return "良好"
+    if total >= 60:
+        return "达到基本要求"
+    if total >= 40:
+        return "完成不足"
+    return "核心任务明显缺失"
+
+
+def _course_conclusion(total: float | None, passing_score: float) -> str:
+    if total is None:
+        return "暂无法确定"
+    if total >= passing_score:
+        return "达到课程论文基本要求"
+    return "未达到课程论文基本要求"
+
+
+def _append_course_findings(
+    lines: list[str], findings: Any, presentation: ReportPresentation
+) -> None:
+    lines.extend(["## 主要问题与修改建议", ""])
+    severity_order = {
+        Severity.CRITICAL.value: 0,
+        Severity.MAJOR.value: 1,
+        Severity.MINOR.value: 2,
+        Severity.SUGGESTION.value: 3,
+    }
+    finding_items = _items(findings)
+    finding_items.sort(
+        key=lambda item: severity_order.get(
+            _text(_field(item, "severity", default="")).casefold(), 99
+        )
+    )
+    if not finding_items:
+        lines.extend(["未发现需要单列的问题。", ""])
+        return
+    for finding in finding_items:
+        severity = presentation.severity(_field(finding, "severity", default="finding"))
+        claim = presentation.narrative(_field(finding, "claim", default=""))
+        dimension = _field(finding, "dimension_id", "criterion_id", default="—")
+        rationale = presentation.narrative(
+            _field(finding, "rationale", "explanation", default="—")
+        )
+        recommendation = presentation.narrative(
+            _field(finding, "recommendation", default="—")
+        )
+        lines.extend(
+            [
+                f"### [{severity}] {claim}",
+                "",
+                f"- 评价维度：{presentation.dimension(dimension)}",
+                f"- 置信度：{_code(_field(finding, 'confidence', default='—'))}",
+                f"- 问题说明：{rationale}",
+                f"- 修改建议：{recommendation}",
+            ]
+        )
+        _append_course_evidence(
+            lines,
+            "论文证据",
+            _field(finding, "paper_evidence", "evidence", default=[]),
+            external=False,
+        )
+        _append_course_evidence(
+            lines,
+            "外部证据",
+            _field(finding, "external_evidence", default=[]),
+            external=True,
+        )
+        if _field(finding, "needs_human_check", default=False):
+            lines.append("- 需要人工核查：是")
+        lines.append("")
+
+
+def _append_course_evidence(
+    lines: list[str],
+    heading: str,
+    evidence: Any,
+    *,
+    external: bool,
+) -> None:
+    items = _items(evidence)
+    if not items:
+        return
+    lines.append(f"- {heading}：")
+    for item in items:
+        page = _field(item, "page", "page_number", default=None)
+        quote = _single_line(_field(item, "quote", default=""))
+        if external:
+            source = _field(item, "title", "doi", "url", default="外部来源")
+            description = _single_line(source) or "外部来源"
+        else:
+            description = f"第 {_text(page)} 页" if page is not None else "论文原文"
+        if quote:
+            description += f"：“{quote}”"
+        lines.append(f"  - {description}")
 
 
 def _render_legacy_markdown(
@@ -779,3 +1058,10 @@ def _load_provider_snapshot(run_dir: Path) -> ProviderSnapshot | None:
     if not path.is_file():
         return None
     return ProviderSnapshot.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _load_submission_metadata(run_dir: Path) -> SubmissionMetadata | None:
+    path = run_dir / "submission-metadata.json"
+    if not path.is_file():
+        return None
+    return SubmissionMetadata.model_validate_json(path.read_text(encoding="utf-8"))

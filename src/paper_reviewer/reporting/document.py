@@ -9,12 +9,14 @@ context, while leaving the persisted domain models unchanged.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 from paper_reviewer.domain.provider import ModelApiProtocol, ProviderSnapshot
 from paper_reviewer.domain.rubric import RubricProfile
+from paper_reviewer.domain.submission import SubmissionMetadata
 from paper_reviewer.reporting.presentation import ReportPresentation, ReportPresentationProfile
 from paper_reviewer.validation.audits import AuditReport
 
@@ -44,6 +46,8 @@ class ReportDocument:
     provider_snapshot: ProviderSnapshot | None = None
     provider_ref: str | None = None
     model: str | None = None
+    submission_metadata: SubmissionMetadata | None = None
+    dimension_scores: Mapping[str, float] | None = None
 
     @property
     def is_evaluation(self) -> bool:
@@ -54,6 +58,12 @@ class ReportDocument:
         """Resolve display labels from the captured rubric snapshot."""
 
         return ReportPresentation(self.rubric, self.presentation_profile)
+
+    @property
+    def is_course_report(self) -> bool:
+        """Return whether the projection uses the course-report contract."""
+
+        return self.presentation_profile is ReportPresentationProfile.COURSE_ZH_CN_V1
 
     @property
     def provider_lines(self) -> tuple[str, ...]:

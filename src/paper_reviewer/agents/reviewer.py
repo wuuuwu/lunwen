@@ -42,6 +42,7 @@ async def run_reviewer(
     discipline_name: str | None = None,
     discipline_profile: str | None = None,
     web_search_tools: WebSearchTools | None = None,
+    require_dimension_scores: bool = False,
 ) -> ReviewerResult:
     read_context = build_reviewer_read_context(blocks=blocks, evidence=evidence)
     registry = read_context.registry
@@ -80,6 +81,12 @@ async def run_reviewer(
             "inspect all paper evidence needed for each assessment."
         ),
     }
+    if require_dimension_scores:
+        user_payload["instruction"] = (
+            str(user_payload["instruction"])
+            + " For this course assessment, fill dimension_scores for every assigned "
+            "dimension using its exact ID and score range."
+        )
     if repair_source is not None:
         user_payload["repair_source"] = repair_source.model_dump(mode="json")
         user_payload["instruction"] = (
@@ -114,6 +121,24 @@ async def run_reviewer(
             errors.append("reviewer result identity does not match the assigned reviewer")
         if not scoring_enabled and result.dimension_scores:
             errors.append("reviewer returned dimension scores while scoring is disabled")
+        if require_dimension_scores:
+            returned_score_ids = set(result.dimension_scores)
+            assigned_score_ids = set(dimension_by_id)
+            if returned_score_ids != assigned_score_ids:
+                errors.append(
+                    "dimension_scores must cover every assigned course dimension; "
+                    f"missing={sorted(assigned_score_ids - returned_score_ids)}, "
+                    f"extra={sorted(returned_score_ids - assigned_score_ids)}"
+                )
+            for dimension_id, proposal in result.dimension_scores.items():
+                dimension = dimension_by_id.get(dimension_id)
+                if dimension is not None and not (
+                    dimension.minimum_score <= proposal.score <= dimension.maximum_score
+                ):
+                    errors.append(
+                        f"{dimension_id}: course score {proposal.score} is outside "
+                        f"{dimension.minimum_score}-{dimension.maximum_score}"
+                    )
         duplicate_ids = _duplicate_finding_ids(result)
         if duplicate_ids:
             errors.append(f"finding_id values must be unique: {duplicate_ids}")
@@ -187,6 +212,12 @@ async def run_reviewer(
             "results. If no exact paper block supports that severity, lower it to minor or "
             "suggestion, or remove the unsupported finding; never invent a block_id, page, or "
             "quote."
+            + (
+                " Every assigned course dimension must also appear exactly once in "
+                "dimension_scores with a score inside the rubric range."
+                if require_dimension_scores
+                else ""
+            )
         ),
     )
     if repair_baseline is not None:

@@ -17,6 +17,10 @@ def bundled_config(name: str) -> Path:
         "zhejiang_independent_panel_v1.yaml": Path(
             "configs/review_profiles/zhejiang_independent_panel_v1.yaml"
         ),
+        "course_paper_v1.yaml": Path("configs/rubrics/course_paper_v1.yaml"),
+        "course_paper_reviewers_v1.yaml": Path(
+            "configs/review_profiles/course_paper_reviewers_v1.yaml"
+        ),
     }
     relative = project_locations.get(name)
     if relative is None:

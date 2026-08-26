@@ -31,6 +31,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from paper_reviewer.application.app_state import (
+    COURSE_ORGANIZATION_NAME,
+    COURSE_SETTINGS_NAME,
+)
 from paper_reviewer.application.models import ReportView, RunDetail, RunEvent
 from paper_reviewer.domain.review import ReviewFinding
 from paper_reviewer.domain.run import RunStatus
@@ -41,6 +45,8 @@ from paper_reviewer.gui.widgets import MessageBar, PageHeader
 from paper_reviewer.reporting.presentation import ReportPresentation
 
 from .run_detail_presenter import (
+    _course_conclusion,
+    _course_grade,
     _display_value,
     _first,
     _format_hard_detail,
@@ -51,6 +57,7 @@ from .run_detail_presenter import (
     _items,
     _make_decision,
     _pending_items,
+    _score_text,
     _status_value,
 )
 
@@ -78,6 +85,15 @@ class RunDetailPage(QWidget):
         ("audit", "确定性审计"),
         ("panel", "独立专家面板"),
         ("meta", "Meta 评语"),
+        ("report", "报告验证与生成"),
+    ]
+    COURSE_STAGES: ClassVar[list[tuple[str, str]]] = [
+        ("ingest", "解析论文"),
+        ("metadata", "提取学生与论文信息"),
+        ("evidence", "收集外部证据"),
+        ("reviews", "课程专项 Reviewer 评阅"),
+        ("audit", "确定性审计"),
+        ("meta", "Meta Review 汇总"),
         ("report", "报告验证与生成"),
     ]
     ACTIVE: ClassVar[set[RunStatus]] = {
@@ -116,6 +132,9 @@ class RunDetailPage(QWidget):
         self.run_id = ""
         self.run_dir: Path | None = None
         self.completed_stages: set[str] = set()
+        self._course_progress_mode = False
+        self._active_course_stage: str | None = None
+        self._last_progress_status: Any = "created"
         self._pending_hard_rules: list[Any] = []
         self._panel_review_required = False
         self._panel_review_detail = ""
@@ -200,6 +219,9 @@ class RunDetailPage(QWidget):
         self.run_id = run_id
         self.run_dir = run_dir
         self.completed_stages.clear()
+        self._set_course_progress_mode(False)
+        self._active_course_stage = None
+        self._last_progress_status = "created"
         self._pending_hard_rules = []
         self._panel_review_required = False
         self._panel_review_detail = ""
@@ -232,13 +254,14 @@ class RunDetailPage(QWidget):
             QSizePolicy.Policy.Preferred,
         )
         self.stage_progress = QProgressBar()
-        self.stage_progress.setRange(0, len(self.STAGES))
+        stages = self._stage_definitions()
+        self.stage_progress.setRange(0, len(stages))
         self.stage_progress.setTextVisible(False)
         self.stage_model = QStandardItemModel()
         self.stage_list = QListView()
         self.stage_list.setModel(self.stage_model)
         self.stage_list.setAccessibleName("评测阶段")
-        self._show_list_rows(self.stage_list, len(self.STAGES))
+        self._show_list_rows(self.stage_list, len(stages))
 
         self.hard_rule_review_frame = QFrame()
         self.hard_rule_review_frame.setProperty("fluentRole", "card")
@@ -385,8 +408,8 @@ class RunDetailPage(QWidget):
         diagnostic_layout = QVBoxLayout(self.diagnostic_frame)
         diagnostic_layout.setContentsMargins(16, 16, 16, 16)
         diagnostic_layout.setSpacing(12)
-        diagnostic_title = QLabel("九项诊断评分（0–4）")
-        diagnostic_title.setProperty("fluentType", "sectionTitle")
+        self.diagnostic_title = QLabel("九项诊断评分（0–4）")
+        self.diagnostic_title.setProperty("fluentType", "sectionTitle")
         self.diagnostic_summary = QLabel()
         self.diagnostic_summary.setProperty("fluentType", "secondary")
         self.diagnostic_summary.setWordWrap(True)
@@ -396,6 +419,7 @@ class RunDetailPage(QWidget):
         self.criterion_table = self.diagnostic_scores
         self.diagnostic_scores.setObjectName("diagnosticScores")
         self.diagnostic_scores.setModel(self.diagnostic_scores_model)
+        self.diagnostic_scores.setAccessibleName("诊断评分明细")
         self.diagnostic_scores.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.diagnostic_scores.verticalHeader().hide()
         self.diagnostic_scores.horizontalHeader().setStretchLastSection(True)
@@ -403,7 +427,7 @@ class RunDetailPage(QWidget):
         self.experimental_score = QLabel()
         self.experimental_score.setWordWrap(True)
         for widget in (
-            diagnostic_title,
+            self.diagnostic_title,
             self.diagnostic_summary,
             self.diagnostic_scores,
             self.experimental_score,
@@ -504,13 +528,13 @@ class RunDetailPage(QWidget):
         notes_layout = QVBoxLayout(self.notes_frame)
         notes_layout.setContentsMargins(16, 16, 16, 16)
         notes_layout.setSpacing(12)
-        notes_title = QLabel("分歧、人工复核与审计说明")
-        notes_title.setProperty("fluentType", "sectionTitle")
+        self.notes_title = QLabel("分歧、人工复核与审计说明")
+        self.notes_title.setProperty("fluentType", "sectionTitle")
         self.notes = QPlainTextEdit()
         self.notes.setReadOnly(True)
         self.notes.setAccessibleName("分歧、人工核查和审计说明")
         self._show_text_lines(self.notes, 8)
-        notes_layout.addWidget(notes_title)
+        notes_layout.addWidget(self.notes_title)
         notes_layout.addWidget(self.notes)
         self.export_markdown_button = QPushButton("导出 Markdown")
         self.export_markdown_button.setObjectName("exportMarkdownButton")
@@ -572,7 +596,20 @@ class RunDetailPage(QWidget):
             or getattr(run, "provider_snapshot", None)
             or detail
         )
+        course_progress = self._is_course_detail(detail)
+        self._set_course_progress_mode(course_progress)
         self.completed_stages = set(run.completed_stages)
+        self._active_course_stage = None
+        if course_progress:
+            self._replay_course_stage_events(detail.events)
+            if self.completed_stages.intersection(
+                {"evidence", "reviews", "audit", "meta", "report"}
+            ):
+                self.completed_stages.add("metadata")
+            status_stage = self._course_stage_for_status(run.status)
+            if status_stage is not None:
+                self._active_course_stage = status_stage
+        self._last_progress_status = run.status
         self.set_cancel_pending(run.run_id, False)
         self.stack.setCurrentWidget(self.progress_page)
         self.run_metadata.setText(
@@ -628,10 +665,25 @@ class RunDetailPage(QWidget):
         if not self.run_id:
             self.run_id = event.run_id
         self.events.appendPlainText(event.message)
+        if event.event_type.startswith("submission_metadata_"):
+            self._set_course_progress_mode(True)
         if event.stage and event.event_type.endswith("_completed"):
             self.completed_stages.add(event.stage)
+            if self._active_course_stage == event.stage:
+                self._active_course_stage = None
+        elif (
+            self._course_progress_mode
+            and event.stage
+            and event.event_type.endswith("_started")
+        ):
+            if event.stage != "metadata" and "metadata" not in self.completed_stages:
+                # Once a later course stage starts, the local metadata artifact
+                # necessarily exists even if the app stopped between writing it
+                # and appending its completion trace event.
+                self.completed_stages.add("metadata")
+            self._active_course_stage = event.stage
         if event.status is not None:
-            self._update_stages(sorted(self.completed_stages), event.status)
+            self._last_progress_status = event.status
             self.run_metadata.setText(f"任务 {event.run_id} · 状态：{_display_value(event.status)}")
             self.cancel_button.setVisible(self._is_active_status(event.status))
             self.resume_button.setVisible(
@@ -648,6 +700,10 @@ class RunDetailPage(QWidget):
                     self._show_hard_rule_review(_pending_items(pending))
         elif self.run_id:
             self.cancel_button.show()
+        self._update_stages(
+            sorted(self.completed_stages),
+            self._last_progress_status,
+        )
 
     def show_report(self, report: ReportView, *, run_dir: Path) -> None:
         self._reset_report_context(True)
@@ -665,21 +721,41 @@ class RunDetailPage(QWidget):
         )
         self._set_export_buttons_enabled(True)
         self.stack.setCurrentWidget(self.report_page)
+        course_report = getattr(report.rubric, "evaluation_mode", None) == "course_assessment"
+        self._set_course_progress_mode(course_report)
+        self._configure_report_mode(course_report)
         title = (
             report.document.title
             if report.document and report.document.title
             else Path(report.run.input_path).name
         )
-        self.report_metadata.setText(
-            f"{title} · {report.rubric.title} ({report.rubric.version}) · "
-            f"{provider_label(report.run.provider, report.run.model, provider_source)}"
-        )
+        if course_report:
+            metadata = report.submission_metadata
+            paper_title = metadata.paper_title if metadata is not None else title
+            student_name = metadata.student_name if metadata is not None else "未提取"
+            student_id = metadata.student_id if metadata is not None else "未提取"
+            major = metadata.major if metadata is not None else "未提取"
+            self.report_metadata.setText(
+                f"题目：{paper_title}\n"
+                f"姓名：{student_name} · 学号：{student_id} · 专业：{major}\n"
+                f"评价标准：{report.rubric.title} ({report.rubric.version}) · "
+                f"{provider_label(report.run.provider, report.run.model, provider_source)}"
+            )
+        else:
+            self.report_metadata.setText(
+                f"{title} · {report.rubric.title} ({report.rubric.version}) · "
+                f"{provider_label(report.run.provider, report.run.model, provider_source)}"
+            )
         self.overall_summary.setText(
             self._presentation.narrative(report.review.overall_summary)
             if self._presentation is not None
             else report.review.overall_summary
         )
-        if report.evaluation is not None:
+        if course_report and report.rubric.scoring_enabled:
+            self.score_frame.show()
+            self.unscored_message.hide()
+            self._render_course_score_card(report)
+        elif report.evaluation is not None:
             # v2 uses an experimental diagnostic score and a separate policy
             # risk decision. Do not present the legacy course-style verdict card.
             self.score_frame.hide()
@@ -702,22 +778,28 @@ class RunDetailPage(QWidget):
             self.unscored_message.show_message(
                 "当前 Rubric 仅提供评语，不生成分数。", severity="info"
             )
-        self._render_policy_report(report)
-        review_summary = _first(report, "human_review_summary")
-        panel_review_required = bool(
-            _first(review_summary, "panel_review_required", default=False)
-        )
-        pending_rules = _pending_items(
-            _first(report, "pending_hard_rules", default=[])
-        )
-        evaluation_source = _first(report, "evaluation", default=report)
-        self._show_hard_rule_review(
-            pending_rules,
-            panel_review_required=panel_review_required,
-            panel_review_detail=_format_panel_review_detail(
-                evaluation_source, self._presentation
-            ),
-        )
+        if course_report:
+            self._render_course_report(report)
+            pending_rules: list[Any] = []
+            panel_review_required = False
+            self._show_hard_rule_review([])
+        else:
+            self._render_policy_report(report)
+            review_summary = _first(report, "human_review_summary")
+            panel_review_required = bool(
+                _first(review_summary, "panel_review_required", default=False)
+            )
+            pending_rules = _pending_items(
+                _first(report, "pending_hard_rules", default=[])
+            )
+            evaluation_source = _first(report, "evaluation", default=report)
+            self._show_hard_rule_review(
+                pending_rules,
+                panel_review_required=panel_review_required,
+                panel_review_detail=_format_panel_review_detail(
+                    evaluation_source, self._presentation
+                ),
+            )
         self.findings_model.set_items(report.review.findings)
         self.findings.resizeColumnsToContents()
         if report.review.findings:
@@ -736,7 +818,7 @@ class RunDetailPage(QWidget):
             )
         if report.review.human_checks:
             notes.append(
-                "人工核查\n"
+                ("需要教师关注\n" if course_report else "人工核查\n")
                 + "\n".join(
                     f"• {self._localized_narrative(x)}" for x in report.review.human_checks
                 )
@@ -751,7 +833,12 @@ class RunDetailPage(QWidget):
                     ]
                 )
             )
-        self.notes.setPlainText("\n\n".join(notes) or "没有额外的分歧、人工核查或审计说明。")
+        empty_notes = (
+            "没有额外的分歧或审计说明。"
+            if course_report
+            else "没有额外的分歧、人工核查或审计说明。"
+        )
+        self.notes.setPlainText("\n\n".join(notes) or empty_notes)
         self._scroll_to_top(self.report_scroll)
         if pending_rules or panel_review_required:
             pending_count = len(pending_rules) + int(panel_review_required)
@@ -762,6 +849,112 @@ class RunDetailPage(QWidget):
             )
         else:
             self.message.clear()
+
+    def _configure_report_mode(self, course_report: bool) -> None:
+        """在不改变控件身份的前提下切换报告语义。"""
+
+        if course_report:
+            self.diagnostic_title.setText("六项课程评价维度")
+            self.diagnostic_scores_model.setHorizontalHeaderLabels(
+                ["课程评价维度", "得分（0–100）", "权重", "加权贡献"]
+            )
+            self.diagnostic_scores.setAccessibleName("六项课程评价维度得分")
+            self.notes_title.setText("分歧与审计说明")
+            self.notes.setAccessibleName("课程评测分歧与审计说明")
+        else:
+            self.diagnostic_title.setText("九项诊断评分（0–4）")
+            self.diagnostic_scores_model.setHorizontalHeaderLabels(
+                ["指标", "分组", "等级", "加权贡献"]
+            )
+            self.diagnostic_scores.setAccessibleName("诊断评分明细")
+            self.notes_title.setText("分歧、人工复核与审计说明")
+            self.notes.setAccessibleName("分歧、人工核查和审计说明")
+        for frame in (
+            self.hard_rule_report_frame,
+            self.panel_report_frame,
+            self.decision_frame,
+        ):
+            frame.setVisible(not course_report)
+
+    def _render_course_score_card(self, report: ReportView) -> None:
+        total = report.review.total_score
+        passing_score = (
+            report.rubric.aggregation.passing_score
+            if report.rubric.aggregation is not None
+            else None
+        )
+        grade = _course_grade(total)
+        conclusion = _course_conclusion(total, passing_score, report.review.verdict)
+        total_text = f"{_score_text(total)} 分" if total is not None else "暂无"
+        self.total_score.setText(f"课程总分\n{total_text}")
+        passing_text = (
+            f"{_score_text(passing_score)} 分" if passing_score is not None else "未设置"
+        )
+        self.dimension_scores.setText(
+            f"五级等级：{grade}\n"
+            f"课程要求结论：{conclusion}\n"
+            f"及格参考线：{passing_text}"
+        )
+
+    def _render_course_report(self, report: ReportView) -> None:
+        self.diagnostic_scores_model.removeRows(0, self.diagnostic_scores_model.rowCount())
+        dimensions_by_id = {
+            dimension.dimension_id: dimension for dimension in report.rubric.dimensions
+        }
+        for dimension in report.rubric.dimensions:
+            score = report.dimension_scores.get(dimension.dimension_id)
+            contribution = score * dimension.weight / 100 if score is not None else None
+            row = (
+                dimension.title,
+                _score_text(score),
+                f"{_score_text(dimension.weight)}%",
+                _score_text(contribution),
+            )
+            items = [QStandardItem(value) for value in row]
+            for item in items:
+                item.setEditable(False)
+            self.diagnostic_scores_model.appendRow(items)
+        for dimension_id, score in report.dimension_scores.items():
+            if dimension_id in dimensions_by_id:
+                continue
+            title = (
+                self._presentation.dimension(dimension_id)
+                if self._presentation is not None
+                else "未命名指标"
+            )
+            items = [
+                QStandardItem(title),
+                QStandardItem(_score_text(score)),
+                QStandardItem("未提供"),
+                QStandardItem("未提供"),
+            ]
+            for item in items:
+                item.setEditable(False)
+            self.diagnostic_scores_model.appendRow(items)
+        self.diagnostic_scores.resizeColumnsToContents()
+        dimension_count = len(report.rubric.dimensions)
+        self.diagnostic_summary.setText(
+            f"本报告按当前课程评价标准的 {dimension_count} 个评价维度加权汇总。"
+        )
+        total = report.review.total_score
+        passing_score = (
+            report.rubric.aggregation.passing_score
+            if report.rubric.aggregation is not None
+            else None
+        )
+        self.experimental_score.setText(
+            f"课程总分：{_score_text(total)} 分 · "
+            f"五级等级：{_course_grade(total)} · "
+            f"课程要求结论："
+            f"{_course_conclusion(total, passing_score, report.review.verdict)}"
+        )
+        self.disclaimers.setText(
+            "使用说明：\n"
+            "• 本报告为 AI 辅助课程论文评测结果，最终成绩由任课教师确定。\n"
+            "• 五级等级和及格参考线来自当前课程评价标准，使用前应结合课程大纲确认。\n"
+            "• 系统不考察专业培养目标，也不据此认定学术不端。\n"
+            "• 模型置信度是未经校准的自评，不作为统计概率。"
+        )
 
     def _icon_or_null(self, name: str) -> QIcon:
         """Return a theme icon while allowing optional packaged icons to lag."""
@@ -839,7 +1032,7 @@ class RunDetailPage(QWidget):
             self._set_export_buttons_enabled(self._report_available)
 
     def _last_export_directory(self) -> Path:
-        settings = QSettings("PaperReviewer", "PaperReviewer")
+        settings = QSettings(COURSE_ORGANIZATION_NAME, COURSE_SETTINGS_NAME)
         remembered = settings.value("reportExport/lastDirectory", "")
         if remembered:
             candidate = Path(str(remembered))
@@ -918,7 +1111,7 @@ class RunDetailPage(QWidget):
         output = getattr(result, "output_path", getattr(result, "path", result))
         output_path = Path(str(output))
         self._exported_report_path = output_path
-        QSettings("PaperReviewer", "PaperReviewer").setValue(
+        QSettings(COURSE_ORGANIZATION_NAME, COURSE_SETTINGS_NAME).setValue(
             "reportExport/lastDirectory", str(output_path.parent)
         )
         self._set_export_busy(False)
@@ -1130,23 +1323,79 @@ class RunDetailPage(QWidget):
         self.decision_path.setPlainText("暂无结构化决策路径数据。")
         self.disclaimers.clear()
 
-    def _update_stages(self, completed: list[str], status: Any) -> None:
-        self.stage_model.clear()
-        current = {
+    def _stage_definitions(self) -> list[tuple[str, str]]:
+        return self.COURSE_STAGES if self._course_progress_mode else self.STAGES
+
+    def _set_course_progress_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._course_progress_mode == enabled:
+            return
+        self._course_progress_mode = enabled
+        stages = self._stage_definitions()
+        if hasattr(self, "stage_progress"):
+            self.stage_progress.setRange(0, len(stages))
+        if hasattr(self, "stage_list"):
+            self._show_list_rows(self.stage_list, len(stages))
+
+    @staticmethod
+    def _is_course_detail(detail: RunDetail) -> bool:
+        rubric_id = detail.run.rubric_id.partition("@")[0]
+        return rubric_id == "course-paper-general-assessment" or any(
+            event.event_type.startswith("submission_metadata_")
+            for event in detail.events
+        )
+
+    def _replay_course_stage_events(self, events: list[RunEvent]) -> None:
+        """Recover the metadata checkpoint and live stage from persisted trace."""
+
+        active: str | None = None
+        for event in events:
+            stage = event.stage
+            if not stage:
+                continue
+            if event.event_type.endswith("_completed"):
+                self.completed_stages.add(stage)
+                if active == stage:
+                    active = None
+            elif event.event_type.endswith("_started"):
+                if stage != "metadata" and "metadata" not in self.completed_stages:
+                    self.completed_stages.add("metadata")
+                active = stage
+        self._active_course_stage = active
+
+    @staticmethod
+    def _course_stage_for_status(status: Any) -> str | None:
+        return {
             "ingesting": "ingest",
             "building_evidence": "evidence",
-            "scoring": "scoring",
-            "reviewing": "scoring",
+            "reviewing": "reviews",
             "auditing": "audit",
-            "awaiting_hard_rule_confirmation": "panel",
-            "panel_reviewing": "panel",
-            "supplemental_reviewing": "panel",
-            "awaiting_panel_review": "panel",
             "meta_reviewing": "meta",
             "synthesizing": "meta",
             "validating": "report",
         }.get(_status_value(status))
-        for stage, label in self.STAGES:
+
+    def _update_stages(self, completed: list[str], status: Any) -> None:
+        self.stage_model.clear()
+        if self._course_progress_mode:
+            current = self._active_course_stage or self._course_stage_for_status(status)
+        else:
+            current = {
+                "ingesting": "ingest",
+                "building_evidence": "evidence",
+                "scoring": "scoring",
+                "reviewing": "scoring",
+                "auditing": "audit",
+                "awaiting_hard_rule_confirmation": "panel",
+                "panel_reviewing": "panel",
+                "supplemental_reviewing": "panel",
+                "awaiting_panel_review": "panel",
+                "meta_reviewing": "meta",
+                "synthesizing": "meta",
+                "validating": "report",
+            }.get(_status_value(status))
+        stages = self._stage_definitions()
+        for stage, label in stages:
             if stage in completed:
                 prefix, state, icon = (
                     "已完成",
@@ -1171,7 +1420,7 @@ class RunDetailPage(QWidget):
             item.setAccessibleText(f"{label}，{prefix}")
             self.stage_model.appendRow(item)
         self.stage_progress.setValue(
-            len(set(completed).intersection({stage for stage, _ in self.STAGES}))
+            len(set(completed).intersection({stage for stage, _ in stages}))
         )
 
     def _show_hard_rule_review(

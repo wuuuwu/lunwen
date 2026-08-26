@@ -11,6 +11,7 @@ from paper_reviewer.domain.reference import ReferenceCheckReport
 from paper_reviewer.domain.review import EvaluationReport, MetaReview, ReviewerResult
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord
+from paper_reviewer.domain.submission import SubmissionMetadata
 from paper_reviewer.validation.audits import AuditReport
 
 
@@ -29,8 +30,10 @@ class PipelineContext:
     panel_profile: ReviewProfile | None
     plan: ReviewPlan
     dual_advisory: bool
+    course_assessment: bool
     discipline_name: str
     discipline_profile: str | None
+    expected_input_hash: str | None = None
     document: DocumentInfo | None = None
     blocks: list[DocumentBlock] = field(default_factory=list)
     evidence: list[EvidenceItem] = field(default_factory=list)
@@ -39,3 +42,4 @@ class PipelineContext:
     audit: AuditReport | None = None
     meta: MetaReview | None = None
     evaluation: EvaluationReport | None = None
+    submission_metadata: SubmissionMetadata | None = None

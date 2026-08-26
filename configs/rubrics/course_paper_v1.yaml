@@ -1,0 +1,118 @@
+schema_version: "1"
+rubric_id: course-paper-general-assessment
+version: "0.1.0-experimental"
+title: 普通课程论文 AI 辅助评测（通用实验版）
+applicable_levels: [undergraduate]
+applicable_paper_types: [course_paper_pdf]
+evaluation_mode: course_assessment
+experimental: true
+validation_notice: 通用评分模板尚未针对具体课程完成教育测量效度验证，教师应依据课程大纲确认或替换后再用于正式计分。
+
+dimensions:
+  - dimension_id: task_completion
+    title: 课程任务完成度
+    description: 评价论文是否回应课程论文要求，并完整完成规定的核心任务。
+    weight: 25
+    minimum_score: 0
+    maximum_score: 100
+    checks:
+      - 是否围绕课程论文任务形成明确、完整且相关的内容。
+      - 关键组成部分是否齐全，篇幅与完成程度是否符合一般课程要求。
+    anchors: &course_score_anchors
+      - label: 核心任务明显缺失
+        minimum: 0
+        maximum: 39
+        description: 核心任务明显缺失，论文内容与课程要求严重脱节。
+      - label: 完成不足
+        minimum: 40
+        maximum: 59
+        description: 完成程度不足，存在影响课程任务达成的实质性问题。
+      - label: 达到基本要求
+        minimum: 60
+        maximum: 74
+        description: 达到课程论文基本要求，但仍有较明显的不足。
+      - label: 良好
+        minimum: 75
+        maximum: 89
+        description: 完成良好，内容较完整，论证和表达较充分。
+      - label: 优秀
+        minimum: 90
+        maximum: 100
+        description: 完成优秀，明显高于课程论文的基本要求。
+    evidence_policy: &course_paper_evidence
+      paper_evidence_required: true
+      external_evidence_required: false
+      minimum_references: 1
+    reviewer_tags: [course_requirements]
+
+  - dimension_id: course_knowledge_application
+    title: 课程知识理解与运用
+    description: 评价论文是否准确理解并合理运用本课程的核心概念、理论或方法。
+    weight: 25
+    minimum_score: 0
+    maximum_score: 100
+    checks:
+      - 课程核心概念、理论或方法的理解是否准确。
+      - 是否能将课程知识用于解释、分析或解决论文所讨论的问题。
+    anchors: *course_score_anchors
+    evidence_policy: *course_paper_evidence
+    reviewer_tags: [course_requirements]
+
+  - dimension_id: argument_evidence
+    title: 论证与证据
+    description: 评价主要观点是否有充分、相关且可核查的论文证据支持。
+    weight: 20
+    minimum_score: 0
+    maximum_score: 100
+    checks:
+      - 主要观点、材料与结论之间是否形成清楚的论证关系。
+      - 关键论断是否有相关证据支持，是否避免无依据的外推。
+    anchors: *course_score_anchors
+    evidence_policy: *course_paper_evidence
+    reviewer_tags: [argumentation]
+
+  - dimension_id: structure_logic
+    title: 结构与逻辑
+    description: 评价文章结构、章节衔接和整体推理是否清晰连贯。
+    weight: 15
+    minimum_score: 0
+    maximum_score: 100
+    checks:
+      - 文章层次是否清晰，内容安排是否围绕中心问题展开。
+      - 段落和章节之间是否衔接自然，推理是否前后一致。
+    anchors: *course_score_anchors
+    evidence_policy: *course_paper_evidence
+    reviewer_tags: [argumentation]
+
+  - dimension_id: writing_expression
+    title: 文字表达
+    description: 评价语言是否准确、清楚、简洁并符合一般课程论文写作要求。
+    weight: 10
+    minimum_score: 0
+    maximum_score: 100
+    checks:
+      - 用词、语句和段落表达是否清楚，是否存在影响理解的错误。
+      - 语体、格式、图表或符号是否保持基本一致和可读。
+    anchors: *course_score_anchors
+    evidence_policy: *course_paper_evidence
+    reviewer_tags: [writing_norms]
+
+  - dimension_id: citation_format
+    title: 引用格式规范
+    description: 评价正文引用与参考文献是否基本对应、标注清楚且格式一致；不据此认定学术不端。
+    weight: 5
+    minimum_score: 0
+    maximum_score: 100
+    checks:
+      - 正文引用与参考文献条目是否能够相互对应。
+      - 引用标注和参考文献格式是否基本统一、信息是否足以识别来源。
+    anchors: *course_score_anchors
+    evidence_policy: *course_paper_evidence
+    reviewer_tags: [writing_norms]
+
+hard_rules: []
+aggregation:
+  method: weighted_mean
+  passing_score: 60
+  maximum_total: 100
+scoring_enabled: true

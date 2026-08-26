@@ -35,14 +35,18 @@ class RubricsPage(QWidget):
         service: ReviewApplicationService,
         preferences: GuiPreferences,
         icons: FluentIconService,
+        *,
+        profile_path: Path | None = None,
+        default_rubric_path: Path | None = None,
     ) -> None:
         super().__init__()
         self.service = service
         self.preferences = preferences
-        self.profile_path = (
+        self.profile_path = profile_path or (
             _optional_bundled_config("zhejiang_undergraduate_specialists_v1.yaml")
             or bundled_config("three_reviewer.yaml")
         )
+        self.default_rubric_path = default_rubric_path
         self.current_valid = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
@@ -78,10 +82,11 @@ class RubricsPage(QWidget):
         default = self._default_rubric(self.preferences)
         self.picker.set_path(default)
 
-    @staticmethod
-    def _default_rubric(preferences: GuiPreferences) -> Path:
+    def _default_rubric(self, preferences: GuiPreferences) -> Path:
         if preferences.default_rubric and Path(preferences.default_rubric).is_file():
             return Path(preferences.default_rubric)
+        if self.default_rubric_path is not None:
+            return self.default_rubric_path
         return (
             _optional_bundled_config("zhejiang_undergraduate_thesis_v2.yaml")
             or bundled_config("unscored_draft.yaml")
