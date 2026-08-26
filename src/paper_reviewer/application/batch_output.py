@@ -24,6 +24,92 @@ _WINDOWS_RESERVED = {
 _REPORT_SUFFIX = "_课程论文评测报告.pdf"
 _MAX_FILENAME_UTF16_UNITS = 240
 _MAX_WINDOWS_PATH_UTF16_UNITS = 259
+BATCH_SUMMARY_FILENAME = "课程论文评测汇总.csv"
+BATCH_OUTPUT_OWNED_MESSAGE = "该报告输出目录已属于另一个课程论文批次；请选择新的空目录。"
+BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE = (
+    "该报告输出目录已存在课程论文评测汇总表，但没有可验证的批次归属；请选择新的空目录。"
+)
+BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE = (
+    "该报告输出目录的批次归属标记无法验证；请选择新的空目录。"
+)
+
+
+class BatchOutputConflictError(FileExistsError):
+    """A safe, path-free conflict that prevents reusing a batch output folder."""
+
+
+class BatchOutputOwnedByAnotherBatchError(BatchOutputConflictError):
+    """The fixed summary path is already claimed by another batch."""
+
+    def __init__(self) -> None:
+        super().__init__(BATCH_OUTPUT_OWNED_MESSAGE)
+
+
+class BatchOutputSummaryExistsError(BatchOutputConflictError):
+    """A fixed summary exists without a matching ownership marker."""
+
+    def __init__(self) -> None:
+        super().__init__(BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE)
+
+
+class BatchOutputOwnershipUnverifiableError(BatchOutputConflictError):
+    """An ownership marker exists but cannot be read safely."""
+
+    def __init__(self) -> None:
+        super().__init__(BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE)
+
+
+def batch_output_conflict_message(
+    output_dir: Path,
+    *,
+    batch_id: str | None = None,
+) -> str | None:
+    """Inspect the fixed batch output paths without creating or changing files.
+
+    Omitting ``batch_id`` is appropriate when creating a new batch: any owner
+    marker means that the directory is already in use.  Supplying the existing
+    batch ID lets resume paths distinguish their own summary from a conflict.
+    Only static, path-free messages are returned.
+    """
+
+    destination = output_dir.resolve(strict=False) / BATCH_SUMMARY_FILENAME
+    owner_path = _owner_path(destination)
+    if owner_path.exists() or owner_path.is_symlink():
+        if batch_id is None:
+            return BATCH_OUTPUT_OWNED_MESSAGE
+        try:
+            owner = _read_output_owner(owner_path)
+        except BatchOutputOwnershipUnverifiableError:
+            return BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE
+        if owner != batch_id:
+            return BATCH_OUTPUT_OWNED_MESSAGE
+        return None
+    if destination.exists() or destination.is_symlink():
+        return BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE
+    return None
+
+
+def claim_batch_output_directory(output_dir: Path, batch_id: str) -> None:
+    """Atomically claim the fixed summary path for ``batch_id``."""
+
+    destination = output_dir.resolve(strict=False) / BATCH_SUMMARY_FILENAME
+    _claim_output_directory(destination, batch_id)
+
+
+def release_batch_output_directory_claim(output_dir: Path, batch_id: str) -> None:
+    """Release a claim only when it still belongs to ``batch_id``."""
+
+    owner_path = _owner_path(output_dir.resolve(strict=False) / BATCH_SUMMARY_FILENAME)
+    try:
+        owner = _read_output_owner(owner_path)
+    except (FileNotFoundError, BatchOutputOwnershipUnverifiableError):
+        return
+    if owner != batch_id:
+        return
+    try:
+        owner_path.unlink()
+    except FileNotFoundError:
+        return
 
 
 def sanitize_filename_component(
@@ -199,7 +285,7 @@ def _dimension_columns(dimensions: Sequence[tuple[str, str]]) -> list[tuple[str,
 def _claim_output_directory(destination: Path, batch_id: str) -> None:
     """Claim one summary path without monopolizing the entire output folder."""
 
-    owner_path = destination.with_name(f".{destination.name}.owner")
+    owner_path = _owner_path(destination)
     try:
         descriptor = os.open(
             owner_path,
@@ -208,11 +294,11 @@ def _claim_output_directory(destination: Path, batch_id: str) -> None:
         )
     except FileExistsError:
         try:
-            owner = owner_path.read_text(encoding="ascii").strip()
-        except (OSError, UnicodeError) as error:
-            raise PermissionError("无法验证批次输出目录归属。") from error
+            owner = _read_output_owner(owner_path)
+        except BatchOutputOwnershipUnverifiableError:
+            raise
         if owner != batch_id:
-            raise FileExistsError("该汇总文件路径已由另一个课程论文批次使用。") from None
+            raise BatchOutputOwnedByAnotherBatchError from None
         return
     try:
         with os.fdopen(descriptor, "w", encoding="ascii", newline="") as handle:
@@ -222,9 +308,31 @@ def _claim_output_directory(destination: Path, batch_id: str) -> None:
     except Exception:
         owner_path.unlink(missing_ok=True)
         raise
-    if destination.exists():
+    if destination.exists() or destination.is_symlink():
         owner_path.unlink(missing_ok=True)
-        raise FileExistsError("目标位置已存在未归属的课程论文评测汇总 CSV。")
+        raise BatchOutputSummaryExistsError
+
+
+def _owner_path(destination: Path) -> Path:
+    return destination.with_name(f".{destination.name}.owner")
+
+
+def _read_output_owner(owner_path: Path) -> str:
+    if owner_path.is_symlink():
+        raise BatchOutputOwnershipUnverifiableError
+    try:
+        with owner_path.open("r", encoding="ascii", newline="") as handle:
+            owner = handle.read(129)
+            if handle.read(1):
+                raise BatchOutputOwnershipUnverifiableError
+    except FileNotFoundError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise BatchOutputOwnershipUnverifiableError from error
+    owner = owner.strip()
+    if not owner or len(owner) > 128 or any(character.isspace() for character in owner):
+        raise BatchOutputOwnershipUnverifiableError
+    return owner
 
 
 def _spreadsheet_safe(value: str) -> str:

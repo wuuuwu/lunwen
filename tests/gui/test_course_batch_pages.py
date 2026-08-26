@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
+import pytest
 import yaml
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from paper_reviewer.application.app_state import GuiPreferences
+from paper_reviewer.application.batch_output import BATCH_SUMMARY_FILENAME
 from paper_reviewer.application.models import RubricValidationResult
 from paper_reviewer.domain.batch import (
     BatchEvent,
@@ -26,6 +29,7 @@ from paper_reviewer.domain.submission import (
 )
 from paper_reviewer.gui.batch_models import BatchItemsTableModel
 from paper_reviewer.gui.icons import FluentIconService
+from paper_reviewer.gui.pages import course_batch_new
 from paper_reviewer.gui.pages.course_batch_detail import CourseBatchDetailPage
 from paper_reviewer.gui.pages.course_batch_new import CourseBatchNewPage
 from paper_reviewer.gui.theme import FluentThemeManager
@@ -231,6 +235,126 @@ def test_course_batch_new_page_enforces_hundred_pdf_limit(
     assert "最多支持 100 篇" in page.scan_summary.text()
     assert not page.start_button.isEnabled()
     assert page.source_picker.edit.property("fluentInvalid") is True
+
+
+def test_course_batch_new_page_rotates_automatic_output_for_consecutive_starts(
+    qapp: QApplication,
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> FrozenDateTime:
+            del tz
+            return cls(2026, 8, 26, 12, 34, 56)
+
+    monkeypatch.setattr(course_batch_new, "datetime", FrozenDateTime)
+    source = tmp_path / "papers"
+    source.mkdir()
+    (source / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+    occupied = source / "课程论文评测报告_20260826_123456"
+    occupied.mkdir()
+
+    page = CourseBatchNewPage(
+        CourseBatchServiceStub(),  # type: ignore[arg-type]
+        GuiPreferences(),
+        _icons(qapp),
+    )
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    page.source_picker.set_path(source)
+    page.cloud_processing_authorized.setChecked(True)
+    page.non_classified_confirmation.setChecked(True)
+    page.pii_output_confirmation.setChecked(True)
+
+    requests: list[BatchReviewRequest] = []
+    page.start_requested.connect(requests.append)
+    first_output = source / "课程论文评测报告_20260826_123456_2"
+    assert page.output_picker.path() == first_output
+
+    page.start_button.click()
+    second_output = source / "课程论文评测报告_20260826_123456_3"
+    assert requests[0].output_dir == first_output
+    assert page.output_picker.path() == second_output
+    assert page.start_button.isEnabled()
+
+    page.start_button.click()
+    assert [request.output_dir for request in requests] == [first_output, second_output]
+    assert page.output_picker.path() == (
+        source / "课程论文评测报告_20260826_123456_4"
+    )
+
+
+@pytest.mark.parametrize(
+    "marker_name",
+    [BATCH_SUMMARY_FILENAME, f".{BATCH_SUMMARY_FILENAME}.owner"],
+)
+def test_course_batch_new_page_rejects_manual_previous_batch_output_accessibly(
+    qapp: QApplication,
+    qtbot: object,
+    tmp_path: Path,
+    marker_name: str,
+) -> None:
+    source = tmp_path / "papers"
+    source.mkdir()
+    (source / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+    previous_output = tmp_path / "previous-output"
+    previous_output.mkdir()
+    (previous_output / marker_name).write_text(
+        "batch-existing" if marker_name.endswith(".owner") else "summary",
+        encoding="utf-8",
+    )
+
+    page = CourseBatchNewPage(
+        CourseBatchServiceStub(),  # type: ignore[arg-type]
+        GuiPreferences(),
+        _icons(qapp),
+    )
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    page.source_picker.set_path(source)
+    page.cloud_processing_authorized.setChecked(True)
+    page.non_classified_confirmation.setChecked(True)
+    page.pii_output_confirmation.setChecked(True)
+    page.output_picker.set_path(previous_output)
+
+    assert page.output_picker.edit.property("fluentInvalid") is True
+    assert "批次记录" in page.output_picker.edit.accessibleDescription()
+    assert "批次记录" in page.output_picker.edit.toolTip()
+    assert "批次记录" in page.message.message_label.text()
+    assert "批次记录" in page.start_button.accessibleDescription()
+    assert not page.start_button.isEnabled()
+
+    page.show()
+    page.activateWindow()
+    page.source_picker.button.setFocus(Qt.FocusReason.TabFocusReason)
+    qapp.processEvents()
+    assert page.source_picker.button.hasFocus()
+    qtbot.keyClick(page.source_picker.button, Qt.Key.Key_Tab)  # type: ignore[attr-defined]
+    assert page.output_picker.edit.hasFocus()
+
+
+def test_clearing_manual_output_restores_a_fresh_automatic_directory(
+    qapp: QApplication,
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "papers"
+    source.mkdir()
+    (source / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+    page = CourseBatchNewPage(
+        CourseBatchServiceStub(),  # type: ignore[arg-type]
+        GuiPreferences(),
+        _icons(qapp),
+    )
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    page.source_picker.set_path(source)
+    automatic = page.output_picker.path()
+    page.output_picker.set_path(tmp_path / "manual-output")
+
+    page.output_picker.edit.clear()
+
+    assert page.output_picker.path() == automatic
+    assert page.output_picker.edit.property("fluentInvalid") is False
 
 
 def test_course_batch_detail_actions_events_and_keyboard_open(

@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
 from paper_reviewer.application.batch_output import (
+    BATCH_OUTPUT_OWNED_MESSAGE,
+    BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE,
+    BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE,
+    BATCH_SUMMARY_FILENAME,
+    BatchOutputConflictError,
+    BatchOutputOwnedByAnotherBatchError,
+    BatchOutputOwnershipUnverifiableError,
+    BatchOutputSummaryExistsError,
     allocate_report_path,
+    batch_output_conflict_message,
     build_report_filename,
+    claim_batch_output_directory,
     sanitize_filename_component,
     write_batch_summary_csv,
 )
@@ -213,3 +225,89 @@ def test_batch_csv_refuses_to_overwrite_another_batch_output(tmp_path: Path) -> 
         write_batch_summary_csv(destination, second, [])
 
     assert destination.read_bytes() == original
+
+
+def test_batch_output_conflict_probe_is_static_and_has_no_side_effects(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+
+    assert batch_output_conflict_message(output_dir) is None
+    assert not output_dir.exists()
+
+    output_dir.mkdir()
+    summary = output_dir / BATCH_SUMMARY_FILENAME
+    summary.write_bytes(b"existing")
+    before = tuple(output_dir.iterdir())
+
+    assert batch_output_conflict_message(output_dir) == BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE
+    assert tuple(output_dir.iterdir()) == before
+    with pytest.raises(BatchOutputSummaryExistsError) as captured:
+        claim_batch_output_directory(output_dir, "new-batch")
+
+    assert str(captured.value) == BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE
+    assert tuple(output_dir.iterdir()) == before
+
+
+def test_batch_output_claim_allows_only_its_batch_to_resume(tmp_path: Path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    claim_batch_output_directory(output_dir, "batch-one")
+
+    assert batch_output_conflict_message(output_dir) == BATCH_OUTPUT_OWNED_MESSAGE
+    assert batch_output_conflict_message(output_dir, batch_id="batch-one") is None
+    assert (
+        batch_output_conflict_message(output_dir, batch_id="batch-two")
+        == BATCH_OUTPUT_OWNED_MESSAGE
+    )
+    claim_batch_output_directory(output_dir, "batch-one")
+    with pytest.raises(BatchOutputOwnedByAnotherBatchError) as captured:
+        claim_batch_output_directory(output_dir, "batch-two")
+
+    assert str(captured.value) == BATCH_OUTPUT_OWNED_MESSAGE
+
+
+def test_competing_output_claims_have_one_winner_and_one_safe_conflict(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    barrier = Barrier(2)
+
+    def compete(batch_id: str) -> BaseException | None:
+        barrier.wait()
+        try:
+            claim_batch_output_directory(output_dir, batch_id)
+        except BaseException as error:
+            return error
+        return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(compete, ("batch-one", "batch-two")))
+
+    assert sum(result is None for result in results) == 1
+    conflict = next(result for result in results if result is not None)
+    assert isinstance(conflict, BatchOutputConflictError)
+    assert str(conflict) in {
+        BATCH_OUTPUT_OWNED_MESSAGE,
+        "该报告输出目录的批次归属标记无法验证；请选择新的空目录。",
+    }
+    assert "output" not in str(conflict).casefold()
+
+
+def test_corrupt_owner_is_a_static_explicit_conflict(tmp_path: Path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    owner = output_dir / f".{BATCH_SUMMARY_FILENAME}.owner"
+    owner.write_bytes(b"\xffprivate-path")
+
+    assert (
+        batch_output_conflict_message(output_dir, batch_id="existing-batch")
+        == BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE
+    )
+    with pytest.raises(BatchOutputOwnershipUnverifiableError) as captured:
+        claim_batch_output_directory(output_dir, "existing-batch")
+
+    assert str(captured.value) == BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE
+    assert "private-path" not in str(captured.value)

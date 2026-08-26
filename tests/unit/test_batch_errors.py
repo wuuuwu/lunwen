@@ -13,6 +13,14 @@ from paper_reviewer.application.batch_errors import (
     classify_batch_error,
     sanitize_batch_error_summary,
 )
+from paper_reviewer.application.batch_output import (
+    BATCH_OUTPUT_OWNED_MESSAGE,
+    BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE,
+    BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE,
+    BatchOutputOwnedByAnotherBatchError,
+    BatchOutputOwnershipUnverifiableError,
+    BatchOutputSummaryExistsError,
+)
 from paper_reviewer.application.orchestrator import SanitizedReviewError
 
 
@@ -127,6 +135,35 @@ def test_output_directory_context_disambiguates_generic_os_error(tmp_path: Path)
     result = classify_batch_error(error, context="output_directory")
     assert result.scope is BatchErrorScope.SHARED_PAUSE
     assert result.kind is BatchErrorKind.OUTPUT_DIRECTORY
+
+
+def test_output_conflicts_have_distinct_static_safe_classifications() -> None:
+    cases = (
+        (
+            BatchOutputOwnedByAnotherBatchError(),
+            BatchErrorKind.OUTPUT_DIRECTORY_OWNED,
+            BATCH_OUTPUT_OWNED_MESSAGE,
+        ),
+        (
+            BatchOutputSummaryExistsError(),
+            BatchErrorKind.OUTPUT_SUMMARY_EXISTS,
+            BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE,
+        ),
+        (
+            BatchOutputOwnershipUnverifiableError(),
+            BatchErrorKind.OUTPUT_OWNERSHIP_UNVERIFIABLE,
+            BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE,
+        ),
+    )
+
+    for error, expected_kind, expected_message in cases:
+        wrapped = RuntimeError("private output path and paper name")
+        wrapped.__cause__ = error
+        result = classify_batch_error(wrapped, context="output_directory")
+        assert result.scope is BatchErrorScope.SHARED_PAUSE
+        assert result.kind is expected_kind
+        assert result.summary == expected_message
+        assert "private output path" not in result.summary
 
 
 def test_batch_authorization_failure_is_shared_and_safely_classified() -> None:

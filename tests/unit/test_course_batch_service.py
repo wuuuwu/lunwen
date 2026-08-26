@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from paper_reviewer.application.batch_output import build_report_filename
+from paper_reviewer.application.batch_output import (
+    BATCH_SUMMARY_FILENAME,
+    BatchOutputConflictError,
+    BatchOutputOwnedByAnotherBatchError,
+    BatchOutputSummaryExistsError,
+    batch_output_conflict_message,
+    build_report_filename,
+    claim_batch_output_directory,
+)
 from paper_reviewer.application.batch_store import (
     BatchExecutionInProgressError,
     BatchStore,
@@ -191,6 +200,186 @@ async def test_create_batch_freezes_rubric_profile_provider_and_persists_manifes
     assert persisted.provider_snapshot.model == "gpt-test"
     assert persisted.summary_path is not None
     assert persisted.summary_path.name == "课程论文评测汇总.csv"
+
+
+@pytest.mark.asyncio
+async def test_create_batch_rejects_unowned_existing_summary_before_persisting(
+    tmp_path: Path,
+) -> None:
+    store = MemoryBatchStore()
+    service = _service(tmp_path, store)
+    request = _request(tmp_path)
+    (request.source_dir / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+    request.output_dir.mkdir()
+    (request.output_dir / BATCH_SUMMARY_FILENAME).write_bytes(b"previous summary")
+
+    with pytest.raises(BatchOutputSummaryExistsError):
+        await service.create_batch(request)
+
+    assert store.record is None
+    assert not service.paths.batches_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_create_batch_rejects_another_owner_before_persisting(
+    tmp_path: Path,
+) -> None:
+    store = MemoryBatchStore()
+    service = _service(tmp_path, store)
+    request = _request(tmp_path)
+    (request.source_dir / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+    request.output_dir.mkdir()
+    claim_batch_output_directory(request.output_dir, "previous-batch")
+
+    with pytest.raises(BatchOutputOwnedByAnotherBatchError):
+        await service.create_batch(request)
+
+    assert store.record is None
+    assert not service.paths.batches_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_competing_batch_creators_do_not_both_persist_the_same_output(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    (request.source_dir / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+    first_store = MemoryBatchStore()
+    second_store = MemoryBatchStore()
+    first_service = _service(tmp_path / "first-state", first_store)
+    second_service = _service(tmp_path / "second-state", second_store)
+
+    results = await asyncio.gather(
+        first_service.create_batch(request),
+        second_service.create_batch(request),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, BatchRecord) for result in results) == 1
+    conflict = next(result for result in results if isinstance(result, BaseException))
+    assert isinstance(conflict, BatchOutputConflictError)
+    assert sum(store.record is not None for store in (first_store, second_store)) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_batch_releases_claim_without_masking_store_failure(
+    tmp_path: Path,
+) -> None:
+    class FailingCreateStore(MemoryBatchStore):
+        def create(self, record: BatchRecord) -> None:
+            del record
+            raise RuntimeError("original persistence failure")
+
+    store = FailingCreateStore()
+    service = _service(tmp_path, store)
+    request = _request(tmp_path)
+    (request.source_dir / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+
+    with pytest.raises(RuntimeError, match="original persistence failure"):
+        await service.create_batch(request)
+
+    assert store.record is None
+    assert batch_output_conflict_message(request.output_dir) is None
+
+
+@pytest.mark.asyncio
+async def test_claim_cleanup_failure_does_not_mask_store_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingCreateStore(MemoryBatchStore):
+        def create(self, record: BatchRecord) -> None:
+            del record
+            raise RuntimeError("original persistence failure")
+
+    store = FailingCreateStore()
+    service = _service(tmp_path, store)
+    request = _request(tmp_path)
+    (request.source_dir / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+
+    def fail_cleanup(_output_dir: Path, _batch_id: str) -> None:
+        raise PermissionError("private output owner path")
+
+    monkeypatch.setattr(
+        "paper_reviewer.application.service.release_batch_output_directory_claim",
+        fail_cleanup,
+    )
+
+    with pytest.raises(RuntimeError, match="original persistence failure"):
+        await service.create_batch(request)
+
+    assert store.record is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_waits_for_manifest_before_preserving_claim(
+    tmp_path: Path,
+) -> None:
+    started = Event()
+    allow_finish = Event()
+
+    class BlockingCreateStore(MemoryBatchStore):
+        def create(self, record: BatchRecord) -> None:
+            started.set()
+            assert allow_finish.wait(timeout=5)
+            super().create(record)
+
+    store = BlockingCreateStore()
+    service = _service(tmp_path, store)
+    request = _request(tmp_path)
+    (request.source_dir / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+    creation = asyncio.create_task(service.create_batch(request))
+    assert await asyncio.to_thread(started.wait, 5)
+
+    creation.cancel()
+    await asyncio.sleep(0)
+    assert not creation.done()
+    assert batch_output_conflict_message(request.output_dir) is not None
+
+    allow_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await creation
+
+    assert store.record is not None
+    assert batch_output_conflict_message(request.output_dir) is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_waits_for_claim_and_manifest_as_one_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = Event()
+    allow_finish = Event()
+    store = MemoryBatchStore()
+    service = _service(tmp_path, store)
+    request = _request(tmp_path)
+    (request.source_dir / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+
+    def blocking_claim(output_dir: Path, batch_id: str) -> None:
+        claim_batch_output_directory(output_dir, batch_id)
+        started.set()
+        assert allow_finish.wait(timeout=5)
+
+    monkeypatch.setattr(
+        "paper_reviewer.application.service.claim_batch_output_directory",
+        blocking_claim,
+    )
+    creation = asyncio.create_task(service.create_batch(request))
+    assert await asyncio.to_thread(started.wait, 5)
+
+    creation.cancel()
+    await asyncio.sleep(0)
+    assert not creation.done()
+    assert store.record is None
+    assert batch_output_conflict_message(request.output_dir) is not None
+
+    allow_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await creation
+
+    assert store.record is not None
+    assert batch_output_conflict_message(request.output_dir) is not None
 
 
 @pytest.mark.asyncio

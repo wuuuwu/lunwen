@@ -29,8 +29,11 @@ from paper_reviewer.application.app_state import AppPaths, PreferencesStore, rea
 from paper_reviewer.application.artifacts import RunArtifactStore
 from paper_reviewer.application.batch_errors import classify_batch_error
 from paper_reviewer.application.batch_output import (
+    BATCH_SUMMARY_FILENAME,
     allocate_report_path,
     build_report_filename,
+    claim_batch_output_directory,
+    release_batch_output_directory_claim,
     write_batch_summary_csv,
 )
 from paper_reviewer.application.batch_store import (
@@ -533,8 +536,9 @@ class ReviewApplicationService:
             raise ValueError("所选 Provider 未配置 API Key。")
         await asyncio.to_thread(_ensure_batch_output_directory, request.output_dir)
         items = await asyncio.to_thread(scan_batch_sources, request)
+        batch_id = uuid.uuid4().hex
         record = BatchRecord(
-            batch_id=uuid.uuid4().hex,
+            batch_id=batch_id,
             request=request,
             rubric_snapshot=rubric,
             profile_snapshot=profile,
@@ -543,7 +547,10 @@ class ReviewApplicationService:
         )
         _ensure_batch_summary_path(record)
         store = self._batch_store()
-        await asyncio.to_thread(store.create, record)
+        # Claim and manifest persistence form one shielded thread operation.
+        # A cancellation can therefore leave either no claim and no manifest,
+        # or a matching claim and manifest, but never an orphaned owner marker.
+        await _persist_batch_with_output_claim(store, record)
         try:
             await asyncio.to_thread(_write_batch_csv, record)
         except Exception as error:
@@ -1756,6 +1763,52 @@ def _ensure_batch_output_directory(output_dir: Path) -> None:
     Path(temporary_name).unlink(missing_ok=True)
 
 
+async def _persist_batch_with_output_claim(store: BatchStore, record: BatchRecord) -> None:
+    """Wait for the indivisible claim-and-manifest operation to settle."""
+
+    operation = asyncio.create_task(
+        asyncio.to_thread(_claim_and_create_batch_manifest, store, record)
+    )
+    caller_cancelled = False
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # ``to_thread`` cannot be stopped.  Releasing ownership here could
+            # let another batch take the directory before this thread publishes
+            # its manifest, so wait through repeated cancellation requests.
+            caller_cancelled = True
+        except BaseException:
+            break
+
+    try:
+        operation.result()
+    except BaseException:
+        if caller_cancelled:
+            raise asyncio.CancelledError from None
+        raise
+    if caller_cancelled:
+        raise asyncio.CancelledError
+
+
+def _claim_and_create_batch_manifest(store: BatchStore, record: BatchRecord) -> None:
+    """Synchronously claim output ownership and publish the matching manifest."""
+
+    claim_batch_output_directory(record.request.output_dir, record.batch_id)
+    try:
+        store.create(record)
+    except BaseException:
+        # Cleanup must never hide the persistence failure.
+        try:
+            release_batch_output_directory_claim(
+                record.request.output_dir,
+                record.batch_id,
+            )
+        except OSError:
+            pass
+        raise
+
+
 def _require_batch_api_key(service: ReviewApplicationService, record: BatchRecord) -> None:
     if not service.providers.get_snapshot_api_key(record.provider_snapshot):
         raise ValueError("批次 Provider 的 API Key 不存在。")
@@ -1775,7 +1828,7 @@ def _ensure_batch_summary_path(record: BatchRecord) -> Path:
             record.request.output_dir, record.summary_path, suffix=".csv"
         )
     output_dir = record.request.output_dir.resolve(strict=False)
-    record.summary_path = output_dir / "课程论文评测汇总.csv"
+    record.summary_path = output_dir / BATCH_SUMMARY_FILENAME
     return record.summary_path
 
 

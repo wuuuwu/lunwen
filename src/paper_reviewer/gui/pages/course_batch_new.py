@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from paper_reviewer.application.app_state import GuiPreferences
+from paper_reviewer.application.batch_output import batch_output_conflict_message
 from paper_reviewer.application.models import RubricValidationResult
 from paper_reviewer.application.service import ReviewApplicationService
 from paper_reviewer.domain.batch import BatchReviewRequest
@@ -61,6 +62,8 @@ class CourseBatchNewPage(QWidget):
         self._setting_default_output = False
         self._output_was_edited = False
         self._default_output_source: Path | None = None
+        self._submitted_output_paths: set[str] = set()
+        self._visible_output_error = ""
         self._provider_catalog: list[ProviderDisplay] = []
         self._provider_catalog_error = ""
         self._source_paths: list[Path] = []
@@ -331,26 +334,40 @@ class CourseBatchNewPage(QWidget):
             if count
             else "选择论文文件夹后，将显示最低模型请求次数估算。"
         )
-        if (
-            source
-            and source.is_dir()
-            and not self._output_was_edited
-            and source != self._default_output_source
-        ):
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            default_output = source / f"课程论文评测报告_{timestamp}"
-            self._setting_default_output = True
-            self.output_picker.set_path(default_output)
-            self._setting_default_output = False
-            self._default_output_source = source
+        if source and source.is_dir() and not self._output_was_edited:
+            output = self.output_picker.path()
+            if (
+                source != self._default_output_source
+                or output is None
+                or _output_path_key(output) in self._submitted_output_paths
+                or output.exists()
+                or output.is_symlink()
+            ):
+                self._select_next_default_output(source)
         self._update_start_state()
 
     def _output_changed(self, _text: str = "") -> None:
         if not self._setting_default_output:
             self._output_was_edited = bool(self.output_picker.edit.text().strip())
-        error = _output_error(self.output_picker.path())
-        self.output_picker.set_invalid(error)
+            if not self._output_was_edited:
+                source = self.source_picker.path()
+                if source is not None and source.is_dir():
+                    self._select_next_default_output(source)
+                    return
         self._update_start_state()
+
+    def _select_next_default_output(self, source: Path) -> None:
+        default_output = _next_default_output(
+            source,
+            reserved_paths=self._submitted_output_paths,
+        )
+        self._setting_default_output = True
+        self._output_was_edited = False
+        try:
+            self.output_picker.set_path(default_output)
+        finally:
+            self._setting_default_output = False
+        self._default_output_source = source
 
     def _rubric_changed(self, text: str) -> None:
         path = Path(text.strip()) if text.strip() else None
@@ -463,7 +480,11 @@ class CourseBatchNewPage(QWidget):
 
     def _update_start_state(self, _value: object = None) -> None:
         source_error = _source_error(self.source_picker.path(), len(self._source_paths))
-        output_error = _output_error(self.output_picker.path())
+        output_error = _output_error(
+            self.output_picker.path(),
+            reserved_paths=self._submitted_output_paths,
+        )
+        self.output_picker.set_invalid(output_error)
         cloud_ok = self.cloud_processing_authorized.isChecked()
         non_classified_ok = self.non_classified_confirmation.isChecked()
         pii_ok = self.pii_output_confirmation.isChecked()
@@ -529,6 +550,18 @@ class CourseBatchNewPage(QWidget):
                 f"{self._provider_catalog_error}",
                 severity="danger",
             )
+        visible_output_error = output_error if self._output_was_edited else None
+        self._sync_visible_output_error(visible_output_error)
+
+    def _sync_visible_output_error(self, error: str | None) -> None:
+        if error:
+            self._visible_output_error = error
+            self.message.show_message(error, severity="danger")
+            return
+        previous = self._visible_output_error
+        self._visible_output_error = ""
+        if previous and self.message.message_label.text() == previous:
+            self.message.clear()
 
     def _missing_requirements(
         self,
@@ -598,7 +631,12 @@ class CourseBatchNewPage(QWidget):
             pii_output_authorized=True,
             external_search=self.external_search.isChecked(),
         )
+        self._submitted_output_paths.add(_output_path_key(output))
         self.start_requested.emit(request)
+        if self._output_was_edited:
+            self._update_start_state()
+        else:
+            self._select_next_default_output(source)
 
     def _set_tab_order(self) -> None:
         controls = [
@@ -662,14 +700,55 @@ def _source_error(source: Path | None, count: int) -> str | None:
     return None
 
 
-def _output_error(output: Path | None) -> str | None:
+def _output_error(
+    output: Path | None,
+    *,
+    reserved_paths: set[str] | None = None,
+) -> str | None:
     if output is None:
         return "请选择批次报告输出目录"
+    if reserved_paths and _output_path_key(output) in reserved_paths:
+        return (
+            "该输出目录刚刚已提交给一个新批次。"
+            "请选择新的输出目录，或前往批次记录继续原批次。"
+        )
     if output.exists():
         if not output.is_dir():
             return "输出路径已存在且不是文件夹"
-        return None if os.access(output, os.W_OK) else "输出目录不可写"
+        if not os.access(output, os.W_OK):
+            return "输出目录不可写"
+        conflict = batch_output_conflict_message(output)
+        if conflict:
+            return (
+                f"{conflict}"
+                "如需使用原有结果，请前往批次记录继续原批次。"
+            )
+        return None
     parent = output.parent
     if not parent.is_dir():
         return "输出目录的上级文件夹不存在"
     return None if os.access(parent, os.W_OK) else "输出目录的上级文件夹不可写"
+
+
+def _next_default_output(source: Path, *, reserved_paths: set[str]) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = f"课程论文评测报告_{timestamp}"
+    sequence = 1
+    while True:
+        suffix = "" if sequence == 1 else f"_{sequence}"
+        candidate = source / f"{base_name}{suffix}"
+        if (
+            _output_path_key(candidate) not in reserved_paths
+            and not candidate.exists()
+            and not candidate.is_symlink()
+        ):
+            return candidate
+        sequence += 1
+
+
+def _output_path_key(path: Path) -> str:
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        resolved = path.absolute()
+    return os.path.normcase(str(resolved))

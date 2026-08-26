@@ -21,6 +21,15 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from paper_reviewer.application.batch_output import (
+    BATCH_OUTPUT_OWNED_MESSAGE,
+    BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE,
+    BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE,
+    BatchOutputOwnedByAnotherBatchError,
+    BatchOutputOwnershipUnverifiableError,
+    BatchOutputSummaryExistsError,
+)
+
 
 class BatchErrorScope(StrEnum):
     """What the batch coordinator should do after a failure."""
@@ -43,6 +52,9 @@ class BatchErrorKind(StrEnum):
     NETWORK = "network"
     TIMEOUT = "timeout"
     OUTPUT_DIRECTORY = "output_directory"
+    OUTPUT_DIRECTORY_OWNED = "output_directory_owned"
+    OUTPUT_OWNERSHIP_UNVERIFIABLE = "output_ownership_unverifiable"
+    OUTPUT_SUMMARY_EXISTS = "output_summary_exists"
     DATABASE = "database"
     PDF_PARSE = "pdf_parse"
     PDF_CORRUPT = "pdf_corrupt"
@@ -99,6 +111,11 @@ _SUMMARY: Mapping[BatchErrorKind, str] = {
     BatchErrorKind.NETWORK: "无法连接 Provider 或外部服务；批次已暂停。",
     BatchErrorKind.TIMEOUT: "Provider 或外部服务请求超时；批次已暂停。",
     BatchErrorKind.OUTPUT_DIRECTORY: "报告输出目录不可写或不可用；批次已暂停。",
+    BatchErrorKind.OUTPUT_DIRECTORY_OWNED: BATCH_OUTPUT_OWNED_MESSAGE,
+    BatchErrorKind.OUTPUT_OWNERSHIP_UNVERIFIABLE: (
+        BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE
+    ),
+    BatchErrorKind.OUTPUT_SUMMARY_EXISTS: BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE,
     BatchErrorKind.DATABASE: "本地数据库连接或写入失败；批次已暂停。",
     BatchErrorKind.PDF_PARSE: "该论文 PDF 无法解析；已记录为单篇失败。",
     BatchErrorKind.PDF_CORRUPT: "该论文 PDF 可能已损坏或不受支持；已记录为单篇失败。",
@@ -182,6 +199,13 @@ def classify_batch_error(
     names = _names(error_chain)
     safe_codes = _safe_codes(error_chain)
     safe_params = _safe_params(error_chain)
+
+    if any(isinstance(item, BatchOutputOwnedByAnotherBatchError) for item in error_chain):
+        return _result(BatchErrorKind.OUTPUT_DIRECTORY_OWNED)
+    if any(isinstance(item, BatchOutputOwnershipUnverifiableError) for item in error_chain):
+        return _result(BatchErrorKind.OUTPUT_OWNERSHIP_UNVERIFIABLE)
+    if any(isinstance(item, BatchOutputSummaryExistsError) for item in error_chain):
+        return _result(BatchErrorKind.OUTPUT_SUMMARY_EXISTS)
 
     # HTTP status is more reliable than a provider's free-form body.  Do not
     # inspect or stringify response bodies: only this integer is retained.
@@ -275,6 +299,9 @@ def _result(kind: BatchErrorKind, *, suffix: str = "") -> BatchFailure:
             BatchErrorKind.NETWORK,
             BatchErrorKind.TIMEOUT,
             BatchErrorKind.OUTPUT_DIRECTORY,
+            BatchErrorKind.OUTPUT_DIRECTORY_OWNED,
+            BatchErrorKind.OUTPUT_OWNERSHIP_UNVERIFIABLE,
+            BatchErrorKind.OUTPUT_SUMMARY_EXISTS,
             BatchErrorKind.DATABASE,
         }
         else BatchErrorScope.ITEM_FAILURE
