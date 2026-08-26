@@ -1,117 +1,153 @@
-# Paper Reviewer
+# Course Paper Reviewer（课程论文批量评测版）
 
-Paper Reviewer is a Python 3.12 harness for evidence-grounded academic paper review. It uses a
-deterministic workflow around bounded LLM reviewers. Models make semantic judgments; Python code
-controls state, tools, budgets, validation, persistence, and reporting.
+Course Paper Reviewer 是面向普通课程论文的 Windows 桌面评测工具。它使用课程 Rubric、
+有边界的多 Reviewer Agent 和确定性程序校验，为一个文件夹中的 PDF 依次生成课程评分、
+改进意见、个人报告及汇总表。
 
-## Current capabilities
+本分支为独立课程版：`codex/course-paper-reviewer`。本科毕业论文抽检版完整保留在
+`main`，课程版不会覆盖或合并其用户数据、配置和凭据。
 
-- Searchable-PDF ingestion with stable page/block references
-- Validated, versioned YAML rubrics and reviewer profiles
-- OpenAI and DeepSeek through a common provider boundary
-- Five specialist reviewers, an isolated 3+2 expert panel, and a summary-only meta-reviewer
-- Allow-listed paper, scholarly-evidence, and live `web_search` tools
-- Zero-key DDGS metasearch plus OpenAlex, Crossref, and arXiv with graceful degradation
-- Automatic bibliography verification with stable evidence IDs and explicit human-check warnings
-- SQLite checkpoints and resumable runs
-- Markdown, JSON, evidence, and run-summary artifacts
-- Zhejiang undergraduate-thesis Schema v2 with nine discrete 0-4 diagnostic ratings
-- Human confirmation gates for political-direction and academic-integrity suspicions
-- Deterministic AI-assisted risk decisions that remain separate from the experimental score
-- Legacy Schema v1 and unscored-task compatibility
-- A native PySide6 Fluent 2 desktop app with dynamic rubric/report rendering
-- Windows Credential Manager integration for provider keys
+## 适用范围
 
-## Install
+- 按当前课程的任务和评价标准评测普通课程论文，不考察学生所属专业的培养目标或专业深度。
+- 创建批次时不要求填写专业名称；专业只作为自动提取的本地元数据，用于报告和汇总表。
+- 扫描所选文件夹顶层的 `1–100` 个 PDF，不递归读取子目录，并按文件名顺序逐篇评测。
+- 支持停止、从检查点继续，以及只重试失败论文；已完成论文不会重复调用模型。
+- 自动提取姓名、学号、专业和题目，低置信度或缺失字段可在批次详情中人工修正。
+- 评分 Reviewer 和 Meta Reviewer 不接收姓名、学号、专业或原始文件路径；专用元数据提取步骤
+  仍可能通过所选云端模型处理封面内容，因此开始前必须确认处理授权和非涉密属性。
+- 每篇生成固定格式的 PDF 报告，并生成 UTF-8 BOM 编码的
+  `课程论文评测汇总.csv`，方便用 Excel 打开。
+
+## 默认评分规则
+
+内置实验 Rubric 为 `configs/rubrics/course_paper_v1.yaml`：
+
+| 评价维度 | 权重 |
+| --- | ---: |
+| 课程任务完成度 | 25% |
+| 课程知识理解与运用 | 25% |
+| 论证与证据 | 20% |
+| 结构与逻辑 | 15% |
+| 文字表达 | 10% |
+| 引用格式规范 | 5% |
+
+每项采用百分制五级锚点：`0–39` 核心任务明显缺失、`40–59` 完成不足、
+`60–74` 达到基本要求、`75–89` 良好、`90–100` 优秀。总分按权重计算，
+默认 `60` 分为“达到基本要求”的课程结论边界。
+
+这是一套适当放宽的通用课程模板，不是所有课程的正式评分标准。正式使用前，教师应根据
+课程大纲、作业要求和教学目标检查或替换 Rubric；不得仅凭 AI 结果直接形成学生正式成绩。
+
+## 直接使用 Windows 便携版
+
+1. 解压整个 `CoursePaperReviewer-portable.zip`，不要只复制其中的 EXE。
+2. 双击 `CoursePaperReviewer\CoursePaperReviewer.exe`。
+3. 在“设置”中配置 Provider、模型和 API Key，也可以先运行兼容性测试。
+4. 在“新建批次”中选择论文文件夹和输出目录，确认云端处理授权、非涉密及个人信息输出风险。
+5. 检查扫描预览和课程 Rubric 后，点击“开始批量评测”。
+6. 在“批次记录/批次详情”中查看进度、停止、继续、重试失败项或修正元数据。
+
+课程批量流程目前只在桌面端提供，不新增 CLI 批量命令。
+
+### 批次输出
+
+默认报告名为：
+
+```text
+姓名_学号_专业_题目_课程论文评测报告.pdf
+```
+
+文件名会自动清理 Windows 非法字符并限制长度。若元数据未识别，则使用明确占位文字；若出现
+重名，程序会追加稳定短标识，绝不覆盖已有报告。输出目录同时包含：
+
+```text
+课程论文评测汇总.csv
+```
+
+汇总表包含原文件名、姓名、学号、专业、题目、元数据核对提示、各维度分数、总分、等级、
+结论、状态、报告文件名和脱敏错误摘要。以 `= + - @` 开头的单元格会被安全转义，避免公式注入。
+
+## Provider 与数据隔离
+
+课程版支持 OpenAI Chat Completions、OpenAI Responses、DeepSeek 和 OpenAI-compatible
+自定义 Provider。自定义 Provider 的协议在创建时固定为 Chat Completions 或 Responses。
+
+首次启动且课程版尚无配置时，程序会自动尝试一次从本机论文版只读复制 Provider 目录和
+Windows Credential Manager 凭据。复制完成后两套产品完全独立，后续修改互不影响。课程版不会从
+`OPENAI_API_KEY` 或 `DEEPSEEK_API_KEY` 环境变量回退读取密钥。
+
+运行数据位于：
+
+```text
+%LOCALAPPDATA%\CoursePaperReviewer\CoursePaperReviewer\
+├─ data\       SQLite 数据库
+├─ runs\       单篇任务、检查点和规范报告
+├─ batches\    批次清单与恢复状态
+├─ logs\       course-paper-reviewer.log
+└─ config\     非秘密偏好和 Provider 目录
+```
+
+API Key 存放在 Windows Credential Manager 的 `CoursePaperReviewer` 服务命名空间中，
+不会写入批次清单、数据库、Trace、报告或日志。用户选择的批次输出目录会包含学生个人信息，
+应按学校的数据管理要求保存、传输和备份。
+
+## 开发环境
+
+要求 Python `3.12`（项目声明兼容 `>=3.12,<3.15`）。推荐使用项目虚拟环境：
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\python -m pip install uv
-.\.venv\Scripts\uv sync --extra dev
+.\.venv\Scripts\python.exe -m pip install uv
+.\.venv\Scripts\uv.exe sync --extra dev
 ```
 
-Copy `.env.example` to `.env` and set at least one provider key.
-
-## Use
+启动课程桌面端：
 
 ```powershell
-.\.venv\Scripts\paper-review init
-.\.venv\Scripts\paper-review doctor
-.\.venv\Scripts\paper-review rubric validate configs/rubrics/zhejiang_undergraduate_thesis_v2.yaml
-.\.venv\Scripts\paper-review profile validate configs/review_profiles/zhejiang_undergraduate_specialists_v1.yaml
-
-.\.venv\Scripts\paper-review run paper.pdf `
-  --provider openai `
-  --model YOUR_MODEL_NAME `
-  --discipline-name "计算机科学与技术" `
-  --allow-cloud-processing `
-  --non-classified
+.\.venv\Scripts\course-paper-review-app.exe
 ```
 
-Resume a failed or interrupted run:
+质量检查：
 
 ```powershell
-.\.venv\Scripts\paper-review resume RUN_ID
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m mypy src
+.\.venv\Scripts\python.exe -m pytest
 ```
 
-The default v2 rubric produces an experimental diagnostic score and an independent risk review.
-It has no passing score. It is an AI-assisted pre-review tool, not an official Zhejiang Education
-Department inspection result, and it has not completed educational-measurement validity testing.
-It must not be used for automatic discipline, degree decisions, or official inspection findings.
-The legacy unscored v1 rubric remains available at `configs/rubrics/unscored_draft.yaml`.
-
-When external search is enabled, the harness automatically extracts detected bibliography entries,
-checks DOI/title/year matches across DDGS and scholarly indexes, and writes
-`reference-checks.json` beside the report. Verified matches become citable evidence. Probable,
-conflicting, unavailable, or missing matches are retained as report warnings that explicitly request
-manual checking; a search outage does not fail the whole review. DDGS needs no API key but sends
-queries to public search engines, so disable external search for offline or network-restricted runs.
-
-## Desktop app
-
-Start the Chinese PySide6 desktop client during development:
+## 构建便携版
 
 ```powershell
-.\.venv\Scripts\paper-review-app.exe
+.\scripts\build_course_portable.ps1
 ```
 
-The client stores its SQLite database, reports, logs, and non-secret preferences under
-`%LOCALAPPDATA%\PaperReviewer\PaperReviewer`. OpenAI and DeepSeek API keys are stored through Windows Credential
-Manager. Rubric dimensions, anchors, hard rules, scores, and report findings are rendered from the
-selected YAML/report data rather than hard-coded in the interface.
-
-The “添加查重/学术不端检测报告” control is intentionally a placeholder in this release. It does
-not open a file picker and no detection-report path or content is stored, traced, or sent to a
-model. Teachers may record the result of an offline check in the structured human-review reason.
-
-Completed reports can be exported from the report page as the canonical Markdown file or as a
-searchable, white-background A4 PDF. PDF generation is fully local and does not call an LLM or load
-external images. The last successful export directory is remembered for the next save operation.
-
-Open the development-only Fluent control gallery:
-
-```powershell
-.\.venv\Scripts\paper-review-gallery.exe
-```
-
-Build the portable Windows directory and ZIP:
-
-```powershell
-.\scripts\build_portable.ps1
-```
-
-The executable is written to `dist\PaperReviewer\PaperReviewer.exe`; Python does not need to be
-installed on the target computer.
-
-## Architecture
-
-The package follows a ports-and-adapters layout:
+脚本会构建 onedir 便携目录，依次运行凭据、SQLite、资源、Markdown/PDF、课程 Rubric/Profile、
+批量命名/CSV 和 Qt GUI 启动自检，然后生成：
 
 ```text
-CLI -> application services -> pure domain models
-             |                       ^
-             v                       |
-            ports <- infrastructure adapters
+dist-course\CoursePaperReviewer\CoursePaperReviewer.exe
+dist-course\CoursePaperReviewer-portable.zip
 ```
 
-See `docs/architecture.md` and `docs/rubric-spec.md` for extension contracts.
+目标 Windows 10/11 计算机无需安装 Python。`build-course/` 和 `dist-course/` 是本地构建产物，
+不会提交到 Git。
+
+## 文档与架构
+
+- [课程版完整使用与交付指南](docs/delivery/COURSE_EDITION_GUIDE.md)
+- [开发维护指南](docs/delivery/DEVELOPER_GUIDE.md)
+- [常见报错对照](docs/delivery/TROUBLESHOOTING.md)
+- [基础项目架构](docs/architecture.md)
+- [Rubric 扩展规范](docs/rubric-spec.md)
+
+底层仍采用 ports-and-adapters 架构：模型负责语义判断，Python Harness 负责工具权限、预算、
+证据校验、状态、检查点、批次调度、持久化和报告生成。
+
+## 重要声明
+
+- 本工具输出是课程论文评分辅助，不自动成为教师正式成绩。
+- 通用 Rubric 版本为 `0.1.0-experimental`，尚未完成具体课程的教育测量效度验证。
+- 系统不自动认定抄袭、代写或其他学术不端，也不读取学校查重报告。
+- 扫描件、加密或损坏 PDF、无法抽取文字的 PDF 可能无法评测，需要先转换为可搜索文本 PDF。
+- 云端 Provider 会接收完成评测所需的论文内容；涉密、无授权或不允许上传的材料不得使用。

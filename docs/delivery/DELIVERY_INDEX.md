@@ -2,6 +2,10 @@
 
 > 本索引是本项目交付材料的统一入口。构建源码提交、构建和测试结果已回填；发布判定仍受验收报告中未执行项目的限制。
 
+> **课程论文批量评测分支提示：** 当前位于 `codex/course-paper-reviewer` 时，请先阅读
+> [COURSE_EDITION_GUIDE.md](COURSE_EDITION_GUIDE.md)。本索引其余章节记录的是 `main` 分支的
+> 本科毕业论文抽检版交付基线；课程版的功能边界、EXE/ZIP、哈希和 420 项测试结果以课程指南为准。
+
 ## 1. 项目身份
 
 | 项目 | 内容 |
@@ -19,13 +23,14 @@
 
 ## 2. 推荐阅读顺序
 
-1. [USER_GUIDE.md](USER_GUIDE.md)：普通用户的安装、配置、评测、恢复、人工复核和报告导出说明。
-2. [TROUBLESHOOTING.md](TROUBLESHOOTING.md)：常见界面提示、API、PDF、Rubric、恢复和导出问题的处理方法。
-3. [PROJECT_REPORT.md](PROJECT_REPORT.md)：项目目标、评分模型、Agent/Harness 架构、数据流、安全边界和限制。
-4. [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)：后续开发、调试、扩展 Rubric/Provider 和 GUI 的约束。
-5. [BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md)：PyInstaller 构建、便携 ZIP、四项自检和发布检查。
-6. [TEST_ACCEPTANCE_REPORT.md](TEST_ACCEPTANCE_REPORT.md)：最终环境、命令、通过数量、未执行项目和发布结论。
-7. [RELEASE_NOTES.md](RELEASE_NOTES.md)：版本变化、兼容性和升级注意事项。
+1. [COURSE_EDITION_GUIDE.md](COURSE_EDITION_GUIDE.md)：课程版用户的批量评测、匿名化、恢复、输出、构建和验收说明。
+2. [USER_GUIDE.md](USER_GUIDE.md)：论文抽检版普通用户的安装、配置、评测、恢复、人工复核和报告导出说明。
+3. [TROUBLESHOOTING.md](TROUBLESHOOTING.md)：常见界面提示、API、PDF、Rubric、恢复和导出问题的处理方法。
+4. [PROJECT_REPORT.md](PROJECT_REPORT.md)：项目目标、评分模型、Agent/Harness 架构、数据流、安全边界和限制。
+5. [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)：后续开发、调试、扩展 Rubric/Provider 和 GUI 的约束。
+6. [BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md)：PyInstaller 构建、便携 ZIP、四项自检和发布检查。
+7. [TEST_ACCEPTANCE_REPORT.md](TEST_ACCEPTANCE_REPORT.md)：论文抽检版最终环境、通过数量和发布结论。
+8. [RELEASE_NOTES.md](RELEASE_NOTES.md)：论文抽检版变化、兼容性和升级注意事项。
 
 ## 3. 交付件清单
 
@@ -54,6 +59,7 @@
 
 | 文档 | 用途 |
 | --- | --- |
+| [COURSE_EDITION_GUIDE.md](COURSE_EDITION_GUIDE.md) | 独立课程论文批量评测版使用、交付与维护指南 |
 | [PROJECT_REPORT.md](PROJECT_REPORT.md) | 技术项目报告与架构说明 |
 | [USER_GUIDE.md](USER_GUIDE.md) | 用户操作说明 |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | 常见问题与报错对应 |
