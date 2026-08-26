@@ -146,6 +146,8 @@ Base URL、API Key 和默认模型；程序不会自动追加 `/v1`。远程端�
 
 - 选择一个有写入权限、路径不过长的目录。
 - 不要让两个批次同时占用同一个 `课程论文评测汇总.csv`。
+- 每次提交后，系统会为自动建议路径轮换到新的唯一目录；同一秒重复提交会追加数字后缀。
+- 手工选择已有汇总表或批次归属标记的旧目录时，开始按钮会禁用，并提示选择新目录或继续原批次。
 - 输出包含学生个人信息，应限制访问权限并按学校政策保存。
 - 不建议将实时同步盘或不稳定网络盘作为正在运行的输出目录。
 
@@ -253,6 +255,7 @@ Rubric 动态生成。CSV 原子更新，并对可能触发电子表格公式的
 | 源文件已变化 | 创建批次后修改或替换 PDF | 恢复原文件，或为新文件创建新批次 | 旧检查点不会错误套用 |
 | 单篇失败但后续继续 | 单篇内容或单篇输出问题 | 批次结束后“只重试失败项” | 其他项保留 |
 | 整批暂停 | Provider、数据库、输出目录等共享故障 | 修复共享原因后点击“继续批次” | 保留 |
+| 输出目录已属于另一批次 | 手工复用了已有汇总表的目录 | 到“批次记录”继续原批次，或选择新的空目录重新创建 | 原批次保留；不会创建新的无效批次 |
 | 输出目录权限失败 | 无写权限、路径过长或文件被占用 | 释放文件、缩短路径并确保权限 | 保留 |
 | 元数据不准确 | 封面不规范或证据置信度低 | 在批次详情点击“修改提取信息” | 不重新评分 |
 | EXE 无法启动 | 只复制了 EXE 或冻结资源缺失 | 重新解压完整 ZIP 并核验哈希 | 用户数据通常保留 |
@@ -302,8 +305,8 @@ Credential Manager 中的 API Key 不包含在文件备份里，迁移电脑后�
 
 | 交付件 | 相对路径 | 字节数 | SHA-256 |
 | --- | --- | ---: | --- |
-| EXE | `dist-course/CoursePaperReviewer/CoursePaperReviewer.exe` | 17,091,730 | `5D5A4BF76781645CED3B55D9C56E03517BF27B8D72458DF297AEA9721E8D58B2` |
-| 便携 ZIP | `dist-course/CoursePaperReviewer-portable.zip` | 93,101,232 | `DD5D0BD45B8D560159092E3D0752A66B8985F8243B9050D370C4DF07A2E3FB43` |
+| EXE | `dist-course-fixed/CoursePaperReviewer/CoursePaperReviewer.exe` | 17,096,922 | `7A98EB651FA0824C14548C0BB5368D37203ABB5FFD0972592BAD9A453DC345B5` |
+| 便携 ZIP | `dist-course-fixed/CoursePaperReviewer-portable.zip` | 95,349,501 | `CC56AC8C56925EC2B62D177F2C0DC52CE0AF9DAD846B9E2BBAEF14EA06E90A6E` |
 
 发布时应分发整个 ZIP；Git 不跟踪 `build-course/` 或 `dist-course/`。
 
@@ -314,7 +317,7 @@ Credential Manager 中的 API Key 不包含在文件备份里，迁移电脑后�
 ```text
 Ruff: All checks passed
 mypy: Success: no issues found in 114 source files
-pytest: 420 passed in 135.00s
+pytest: 436 passed in 179.19s
 git diff --check: clean（仅 Git 的 CRLF 转换提示）
 ```
 
