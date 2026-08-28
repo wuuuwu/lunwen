@@ -32,6 +32,7 @@ _FONT_CANDIDATES = (
     "Hiragino Sans GB",
     "Songti SC",
     "Heiti SC",
+    "Noto Sans CJK SC",
     "Microsoft YaHei UI",
     "Microsoft YaHei",
     "SimSun",
