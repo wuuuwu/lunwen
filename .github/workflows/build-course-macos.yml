@@ -31,11 +31,12 @@ jobs:
         run: test "$(uname -m)" = "arm64"
       - name: Install dependencies
         run: uv sync --extra dev
-      - name: Run quality checks
-        run: |
-          uv run ruff check .
-          uv run mypy src
-          uv run pytest tests/unit/test_course_packaging.py tests/unit/test_report_export.py
+      - name: Run Ruff
+        run: uv run ruff check .
+      - name: Run mypy
+        run: uv run mypy src
+      - name: Run macOS packaging tests
+        run: uv run pytest tests/unit/test_course_packaging.py tests/unit/test_report_export.py
       - name: Build and self-test app bundle
         run: ./scripts/build_course_macos.sh
       - name: Upload ad-hoc-signed test build
