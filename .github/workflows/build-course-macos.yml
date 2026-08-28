@@ -60,7 +60,7 @@ jobs:
           build_status=${PIPESTATUS[0]}
           set -e
           if [[ "$build_status" -ne 0 ]]; then
-            uv run python -c 'from pathlib import Path; text = Path("build-course-macos.log").read_text(encoding="utf-8")[-12000:]; escaped = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print(f"::error title=macOS app build::{escaped}")'
+            uv run python -c 'from pathlib import Path; text = Path("build-course-macos.log").read_text(encoding="utf-8")[-4000:]; escaped = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print(f"::error title=macOS app build::{escaped}")'
             exit "$build_status"
           fi
       - name: Upload ad-hoc-signed test build
