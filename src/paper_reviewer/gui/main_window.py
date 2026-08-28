@@ -244,6 +244,7 @@ class MainWindow(QMainWindow):
             self.service,
             self.preferences,
             self.icons,
+            operation_registry=self._operation_registry,
             profile_path=course_profile,
             default_rubric_path=course_rubric,
         )

@@ -151,6 +151,7 @@ dist-course\CoursePaperReviewer-portable.zip
 - [常见报错对照](docs/delivery/TROUBLESHOOTING.md)
 - [基础项目架构](docs/architecture.md)
 - [Rubric 扩展规范](docs/rubric-spec.md)
+- [AI 评价方案生成器](docs/rubric-generator.md)
 
 底层仍采用 ports-and-adapters 架构：模型负责语义判断，Python Harness 负责工具权限、预算、
 证据校验、状态、检查点、批次调度、持久化和报告生成。

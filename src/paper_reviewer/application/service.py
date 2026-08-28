@@ -82,6 +82,11 @@ from paper_reviewer.application.providers import (
     validate_provider_snapshot_identity,
 )
 from paper_reviewer.application.review_planner import build_review_plan
+from paper_reviewer.application.rubric_generator import (
+    RubricPackageStore,
+    generate_rubric_with_model,
+    resolve_companion_profile,
+)
 from paper_reviewer.application.run_events import RunEventView, project_run_event
 from paper_reviewer.application.state_machine import transition
 from paper_reviewer.application.unit_of_work import ApplicationUnitOfWork
@@ -115,6 +120,11 @@ from paper_reviewer.domain.review import (
     PanelOutcome,
 )
 from paper_reviewer.domain.rubric import RubricProfile
+from paper_reviewer.domain.rubric_generation import (
+    RubricGenerationRequest,
+    RubricGenerationResult,
+    SavedRubricPackage,
+)
 from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.domain.submission import SubmissionMetadata
 from paper_reviewer.ports.model import Message, ModelRequest, ToolSpec
@@ -453,6 +463,110 @@ class ReviewApplicationService:
             weight_total=weight_total,
             profile_compatible=profile_compatible,
         )
+
+    def resolve_profile_for_rubric(
+        self,
+        rubric_path: Path,
+        *,
+        fallback_profile_path: Path,
+    ) -> Path:
+        """Resolve a generated Rubric's verified companion profile or a bundled fallback."""
+
+        return resolve_companion_profile(rubric_path) or fallback_profile_path
+
+    def list_rubric_packages(self) -> list[SavedRubricPackage]:
+        return self._rubric_package_store().list()
+
+    def save_rubric_generation(
+        self,
+        result: RubricGenerationResult,
+        *,
+        provider_ref: str = "",
+        model: str = "",
+        parent_package_id: str | None = None,
+    ) -> SavedRubricPackage:
+        return self._rubric_package_store().save(
+            result,
+            provider_ref=provider_ref,
+            model=model,
+            parent_package_id=parent_package_id,
+        )
+
+    async def generate_rubric(
+        self,
+        request: RubricGenerationRequest,
+        *,
+        provider_ref: str,
+        model: str,
+    ) -> RubricGenerationResult:
+        return await self._run_rubric_generator(
+            request,
+            provider_ref=provider_ref,
+            model=model,
+        )
+
+    async def revise_rubric(
+        self,
+        current: RubricGenerationResult,
+        instruction: str,
+        *,
+        provider_ref: str,
+        model: str,
+    ) -> RubricGenerationResult:
+        if not instruction.strip():
+            raise ValueError("请填写希望调整的内容。")
+        return await self._run_rubric_generator(
+            current.request,
+            provider_ref=provider_ref,
+            model=model,
+            current=current,
+            revision_instruction=instruction.strip(),
+        )
+
+    async def _run_rubric_generator(
+        self,
+        request: RubricGenerationRequest,
+        *,
+        provider_ref: str,
+        model: str,
+        current: RubricGenerationResult | None = None,
+        revision_instruction: str = "",
+    ) -> RubricGenerationResult:
+        connection = self.providers.resolve(provider_ref)
+        selected_model = model.strip()
+        if not selected_model:
+            raise ValueError("模型名称不能为空。")
+        api_key = self.providers.get_api_key(provider_ref)
+        if not api_key:
+            raise ValueError("所选 Provider 尚未配置 API Key。")
+        adapter = create_model_adapter(
+            provider_ref,
+            selected_model,
+            api_key=api_key,
+            protocol=connection.protocol,
+            base_url=connection.base_url,
+            timeout=self.settings.request_timeout_seconds,
+        )
+        trace_id = f"rubric-design:{uuid.uuid4().hex}"
+        try:
+            async with asyncio.timeout(self.settings.request_timeout_seconds * 3):
+                return await generate_rubric_with_model(
+                    model=adapter,
+                    request=request,
+                    trace_id=trace_id,
+                    current_draft=current.draft if current is not None else None,
+                    revision_instruction=revision_instruction,
+                    max_repairs=self.settings.max_output_repairs,
+                )
+        except ValueError:
+            raise
+        except Exception as error:
+            raise ValueError(_sanitize_provider_error(error, secrets=(api_key,))) from error
+        finally:
+            await adapter.close()
+
+    def _rubric_package_store(self) -> RubricPackageStore:
+        return RubricPackageStore(self.paths.config_dir / "rubric_packages")
 
     async def start_review(
         self, request: ReviewRequest, *, event_sink: EventSink | None = None

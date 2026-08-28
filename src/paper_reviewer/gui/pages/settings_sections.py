@@ -680,9 +680,13 @@ class PreferencesSettingsMixin:
                 self.default_rubric.set_invalid(message)
                 self.message.show_message(message, severity="danger")
                 return
-            validation = self.service.validate_rubric(
-                rubric, profile_path=self.profile_path
+            resolver = getattr(self.service, "resolve_profile_for_rubric", None)
+            profile_path = (
+                resolver(rubric, fallback_profile_path=self.profile_path)
+                if callable(resolver)
+                else self.profile_path
             )
+            validation = self.service.validate_rubric(rubric, profile_path=profile_path)
             if not validation.valid:
                 message = "；".join(validation.errors)
                 self.default_rubric.set_invalid(message)

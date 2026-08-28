@@ -20,11 +20,13 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from yaml import YAMLError
 
 from paper_reviewer.application.app_state import GuiPreferences
 from paper_reviewer.application.batch_output import batch_output_conflict_message
 from paper_reviewer.application.models import RubricValidationResult
 from paper_reviewer.application.service import ReviewApplicationService
+from paper_reviewer.config import load_review_profile
 from paper_reviewer.domain.batch import BatchReviewRequest
 from paper_reviewer.gui.batch_models import BatchSourcePreviewModel
 from paper_reviewer.gui.icons import FluentIconService
@@ -68,10 +70,11 @@ class CourseBatchNewPage(QWidget):
         self._provider_catalog_error = ""
         self._source_paths: list[Path] = []
         self.validation: RubricValidationResult | None = None
-        self.profile_path = _course_config_path(
+        self.default_profile_path = _course_config_path(
             "course_paper_reviewers_v1.yaml",
             "configs/review_profiles/course_paper_reviewers_v1.yaml",
         )
+        self.profile_path = self.default_profile_path
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -327,13 +330,7 @@ class CourseBatchNewPage(QWidget):
             self.scan_summary.setAccessibleDescription(
                 f"扫描成功，共 {count} 篇课程论文，不包含子目录。"
             )
-        count = len(self._source_paths)
-        self.request_estimate.setText(
-            f"最低约 {count * 5} 次模型请求：每篇至少 1 次信息提取、"
-            "3 次专项评阅和 1 次汇总；工具轮次可能增加实际请求。"
-            if count
-            else "选择论文文件夹后，将显示最低模型请求次数估算。"
-        )
+        self._update_request_estimate()
         if source and source.is_dir() and not self._output_was_edited:
             output = self.output_picker.path()
             if (
@@ -381,6 +378,8 @@ class CourseBatchNewPage(QWidget):
             self.message.show_message(message, severity="danger")
             self._update_start_state()
             return
+        self.profile_path = self._profile_for_rubric(path)
+        self._update_request_estimate()
         result = self.service.validate_rubric(path, profile_path=self.profile_path)
         rubric = result.rubric
         if result.valid and getattr(rubric, "evaluation_mode", None) != "course_assessment":
@@ -405,6 +404,29 @@ class CourseBatchNewPage(QWidget):
             self.rubric_picker.set_invalid(message)
             self.message.show_message(message, severity="danger")
         self._update_start_state()
+
+    def _profile_for_rubric(self, path: Path) -> Path:
+        resolver = getattr(self.service, "resolve_profile_for_rubric", None)
+        if callable(resolver):
+            return Path(resolver(path, fallback_profile_path=self.default_profile_path))
+        return self.default_profile_path
+
+    def _update_request_estimate(self) -> None:
+        count = len(self._source_paths)
+        if not count:
+            self.request_estimate.setText(
+                "选择论文文件夹后，将显示最低模型请求次数估算。"
+            )
+            return
+        try:
+            reviewer_count = len(load_review_profile(self.profile_path).reviewers)
+        except (OSError, ValueError, YAMLError):
+            reviewer_count = 3
+        requests_per_paper = reviewer_count + 2
+        self.request_estimate.setText(
+            f"最低约 {count * requests_per_paper} 次模型请求：每篇至少 1 次信息提取、"
+            f"{reviewer_count} 次专项评阅和 1 次汇总；工具轮次可能增加实际请求。"
+        )
 
     def _load_providers(self, *, preferred: str = "") -> None:
         current = preferred or str(self.provider.currentData() or "")
