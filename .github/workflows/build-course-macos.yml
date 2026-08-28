@@ -11,6 +11,8 @@ on:
       - "migrations/**"
       - "scripts/build_course_macos.sh"
       - "course-paper-reviewer-macos.spec"
+      - "tests/unit/test_course_packaging.py"
+      - "tests/unit/test_report_export.py"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/build-course-macos.yml"
