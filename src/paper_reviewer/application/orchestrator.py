@@ -1239,6 +1239,15 @@ def _blind_course_document(
             # generic title here prevents filename-derived identity from leaking
             # when a non-standard filename was used as the metadata fallback.
             "title": "课程论文",
+            # These parser-only fields may contain the embedded PDF title or
+            # the student's visible paper title.  Neither is needed by the
+            # blinded reviewer projection; retaining them would bypass the
+            # identity/title isolation above when ``model_dump()`` is used to
+            # build reviewer context.
+            "embedded_title": None,
+            "visible_title": None,
+            "visible_title_page": None,
+            "visible_title_block_ids": None,
         }
     )
 

@@ -44,6 +44,17 @@ COURSE_DISCLAIMER_LINES = (
     "模型置信度是未经校准的自评，不作为统计概率。",
 )
 
+_METADATA_FIELD_LABELS = {
+    "student_name": "姓名",
+    "student_id": "学号",
+    "major": "专业",
+    "paper_title": "题目",
+}
+_METADATA_REPORT_LABELS = {
+    **_METADATA_FIELD_LABELS,
+    "paper_title": "论文题目",
+}
+
 
 def write_report_bundle(
     *,
@@ -222,6 +233,7 @@ def _render_course_document(document: ReportDocument) -> str:
         configured = document.rubric.aggregation.passing_score
         if configured is not None:
             passing_score = float(configured)
+    pending_fields = _metadata_pending_fields(metadata)
     lines = [
         "# 课程论文 AI 辅助评测报告",
         "",
@@ -232,18 +244,28 @@ def _render_course_document(document: ReportDocument) -> str:
         "",
         "## 论文与学生信息",
         "",
-        f"- 姓名：{_metadata_text(metadata, 'student_name', '未识别姓名')}",
-        f"- 学号：{_metadata_text(metadata, 'student_id', '未识别学号')}",
-        f"- 专业（仅用于识别与文件命名）：{_metadata_text(metadata, 'major', '未识别专业')}",
-        f"- 论文题目：{_metadata_text(metadata, 'paper_title', '未识别题目')}",
+        f"- {_metadata_label('student_name', pending_fields)}："
+        f"{_metadata_text(metadata, 'student_name', '未识别姓名')}",
+        f"- {_metadata_label('student_id', pending_fields)}："
+        f"{_metadata_text(metadata, 'student_id', '未识别学号')}",
+        f"- {_metadata_label('major', pending_fields)}（仅用于识别与文件命名）："
+        f"{_metadata_text(metadata, 'major', '未识别专业')}",
+        f"- {_metadata_label('paper_title', pending_fields)}："
+        f"{_metadata_text(metadata, 'paper_title', '未识别题目')}",
         "- 元数据核对："
-        + (
-            "需要人工核对"
-            if metadata is None or metadata.needs_review
-            else "自动提取完成，使用前仍建议人工核对"
-        ),
+        + _metadata_review_status(metadata),
         "",
     ]
+    if pending_fields:
+        pending_labels = "、".join(_METADATA_FIELD_LABELS[field] for field in pending_fields)
+        lines.extend(
+            [
+                "> **人工核对未完成：下列内容是自动提取的候选值，尚未经人工确认。**",
+                ">",
+                f"> 待核对字段：{pending_labels}",
+                "",
+            ]
+        )
     if metadata is not None and metadata.warnings:
         lines.extend([">自动提取提示：", ">"])
         lines.extend(f"> - {_single_line(item)}" for item in metadata.warnings)
@@ -297,6 +319,25 @@ def _metadata_text(
     value = getattr(metadata, field_name, "")
     rendered = _single_line(value)
     return rendered or fallback
+
+
+def _metadata_pending_fields(metadata: SubmissionMetadata | None) -> tuple[str, ...]:
+    if metadata is None:
+        return tuple(_METADATA_FIELD_LABELS)
+    return metadata.pending_review_fields
+
+
+def _metadata_label(field_name: str, pending_fields: tuple[str, ...]) -> str:
+    label = _METADATA_REPORT_LABELS[field_name]
+    return f"{label}（候选，待核对）" if field_name in pending_fields else label
+
+
+def _metadata_review_status(metadata: SubmissionMetadata | None) -> str:
+    if metadata is None or metadata.needs_review:
+        return "需要人工核对"
+    if metadata.human_reviewed:
+        return "已由人工核对"
+    return "自动提取置信度达标，使用前仍建议人工核对"
 
 
 def _single_line(value: Any) -> str:

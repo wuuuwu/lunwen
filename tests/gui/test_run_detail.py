@@ -782,6 +782,22 @@ def test_course_report_shows_student_metadata_and_course_only_sections(
     assert "姓名：张三" in metadata_text
     assert "学号：20260001" in metadata_text
     assert "专业：公共管理" in metadata_text
+    assert "信息核对：自动提取" in metadata_text
+
+    pending_evidence = dict(metadata.field_evidence)
+    pending_evidence["student_name"] = SubmissionFieldEvidence(
+        source=SubmissionMetadataSource.FILE_NAME,
+        confidence=0.5,
+    )
+    pending_report = report.model_copy(
+        update={
+            "submission_metadata": metadata.model_copy(
+                update={"field_evidence": pending_evidence}
+            )
+        }
+    )
+    page.show_report(pending_report, run_dir=tmp_path)
+    assert "信息核对：人工核对未完成（待核对：姓名）" in page.report_metadata.text()
     assert page.total_score.text() == "课程总分\n82 分"
     assert "五级等级：良好" in page.dimension_scores.text()
     assert "课程要求结论：达到课程论文基本要求" in page.dimension_scores.text()

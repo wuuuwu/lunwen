@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -19,7 +20,7 @@ from paper_reviewer.domain.review import (
 )
 from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
-from paper_reviewer.domain.submission import SubmissionMetadata
+from paper_reviewer.domain.submission import SubmissionFieldEvidence, SubmissionMetadata
 from paper_reviewer.reporting.presentation import ReportPresentationProfile
 from paper_reviewer.validation.audits import AuditReport
 
@@ -34,6 +35,62 @@ class ReportExportResult(BaseModel):
     format: ReportExportFormat
     size_bytes: int = Field(ge=0)
     reconstructed_from_snapshot: bool = False
+
+
+MetadataFieldName = Literal["student_name", "student_id", "major", "paper_title"]
+
+
+class MetadataFieldSuggestion(BaseModel):
+    field: MetadataFieldName
+    current_value: str
+    suggested_value: str
+    evidence: SubmissionFieldEvidence
+    reason: str
+    selected_by_default: bool = True
+
+
+class BatchMetadataRecheckItem(BaseModel):
+    item_id: str
+    source_filename: str
+    base_metadata_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    suggestions: list[MetadataFieldSuggestion]
+    unresolved_fields: list[MetadataFieldName] = Field(default_factory=list)
+
+
+class BatchMetadataRecheckPreview(BaseModel):
+    batch_id: str
+    items: list[BatchMetadataRecheckItem]
+    skipped: dict[str, str] = Field(default_factory=dict)
+
+
+class MetadataRecheckDecision(BaseModel):
+    item_id: str
+    base_metadata_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    values: dict[MetadataFieldName, str]
+    accepted_fields: list[MetadataFieldName]
+    # A recheck decision must never silently turn into an acknowledgement when
+    # it is deserialized from a partial payload.  Callers that intend to mark
+    # the metadata as checked must explicitly pass ``human_reviewed=True``.
+    human_reviewed: bool = False
+
+    @property
+    def has_explicit_human_review_confirmation(self) -> bool:
+        """Whether this decision explicitly opted into human confirmation.
+
+        The service layer uses this distinction at its trust boundary.  A
+        missing field is different from a deliberate acknowledgement, even
+        though both are represented by ``False``/``True`` values after
+        validation.
+        """
+
+        return "human_reviewed" in self.model_fields_set and self.human_reviewed is True
+
+
+class BatchMetadataRecheckResult(BaseModel):
+    batch_id: str
+    updated_item_ids: list[str]
+    failed_items: dict[str, str]
+    skipped_item_ids: list[str] = Field(default_factory=list)
 
 
 class ProviderErrorDetails(BaseModel):

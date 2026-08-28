@@ -22,6 +22,14 @@ _WINDOWS_RESERVED = {
     *(f"LPT{number}" for number in range(1, 10)),
 }
 _REPORT_SUFFIX = "_课程论文评测报告.pdf"
+_PENDING_REVIEW_MARKER = "__待核对__"
+_CRITICAL_FILENAME_FIELDS = frozenset({"student_name", "student_id", "paper_title"})
+_METADATA_FIELD_LABELS = {
+    "student_name": "姓名",
+    "student_id": "学号",
+    "major": "专业",
+    "paper_title": "题目",
+}
 _MAX_FILENAME_UTF16_UNITS = 240
 _MAX_WINDOWS_PATH_UTF16_UNITS = 259
 BATCH_SUMMARY_FILENAME = "课程论文评测汇总.csv"
@@ -129,7 +137,28 @@ def sanitize_filename_component(
     return normalized or fallback
 
 
-def build_report_filename(metadata: SubmissionMetadata, run_id: str) -> str:
+def build_report_filename(
+    metadata: SubmissionMetadata,
+    run_id: str,
+    *,
+    source_filename: str | None = None,
+) -> str:
+    if _critical_metadata_needs_review(metadata):
+        source_stem = Path(source_filename or "").stem
+        source = sanitize_filename_component(
+            source_stem,
+            fallback="未识别原文件",
+            max_utf16_units=150,
+        )
+        run_token = sanitize_filename_component(
+            run_id[:8],
+            fallback="run",
+            max_utf16_units=8,
+        )
+        tail = f"{_PENDING_REVIEW_MARKER}{run_token}{_REPORT_SUFFIX}"
+        available = _MAX_FILENAME_UTF16_UNITS - _utf16_units(tail)
+        source = _truncate_utf16(source, available).rstrip(" ._") or "未识别原文件"
+        return f"{source}{tail}"
     components = (
         sanitize_filename_component(metadata.student_name, fallback="未识别姓名"),
         sanitize_filename_component(metadata.student_id, fallback="未识别学号"),
@@ -146,11 +175,21 @@ def build_report_filename(metadata: SubmissionMetadata, run_id: str) -> str:
     return f"{base}{_REPORT_SUFFIX}"
 
 
-def allocate_report_path(output_dir: Path, metadata: SubmissionMetadata, run_id: str) -> Path:
+def allocate_report_path(
+    output_dir: Path,
+    metadata: SubmissionMetadata,
+    run_id: str,
+    *,
+    source_filename: str | None = None,
+) -> Path:
     """Choose a deterministic, non-overwriting report path."""
 
     output_dir = output_dir.resolve(strict=False)
-    initial = build_report_filename(metadata, run_id)
+    initial = build_report_filename(
+        metadata,
+        run_id,
+        source_filename=source_filename,
+    )
     filename = _fit_report_filename(
         output_dir,
         initial.removesuffix(_REPORT_SUFFIX),
@@ -190,6 +229,66 @@ def allocate_report_path(output_dir: Path, metadata: SubmissionMetadata, run_id:
     return output_dir / candidate
 
 
+def is_allocated_report_filename(
+    output_dir: Path,
+    filename: str,
+    metadata: SubmissionMetadata,
+    run_id: str,
+    *,
+    source_filename: str | None = None,
+) -> bool:
+    """Recognize only names this allocator can produce for one exact run."""
+
+    output_dir = output_dir.resolve(strict=False)
+    initial = build_report_filename(
+        metadata,
+        run_id,
+        source_filename=source_filename,
+    )
+    fitted_initial = _fit_report_filename(
+        output_dir,
+        initial.removesuffix(_REPORT_SUFFIX),
+        unique_suffix="",
+        fallback="未识别论文",
+    )
+    if filename.casefold() == fitted_initial.casefold():
+        return True
+    candidate_stem = filename.removesuffix(_REPORT_SUFFIX)
+    if candidate_stem == filename:
+        return False
+    run_token = sanitize_filename_component(
+        run_id[:8],
+        fallback="run",
+        max_utf16_units=8,
+    )
+    match = re.search(
+        rf"__{re.escape(run_token)}(?:_(?P<number>[0-9]+))?$",
+        candidate_stem,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return False
+    number_text = match.group("number")
+    if number_text is not None and (number_text.startswith("0") or int(number_text) < 2):
+        return False
+    unique_suffix = f"__{run_token}"
+    if number_text is not None:
+        unique_suffix = f"{unique_suffix}_{number_text}"
+    base_stem = fitted_initial.removesuffix(_REPORT_SUFFIX)
+    suffix_units = _utf16_units(unique_suffix + _REPORT_SUFFIX)
+    shortened = _truncate_utf16(
+        base_stem,
+        _MAX_FILENAME_UTF16_UNITS - suffix_units,
+    ).rstrip(" ._")
+    expected = _fit_report_filename(
+        output_dir,
+        shortened,
+        unique_suffix=unique_suffix,
+        fallback="报告",
+    )
+    return filename.casefold() == expected.casefold()
+
+
 def write_batch_summary_csv(
     destination: Path,
     batch: BatchRecord,
@@ -214,6 +313,8 @@ def write_batch_summary_csv(
         "题目",
         "元数据置信度",
         "元数据待核对",
+        "待核对字段",
+        "人工已核对",
         "重复PDF内容",
         *(column for _, column in dimension_columns),
         "总分",
@@ -246,6 +347,8 @@ def _csv_row(item: BatchItem, dimensions: Sequence[tuple[str, str]]) -> dict[str
         "题目": _spreadsheet_safe(metadata.paper_title if metadata else "未识别题目"),
         "元数据置信度": _metadata_confidence(metadata),
         "元数据待核对": "是" if metadata is None or metadata.needs_review else "否",
+        "待核对字段": "、".join(_pending_metadata_labels(metadata)),
+        "人工已核对": "是" if metadata is not None and metadata.human_reviewed else "否",
         "重复PDF内容": "是" if item.source.duplicate_sha256 else "否",
         "总分": "" if item.total_score is None else item.total_score,
         "等级": _spreadsheet_safe(item.grade or ""),
@@ -265,6 +368,19 @@ def _metadata_confidence(metadata: SubmissionMetadata | None) -> str:
         return ""
     values = [detail.confidence for detail in metadata.field_evidence.values()]
     return "" if not values else f"{sum(values) / len(values):.2f}"
+
+
+def _pending_metadata_labels(metadata: SubmissionMetadata | None) -> list[str]:
+    fields = (
+        _METADATA_FIELD_LABELS
+        if metadata is None
+        else metadata.pending_review_fields
+    )
+    return [_METADATA_FIELD_LABELS[field] for field in fields]
+
+
+def _critical_metadata_needs_review(metadata: SubmissionMetadata) -> bool:
+    return bool(_CRITICAL_FILENAME_FIELDS.intersection(metadata.pending_review_fields))
 
 
 def _dimension_columns(dimensions: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:

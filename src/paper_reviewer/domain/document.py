@@ -22,6 +22,10 @@ class DocumentInfo(BaseModel):
     source_path: str
     sha256: str
     title: str | None = None
+    embedded_title: str | None = None
+    visible_title: str | None = None
+    visible_title_page: int | None = Field(default=None, ge=1)
+    visible_title_block_ids: list[str] | None = None
     page_count: int = Field(ge=1)
 
 

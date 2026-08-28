@@ -19,7 +19,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 COURSE_RUBRIC = PROJECT_ROOT / "configs" / "rubrics" / "course_paper_v1.yaml"
 
 
-def _metadata() -> SubmissionMetadata:
+def _metadata(
+    *,
+    field_confidences: dict[str, float] | None = None,
+    human_reviewed: bool = False,
+) -> SubmissionMetadata:
     return SubmissionMetadata(
         student_name="张三",
         student_id="20260001",
@@ -28,10 +32,11 @@ def _metadata() -> SubmissionMetadata:
         field_evidence={
             field: SubmissionFieldEvidence(
                 source=SubmissionMetadataSource.COVER_LABEL,
-                confidence=0.95,
+                confidence=(field_confidences or {}).get(field, 0.95),
             )
             for field in SUBMISSION_METADATA_FIELDS
         },
+        human_reviewed=human_reviewed,
     )
 
 
@@ -97,3 +102,50 @@ def test_course_markdown_uses_configured_five_level_anchors(
     ):
         assert prohibited not in markdown
     assert "本结果仅供教师评阅参考，不是教师正式成绩" in markdown
+
+
+def test_course_markdown_marks_unconfirmed_values_as_candidates() -> None:
+    rubric = load_rubric(COURSE_RUBRIC)
+    metadata = _metadata(
+        field_confidences={"student_name": 0.4, "paper_title": 0.6}
+    )
+
+    markdown = render_markdown(
+        rubric,
+        {
+            "run_id": "run-pending",
+            "overall_summary": "摘要",
+            "findings": [],
+            "total_score": 75,
+        },
+        AuditReport(),
+        presentation_profile=ReportPresentationProfile.COURSE_ZH_CN_V1,
+        submission_metadata=metadata,
+        dimension_scores={item.dimension_id: 75 for item in rubric.dimensions},
+    )
+
+    assert "姓名（候选，待核对）：张三" in markdown
+    assert "论文题目（候选，待核对）：公共治理课程案例分析" in markdown
+    assert "人工核对未完成" in markdown
+    assert "待核对字段：姓名、题目" in markdown
+    assert "尚未经人工确认" in markdown
+
+
+def test_course_markdown_marks_human_review_without_candidate_warning() -> None:
+    rubric = load_rubric(COURSE_RUBRIC)
+    metadata = _metadata(
+        field_confidences={"student_name": 0.4, "paper_title": 0.6},
+        human_reviewed=True,
+    )
+
+    markdown = render_markdown(
+        rubric,
+        {"run_id": "run-reviewed", "overall_summary": "摘要", "findings": []},
+        AuditReport(),
+        presentation_profile=ReportPresentationProfile.COURSE_ZH_CN_V1,
+        submission_metadata=metadata,
+    )
+
+    assert "元数据核对：已由人工核对" in markdown
+    assert "候选，待核对" not in markdown
+    assert "尚未经人工确认" not in markdown

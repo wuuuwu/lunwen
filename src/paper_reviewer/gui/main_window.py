@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
-from typing import ClassVar
+from typing import ClassVar, cast
 
 from PySide6.QtCore import QEvent, QModelIndex, QSettings, QSize, QUrl
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QResizeEvent
@@ -32,7 +32,11 @@ from paper_reviewer.application.app_state import (
     is_terminal_run_status,
     status_value,
 )
+from paper_reviewer.application.metadata_recheck import submission_metadata_sha256
 from paper_reviewer.application.models import (
+    BatchMetadataRecheckPreview,
+    BatchMetadataRecheckResult,
+    MetadataRecheckDecision,
     ReportExportFormat,
     ReportView,
     ReviewRequest,
@@ -44,6 +48,7 @@ from paper_reviewer.domain.batch import BatchEvent, BatchRecord, BatchReviewRequ
 from paper_reviewer.domain.review import HumanPanelDecision, HumanRuleDecision
 from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.gui.dialogs.course_metadata import CourseMetadataDialog
+from paper_reviewer.gui.dialogs.course_metadata_recheck import CourseMetadataRecheckDialog
 from paper_reviewer.gui.icons import FluentIconService
 from paper_reviewer.gui.models import (
     NavigationItem,
@@ -129,6 +134,14 @@ class MainWindow(QMainWindow):
         self._batch_view_generation = 0
         self._batch_list_generation = 0
         self._batch_locked_run_id = ""
+        # Keep the historical set of batch IDs for integrations and older
+        # tests, while the mapping below is the actual ownership record.  A
+        # fresh token is issued for every preview/apply operation so a late
+        # callback can release only its own Busy state.
+        self._metadata_recheck_inflight: set[str] = set()
+        self._metadata_recheck_operations: dict[str, tuple[int, str]] = {}
+        self._metadata_recheck_token = 0
+        self._closing = False
         self._active_run_id = ""
         self._active_run_status = ""
         self._restored_active_run_id = ""
@@ -273,6 +286,9 @@ class MainWindow(QMainWindow):
         )
         self.batch_detail_page.run_open_requested.connect(self._open_batch_run)
         self.batch_detail_page.metadata_edit_requested.connect(self.edit_batch_metadata)
+        self.batch_detail_page.metadata_recheck_requested.connect(
+            self.recheck_batch_metadata
+        )
         self.rubrics_page.preferences_changed.connect(self._rubric_preferences_changed)
         self.settings_page.preferences_changed.connect(self._settings_preferences_changed)
         self.settings_page.theme_changed.connect(self._theme_from_settings)
@@ -310,6 +326,12 @@ class MainWindow(QMainWindow):
         )
 
     def navigate(self, page_id: str) -> None:
+        # Leaving the batch detail invalidates its transient metadata dialogs
+        # and Busy state.  The worker itself is allowed to unwind; its result
+        # is ignored by the operation-token check below.
+        invalidate = getattr(self, "_invalidate_metadata_recheck_operations", None)
+        if callable(invalidate):
+            invalidate()
         self.run_detail_page.reset_report_export_state()
         self._detail_request_generation += 1
         self._batch_view_generation += 1
@@ -354,6 +376,9 @@ class MainWindow(QMainWindow):
         # The id of a previous batch must not filter the first event emitted by
         # this newly-created batch.  The worker binds its immutable id from the
         # ``batch_created`` event before accepting any later events.
+        invalidate = getattr(self, "_invalidate_metadata_recheck_operations", None)
+        if callable(invalidate):
+            invalidate()
         self._running_batch_id = ""
         self._running_batch_run_ids.clear()
         self._running_batch_record = None
@@ -627,6 +652,7 @@ class MainWindow(QMainWindow):
         self.batches_page.show_error(message)
 
     def open_batch(self, batch_id: str) -> None:
+        self._invalidate_metadata_recheck_operations()
         self._batch_view_generation += 1
         view_generation = self._batch_view_generation
 
@@ -665,6 +691,7 @@ class MainWindow(QMainWindow):
         if item is None or item.metadata is None:
             self.batch_detail_page.show_error("该论文尚无可修改的提取信息。")
             return
+        expected_metadata_sha256 = submission_metadata_sha256(item.metadata)
         dialog = CourseMetadataDialog(item.metadata, parent=self)
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
@@ -677,6 +704,7 @@ class MainWindow(QMainWindow):
                 batch_id,
                 item_id,
                 metadata,
+                expected_metadata_sha256=expected_metadata_sha256,
             )
 
         view_generation = self._batch_view_generation
@@ -696,6 +724,428 @@ class MainWindow(QMainWindow):
                 view_generation=view_generation,
             ),
         )
+
+    def recheck_batch_metadata(self, batch_id: str) -> None:
+        if self._has_active_evaluation_worker():
+            self.batch_detail_page.show_error(
+                "批次评测运行期间不能重新检查信息；请等待完成或先停止批次。"
+            )
+            return
+        is_active = getattr(self, "_metadata_recheck_is_active", None)
+        if callable(is_active) and is_active(batch_id):
+            return
+        batch = self.batch_detail_page.batch
+        if batch is None or batch.batch_id != batch_id:
+            return
+        answer = QMessageBox.question(
+            self,
+            "批量重新检查信息",
+            "重新检查只会在本机重新读取原 PDF，不会联网、不会调用模型或产生费用。"
+            "检查结果会先显示差异预览，不会自动覆盖。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        view_generation = self._batch_view_generation
+        operation_key = MainWindow._begin_metadata_recheck(self, batch_id, "preview")
+        if operation_key is None:
+            return
+        _set_metadata_recheck_busy_for_controller(
+            self,
+            True,
+            batch_id=batch_id,
+            operation_key=operation_key,
+        )
+
+        async def operation(_emit: EventEmitter) -> BatchMetadataRecheckPreview:
+            return await self.service.preview_batch_metadata_recheck(batch_id)
+
+        _run_metadata_async_for_controller(
+            self,
+            operation,
+            lambda value: self._metadata_recheck_preview_loaded(
+                value,
+                expected_batch_id=batch_id,
+                view_generation=view_generation,
+                operation_key=operation_key,
+            ),
+            lambda message, trace: self._metadata_recheck_failed(
+                message,
+                trace,
+                expected_batch_id=batch_id,
+                view_generation=view_generation,
+                operation_key=operation_key,
+            ),
+            lambda: self._metadata_recheck_cancelled(
+                batch_id,
+                view_generation,
+                operation_key,
+            ),
+        )
+
+    def _metadata_recheck_preview_loaded(
+        self,
+        value: object,
+        *,
+        expected_batch_id: str,
+        view_generation: int,
+        operation_key: tuple[str, int] | None = None,
+    ) -> None:
+        operation_key = self._coerce_metadata_operation_key(
+            expected_batch_id, operation_key
+        )
+        if operation_key is None or not self._metadata_recheck_is_current(
+            expected_batch_id, operation_key
+        ):
+            return
+        if (
+            not isinstance(value, BatchMetadataRecheckPreview)
+            or value.batch_id != expected_batch_id
+        ):
+            self._metadata_recheck_failed(
+                "重新检查没有返回有效的差异预览。",
+                "",
+                expected_batch_id=expected_batch_id,
+                view_generation=view_generation,
+                operation_key=operation_key,
+            )
+            return
+        if (
+            view_generation != self._batch_view_generation
+            or not self._is_batch_detail_visible(expected_batch_id)
+        ):
+            self._finish_metadata_recheck(operation_key)
+            return
+        self._finish_metadata_recheck(operation_key)
+        if not value.items:
+            skipped = "；".join(value.skipped.values())
+            self.batch_detail_page.message.show_message(
+                "没有可预览的信息差异。" + (f" {skipped}" if skipped else ""),
+                severity="info",
+            )
+            return
+        batch = self.batch_detail_page.batch
+        if batch is None or batch.batch_id != expected_batch_id:
+            return
+        metadata_by_item = {
+            item.item_id: item.metadata
+            for item in batch.items
+            if item.metadata is not None
+        }
+        dialog = CourseMetadataRecheckDialog(value, metadata_by_item, parent=self)
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        decisions = dialog.result_decisions
+        if not decisions:
+            return
+        self._apply_metadata_recheck(
+            expected_batch_id,
+            decisions,
+            view_generation=view_generation,
+        )
+
+    def _apply_metadata_recheck(
+        self,
+        batch_id: str,
+        decisions: list[MetadataRecheckDecision],
+        *,
+        view_generation: int,
+    ) -> None:
+        operation_key = self._begin_metadata_recheck(batch_id, "apply")
+        if operation_key is None:
+            return
+        _set_metadata_recheck_busy_for_controller(
+            self,
+            True,
+            batch_id=batch_id,
+            operation_key=operation_key,
+        )
+
+        async def operation(
+            _emit: EventEmitter,
+        ) -> tuple[BatchMetadataRecheckResult, BatchRecord]:
+            result = await self.service.apply_batch_metadata_recheck(batch_id, decisions)
+            record = await self.service.get_batch(batch_id)
+            return result, record
+
+        _run_metadata_async_for_controller(
+            self,
+            operation,
+            lambda value: self._metadata_recheck_applied(
+                value,
+                expected_batch_id=batch_id,
+                view_generation=view_generation,
+                operation_key=operation_key,
+            ),
+            lambda message, trace: self._metadata_recheck_failed(
+                message,
+                trace,
+                expected_batch_id=batch_id,
+                view_generation=view_generation,
+                operation_key=operation_key,
+            ),
+            lambda: self._metadata_recheck_cancelled(
+                batch_id,
+                view_generation,
+                operation_key,
+            ),
+        )
+
+    def _metadata_recheck_applied(
+        self,
+        value: object,
+        *,
+        expected_batch_id: str,
+        view_generation: int,
+        operation_key: tuple[str, int] | None = None,
+    ) -> None:
+        operation_key = self._coerce_metadata_operation_key(
+            expected_batch_id, operation_key
+        )
+        if operation_key is None or not self._metadata_recheck_is_current(
+            expected_batch_id, operation_key
+        ):
+            return
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 2
+            or not isinstance(value[0], BatchMetadataRecheckResult)
+            or not isinstance(value[1], BatchRecord)
+            or value[0].batch_id != expected_batch_id
+            or value[1].batch_id != expected_batch_id
+        ):
+            self._metadata_recheck_failed(
+                "应用信息核对结果后没有返回有效批次状态。",
+                "",
+                expected_batch_id=expected_batch_id,
+                view_generation=view_generation,
+                operation_key=operation_key,
+            )
+            return
+        result, record = value
+        self._finish_metadata_recheck(operation_key)
+        self._remember_batch_record(record)
+        if (
+            view_generation == self._batch_view_generation
+            and self._is_batch_detail_visible(expected_batch_id)
+        ):
+            self.batch_detail_page.set_busy(False)
+            self._set_batch_detail_record(record)
+            if result.failed_items:
+                filenames = {
+                    item.item_id: item.source.filename for item in record.items
+                }
+                failure_details = "；".join(
+                    f"{filenames.get(item_id, item_id)}：{reason}"
+                    for item_id, reason in result.failed_items.items()
+                )
+                self.batch_detail_page.message.show_message(
+                    f"已更新 {len(result.updated_item_ids)} 篇；"
+                    f"另有 {len(result.failed_items)} 篇更新失败，可重试。"
+                    f"失败项：{failure_details}",
+                    severity="warning",
+                )
+            else:
+                self.batch_detail_page.message.show_message(
+                    f"已核对并更新 {len(result.updated_item_ids)} 篇论文信息；"
+                    "报告和汇总表已在本地重建。",
+                    severity="success",
+                )
+        self.refresh_batches()
+        self.refresh_runs()
+
+    def _metadata_recheck_failed(
+        self,
+        message: str,
+        _trace: str,
+        *,
+        expected_batch_id: str,
+        view_generation: int,
+        operation_key: tuple[str, int] | None = None,
+    ) -> None:
+        operation_key = self._coerce_metadata_operation_key(
+            expected_batch_id, operation_key
+        )
+        if operation_key is None or not self._metadata_recheck_is_current(
+            expected_batch_id, operation_key
+        ):
+            return
+        self._finish_metadata_recheck(operation_key)
+        if (
+            view_generation == self._batch_view_generation
+            and self._is_batch_detail_visible(expected_batch_id)
+        ):
+            self.batch_detail_page.set_busy(False)
+            self.batch_detail_page.show_error(message)
+            self._set_global_status(fallback="批量信息重新检查失败，需要处理")
+
+    def _metadata_recheck_cancelled(
+        self,
+        batch_id: str,
+        view_generation: int,
+        operation_key: tuple[str, int],
+    ) -> None:
+        """Release a cancelled metadata operation and refresh partial writes.
+
+        Applying decisions is item-by-item.  A cancellation can therefore
+        arrive after an earlier item has already rebuilt its report.  Refresh
+        the persisted batch from disk (unless the window is closing) so the
+        UI reflects those committed items instead of retaining a stale table.
+        """
+
+        if not self._metadata_recheck_is_current(batch_id, operation_key):
+            return
+        self._finish_metadata_recheck(operation_key)
+        if self._closing:
+            return
+        self._refresh_batch_after_metadata_cancel(batch_id, view_generation)
+
+    def _refresh_batch_after_metadata_cancel(
+        self, batch_id: str, view_generation: int
+    ) -> None:
+        async def operation(_emit: EventEmitter) -> BatchRecord:
+            return await self.service.get_batch(batch_id)
+
+        self._run_async(
+            operation,
+            lambda value: self._metadata_cancel_refresh_completed(
+                value, expected_batch_id=batch_id, view_generation=view_generation
+            ),
+            lambda _message, _trace: None,
+        )
+
+    def _metadata_cancel_refresh_completed(
+        self,
+        value: object,
+        *,
+        expected_batch_id: str,
+        view_generation: int,
+    ) -> None:
+        if not isinstance(value, BatchRecord) or value.batch_id != expected_batch_id:
+            return
+        if view_generation != self._batch_view_generation:
+            return
+        self._remember_batch_record(value)
+        if self._is_batch_detail_visible(expected_batch_id):
+            self._set_batch_detail_record(value)
+        self.refresh_batches()
+        self.refresh_runs()
+
+    def _metadata_recheck_is_active(self, batch_id: str) -> bool:
+        return batch_id in getattr(self, "_metadata_recheck_inflight", set())
+
+    def _begin_metadata_recheck(
+        self, batch_id: str, phase: str
+    ) -> tuple[str, int] | None:
+        if batch_id in getattr(self, "_metadata_recheck_inflight", set()):
+            return None
+        self._metadata_recheck_token = int(
+            getattr(self, "_metadata_recheck_token", 0)
+        ) + 1
+        operation_key = (batch_id, self._metadata_recheck_token)
+        self._metadata_recheck_inflight.add(batch_id)
+        operations = getattr(self, "_metadata_recheck_operations", None)
+        if operations is None:
+            operations = {}
+            self._metadata_recheck_operations = operations
+        operations[batch_id] = (operation_key[1], phase)
+        return operation_key
+
+    def _coerce_metadata_operation_key(
+        self, batch_id: str, operation_key: tuple[str, int] | None
+    ) -> tuple[str, int] | None:
+        if operation_key is not None:
+            return operation_key
+        operations = getattr(self, "_metadata_recheck_operations", {})
+        current = operations.get(batch_id)
+        if current is None:
+            return None
+        return (batch_id, current[0])
+
+    def _metadata_recheck_is_current(
+        self, batch_id: str, operation_key: tuple[str, int]
+    ) -> bool:
+        if operation_key[0] != batch_id:
+            return False
+        operations = getattr(self, "_metadata_recheck_operations", {})
+        current = operations.get(batch_id)
+        return bool(
+            batch_id in getattr(self, "_metadata_recheck_inflight", set())
+            and current is not None
+            and current[0] == operation_key[1]
+        )
+
+    def _finish_metadata_recheck(self, operation_key: tuple[str, int]) -> bool:
+        batch_id, token = operation_key
+        operations = getattr(self, "_metadata_recheck_operations", {})
+        current = operations.get(batch_id)
+        if current is None or current[0] != token:
+            return False
+        operations.pop(batch_id, None)
+        self._metadata_recheck_inflight.discard(batch_id)
+        _set_metadata_recheck_busy_for_controller(
+            self,
+            False,
+            batch_id=batch_id,
+            operation_key=operation_key,
+        )
+        return True
+
+    def _invalidate_metadata_recheck_operations(self) -> None:
+        operations = getattr(self, "_metadata_recheck_operations", {})
+        keys = [(batch_id, value[0]) for batch_id, value in operations.items()]
+        operations.clear()
+        self._metadata_recheck_inflight.clear()
+        for operation_key in keys:
+            _set_metadata_recheck_busy_for_controller(
+                self,
+                False,
+                batch_id=operation_key[0],
+                operation_key=operation_key,
+            )
+
+    def _set_metadata_recheck_busy(
+        self,
+        busy: bool,
+        *,
+        batch_id: str,
+        operation_key: tuple[str, int],
+    ) -> None:
+        visibility_check = getattr(self, "_is_batch_detail_visible", None)
+        visible = (
+            visibility_check(batch_id)
+            if callable(visibility_check)
+            else getattr(self.batch_detail_page, "batch_id", "") == batch_id
+        )
+        if not visible:
+            return
+        # Keep compatibility with lightweight page doubles used by consumers
+        # of the pre-token controller API; the real page accepts ``token``.
+        try:
+            self.batch_detail_page.set_busy(
+                busy,
+                action="metadata_recheck" if busy else "",
+                token=operation_key,
+            )
+        except TypeError:
+            self.batch_detail_page.set_busy(
+                busy,
+                action="metadata_recheck" if busy else "",
+            )
+
+    def _run_metadata_async(
+        self,
+        operation: AsyncOperation,
+        on_success: Callable[[object], None],
+        on_failure: Callable[[str, str], None],
+        on_cancelled: Callable[[], None],
+    ) -> AsyncTaskThread | None:
+        # ``_run_async`` binds this handler before starting its QThread.  The
+        # attribute-based hook keeps the public helper signature compatible
+        # with existing integrations that replace ``_run_async`` in tests.
+        operation._task_cancelled_handler = on_cancelled  # type: ignore[attr-defined]
+        return self._run_async(operation, on_success, on_failure)
 
     def _back_from_run_detail(self) -> None:
         self._batch_view_generation += 1
@@ -1311,12 +1761,16 @@ class MainWindow(QMainWindow):
         operation: AsyncOperation,
         on_success: Callable[[object], None],
         on_failure: Callable[[str, str], None] | None = None,
-    ) -> None:
+    ) -> AsyncTaskThread:
         worker = AsyncTaskThread(operation)
         self._track_worker(worker)
         worker.completed.connect(on_success)
         worker.failed.connect(on_failure or self._show_worker_error)
+        cancelled_handler = getattr(operation, "_task_cancelled_handler", None)
+        if callable(cancelled_handler):
+            worker.task_cancelled.connect(cancelled_handler)
         worker.start()
+        return worker
 
     def _track_worker(self, worker: AsyncTaskThread) -> None:
         self._operation_registry.track(worker, self._worker_finished)
@@ -1493,28 +1947,56 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         review_running = self._review_worker is not None and self._review_worker.isRunning()
         batch_running = self._batch_worker is not None and self._batch_worker.isRunning()
-        if review_running or batch_running:
+        metadata_inflight: set[str] = getattr(
+            self, "_metadata_recheck_inflight", set()
+        )
+        metadata_operations: dict[str, tuple[int, str]] = getattr(
+            self, "_metadata_recheck_operations", {}
+        )
+        metadata_running = bool(metadata_inflight)
+        if review_running or batch_running or metadata_running:
+            if batch_running:
+                title = "批次仍在进行"
+                message = (
+                    "退出会安全停止当前批次。已完成论文、当前检查点和后续队列都会保留。"
+                )
+            elif review_running:
+                title = "评测仍在进行"
+                message = "退出会取消当前评测。已完成检查点会保留。"
+            elif any(
+                phase == "apply"
+                for _token, phase in metadata_operations.values()
+            ):
+                title = "信息核对正在应用"
+                message = (
+                    "退出会停止正在应用的论文信息核对。已经提交的项目会保留，"
+                    "剩余项目可稍后重新检查。"
+                )
+            else:
+                title = "信息重新检查仍在进行"
+                message = "退出会停止本机信息重新检查，已保存的评测结果不会受影响。"
             answer = QMessageBox.question(
                 self,
-                "批次仍在进行" if batch_running else "评测仍在进行",
-                (
-                    "退出会安全停止当前批次。已完成论文、当前检查点和后续队列都会保留。"
-                    "是否停止并退出？"
-                    if batch_running
-                    else "退出会取消当前评测。已完成检查点会保留。是否取消并退出？"
-                ),
+                title,
+                message + "是否停止并退出？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+        self._closing = True
         running_workers = self._operation_registry.cancel_running()
         deadline = monotonic() + 5.0
         for worker in running_workers:
             remaining_ms = max(0, int((deadline - monotonic()) * 1000))
             worker.wait(remaining_ms)
         if any(worker.isRunning() for worker in running_workers):
+            # The close request is rejected and the window remains usable.
+            # Do not leave cancellation callbacks in a permanent shutdown
+            # mode, otherwise a later metadata cancellation would skip the
+            # refresh that reflects already committed items.
+            self._closing = False
             self.global_status.setText("后台任务正在安全停止，请稍后重试退出")
             QMessageBox.warning(
                 self,
@@ -1527,3 +2009,51 @@ class MainWindow(QMainWindow):
         self._settings.setValue("window/state", self.saveState())
         self._save_preferences()
         event.accept()
+
+
+def _set_metadata_recheck_busy_for_controller(
+    controller: object,
+    busy: bool,
+    *,
+    batch_id: str,
+    operation_key: tuple[str, int],
+) -> None:
+    """Call the token-aware page helper with legacy-controller tolerance."""
+
+    method = getattr(controller, "_set_metadata_recheck_busy", None)
+    if callable(method):
+        method(busy, batch_id=batch_id, operation_key=operation_key)
+        return
+    # A few embedders construct a minimal controller object around the static
+    # MainWindow handlers.  Keep those integrations functional while the real
+    # MainWindow always takes the branch above.
+    MainWindow._set_metadata_recheck_busy(
+        cast(MainWindow, controller),
+        busy,
+        batch_id=batch_id,
+        operation_key=operation_key,
+    )
+
+
+def _run_metadata_async_for_controller(
+    controller: object,
+    operation: AsyncOperation,
+    on_success: Callable[[object], None],
+    on_failure: Callable[[str, str], None],
+    on_cancelled: Callable[[], None],
+) -> AsyncTaskThread | None:
+    """Run metadata work through a real or legacy controller instance."""
+
+    method = getattr(controller, "_run_metadata_async", None)
+    if callable(method):
+        return cast(
+            AsyncTaskThread | None,
+            method(operation, on_success, on_failure, on_cancelled),
+        )
+    return MainWindow._run_metadata_async(
+        cast(MainWindow, controller),
+        operation,
+        on_success,
+        on_failure,
+        on_cancelled,
+    )

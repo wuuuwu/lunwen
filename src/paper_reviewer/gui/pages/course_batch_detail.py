@@ -16,6 +16,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from paper_reviewer.application.metadata_recheck import (
+    metadata_recheck_fields,
+    metadata_requires_local_recheck,
+)
 from paper_reviewer.domain.batch import (
     BatchEvent,
     BatchItem,
@@ -37,6 +41,7 @@ class CourseBatchDetailPage(QWidget):
     open_output_requested = Signal(str)
     run_open_requested = Signal(str)
     metadata_edit_requested = Signal(str, str)
+    metadata_recheck_requested = Signal(str)
 
     STATUS_TEXT: ClassVar[dict[str, str]] = {
         "created": "已创建",
@@ -51,6 +56,10 @@ class CourseBatchDetailPage(QWidget):
         self.icons = icons
         self._batch: BatchRecord | None = None
         self._busy_action = ""
+        # A batch mutation may finish after the user has switched to another
+        # batch.  Keep the operation identity on the page as well as in the
+        # controller so a stale callback cannot release a newer Busy state.
+        self._busy_token: object | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
@@ -82,6 +91,9 @@ class CourseBatchDetailPage(QWidget):
         self.batch_progress = QLabel("进度：0 / 0")
         self.batch_progress.setObjectName("courseBatchProgress")
         self.batch_progress.setAccessibleName("批次处理进度")
+        self.metadata_review_summary = QLabel("信息核对：待核对 0 篇；已核对 0 篇")
+        self.metadata_review_summary.setObjectName("courseBatchMetadataReviewSummary")
+        self.metadata_review_summary.setAccessibleName("批次论文信息核对进度")
         self.batch_output = QLabel("输出目录：—")
         self.batch_output.setObjectName("courseBatchOutputPath")
         self.batch_output.setProperty("fluentType", "secondary")
@@ -91,6 +103,7 @@ class CourseBatchDetailPage(QWidget):
         summary_layout.addWidget(self.batch_title)
         summary_layout.addWidget(self.batch_status)
         summary_layout.addWidget(self.batch_progress)
+        summary_layout.addWidget(self.metadata_review_summary)
         summary_layout.addWidget(self.batch_output)
         layout.addWidget(summary)
 
@@ -119,6 +132,21 @@ class CourseBatchDetailPage(QWidget):
         set_fluent_property(self.retry_button, "fluentAppearance", "secondary")
         self.retry_button.clicked.connect(self._request_retry)
 
+        self.recheck_metadata_button = QPushButton("重新检查待核对项")
+        self.recheck_metadata_button.setObjectName("recheckBatchMetadataButton")
+        self.recheck_metadata_button.setIcon(icons.icon("search"))
+        self.recheck_metadata_button.setAccessibleName("批量重新检查论文信息")
+        self.recheck_metadata_button.setAccessibleDescription(
+            "只在本机重新解析原 PDF，检查姓名、学号、专业和题目，并先显示差异预览。"
+        )
+        self.recheck_metadata_button.setToolTip(
+            "本地重新检查待核对论文；不联网、不调用模型，应用前会显示差异"
+        )
+        set_fluent_property(
+            self.recheck_metadata_button, "fluentAppearance", "secondary"
+        )
+        self.recheck_metadata_button.clicked.connect(self._request_recheck_metadata)
+
         self.open_output_button = QPushButton("打开输出目录")
         self.open_output_button.setObjectName("openBatchOutputButton")
         self.open_output_button.setIcon(icons.icon("folder"))
@@ -130,6 +158,7 @@ class CourseBatchDetailPage(QWidget):
         toolbar.addWidget(self.stop_button)
         toolbar.addWidget(self.resume_button)
         toolbar.addWidget(self.retry_button)
+        toolbar.addWidget(self.recheck_metadata_button)
         toolbar.addStretch(1)
         toolbar.addWidget(self.open_output_button)
         layout.addLayout(toolbar)
@@ -157,6 +186,11 @@ class CourseBatchDetailPage(QWidget):
         header.setMinimumSectionSize(72)
         layout.addWidget(self.table, 1)
 
+        self.selection_review_message = MessageBar(icons)
+        self.selection_review_message.setObjectName("courseMetadataSelectionMessageBar")
+        self.selection_review_message.setAccessibleName("选中论文的信息核对提示")
+        layout.addWidget(self.selection_review_message)
+
         item_actions = QHBoxLayout()
         item_actions.setSpacing(8)
         self.open_run_button = QPushButton("打开单篇详情")
@@ -164,7 +198,7 @@ class CourseBatchDetailPage(QWidget):
         self.open_run_button.setAccessibleName("打开选中论文的任务详情")
         set_fluent_property(self.open_run_button, "fluentAppearance", "secondary")
         self.open_run_button.clicked.connect(self._request_open_selected)
-        self.edit_metadata_button = QPushButton("修改提取信息")
+        self.edit_metadata_button = QPushButton("核对/修改信息")
         self.edit_metadata_button.setObjectName("editBatchMetadataButton")
         self.edit_metadata_button.setAccessibleName("修改选中论文的学生和题目信息")
         self.edit_metadata_button.setAccessibleDescription(
@@ -191,6 +225,8 @@ class CourseBatchDetailPage(QWidget):
         return self._batch
 
     def set_batch(self, batch: BatchRecord) -> None:
+        if self.batch_id and self.batch_id != batch.batch_id:
+            self.set_busy(False)
         selected_item_id = self._selected_item_id()
         self._batch = batch
         self.model.set_items(batch.items)
@@ -211,6 +247,29 @@ class CourseBatchDetailPage(QWidget):
             f"进度：已处理 {processed} / {len(batch.items)}；"
             f"成功 {completed}；失败 {failed}"
         )
+        reviewed = sum(
+            item.metadata is not None and item.metadata.human_reviewed
+            for item in batch.items
+        )
+        pending = sum(
+            item.metadata is not None
+            and metadata_requires_local_recheck(item.metadata)
+            for item in batch.items
+        )
+        automatic = sum(
+            item.metadata is not None
+            and not item.metadata.human_reviewed
+            and not metadata_requires_local_recheck(item.metadata)
+            for item in batch.items
+        )
+        missing = sum(item.metadata is None for item in batch.items)
+        summary_text = f"信息核对：待核对 {pending} 篇；已核对 {reviewed} 篇"
+        if automatic:
+            summary_text += f"；自动提取 {automatic} 篇"
+        if missing:
+            summary_text += f"；尚未提取 {missing} 篇"
+        self.metadata_review_summary.setText(summary_text)
+        self.metadata_review_summary.setAccessibleDescription(summary_text)
         output = batch.request.output_dir
         self.batch_output.setText(f"输出目录：{output}")
         self.batch_output.setToolTip(str(output))
@@ -235,15 +294,19 @@ class CourseBatchDetailPage(QWidget):
             if row >= 0:
                 self.table.selectRow(row)
         self._update_actions()
+        self._update_selection_review_message()
 
     def clear(self) -> None:
+        self.set_busy(False)
         self._batch = None
         self.model.set_items([])
         self.batch_title.setText("尚未选择批次")
         self.batch_status.setText("状态：—")
         self.batch_progress.setText("进度：0 / 0")
+        self.metadata_review_summary.setText("信息核对：待核对 0 篇；已核对 0 篇")
         self.batch_output.setText("输出目录：—")
         self.message.clear()
+        self.selection_review_message.clear()
         self._update_actions()
 
     def apply_event(self, event: BatchEvent) -> None:
@@ -255,12 +318,29 @@ class CourseBatchDetailPage(QWidget):
         if event.message:
             self.message.show_message(event.message, severity="info")
 
-    def set_busy(self, busy: bool, *, action: str = "") -> None:
-        self._busy_action = (action or "all") if busy else ""
+    def set_busy(
+        self,
+        busy: bool,
+        *,
+        action: str = "",
+        token: object | None = None,
+    ) -> None:
+        if busy:
+            self._busy_action = action or "all"
+            self._busy_token = token
+        else:
+            # ``token=None`` remains the force-clear form used by the page's
+            # ordinary error and navigation paths.  A supplied token may
+            # release only the operation that owns it.
+            if token is not None and token != self._busy_token:
+                return
+            self._busy_action = ""
+            self._busy_token = None
         targets = {
             "stop": self.stop_button,
             "resume": self.resume_button,
             "retry": self.retry_button,
+            "metadata_recheck": self.recheck_metadata_button,
             "metadata": self.edit_metadata_button,
         }
         for name, button in targets.items():
@@ -282,6 +362,10 @@ class CourseBatchDetailPage(QWidget):
     def _request_retry(self) -> None:
         if self._batch is not None and self.retry_button.isEnabled():
             self.retry_failed_requested.emit(self._batch.batch_id)
+
+    def _request_recheck_metadata(self) -> None:
+        if self._batch is not None and self.recheck_metadata_button.isEnabled():
+            self.metadata_recheck_requested.emit(self._batch.batch_id)
 
     def _request_open_output(self) -> None:
         if self._batch is not None and self.open_output_button.isEnabled():
@@ -311,6 +395,7 @@ class CourseBatchDetailPage(QWidget):
 
     def _selection_changed(self) -> None:
         self._update_actions()
+        self._update_selection_review_message()
 
     def _selected_item(self) -> BatchItem | None:
         selection = self.table.selectionModel().selectedRows()
@@ -340,6 +425,17 @@ class CourseBatchDetailPage(QWidget):
                 and not busy
             )
         )
+        has_metadata = bool(
+            batch and any(item.metadata is not None for item in batch.items)
+        )
+        self.recheck_metadata_button.setEnabled(
+            bool(
+                batch
+                and status in {"paused", "completed", "completed_with_errors"}
+                and has_metadata
+                and not busy
+            )
+        )
         self.open_output_button.setEnabled(bool(batch and not busy))
         item = self._selected_item()
         self.open_run_button.setEnabled(bool(item and item.run_id and not busy))
@@ -351,12 +447,62 @@ class CourseBatchDetailPage(QWidget):
                 and not busy
             )
         )
+        self.edit_metadata_button.setText(
+            "查看/修改信息"
+            if item and item.metadata is not None and item.metadata.human_reviewed
+            else "核对/修改信息"
+        )
+
+    def _update_selection_review_message(self) -> None:
+        item = self._selected_item()
+        if item is None:
+            self.selection_review_message.clear()
+            return
+        metadata = item.metadata
+        if metadata is None:
+            self.selection_review_message.show_message(
+                "选中论文尚未完成信息提取，暂时不能人工核对。",
+                severity="warning",
+            )
+            return
+        if metadata.human_reviewed or not metadata_requires_local_recheck(metadata):
+            self.selection_review_message.clear()
+            return
+        labels = {
+            "student_name": "姓名",
+            "student_id": "学号",
+            "major": "专业",
+            "paper_title": "题目",
+        }
+        review_fields = metadata_recheck_fields(metadata)
+        low_confidence_fields = set(metadata.pending_review_fields)
+        low_confidence = "、".join(
+            labels.get(field, field)
+            for field in review_fields
+            if field in low_confidence_fields
+        )
+        historical = "、".join(
+            labels.get(field, field)
+            for field in review_fields
+            if field not in low_confidence_fields
+        )
+        details: list[str] = []
+        if low_confidence:
+            details.append(f"其中 {low_confidence} 的自动识别置信度较低或使用了占位值")
+        if historical:
+            details.append(f"发现 {historical} 存在历史提取异常，建议重新检查")
+        detail = "；".join(details) + "。"
+        self.selection_review_message.show_message(
+            f"选中论文的信息尚未人工核对。{detail}",
+            severity="warning",
+        )
 
     def _set_tab_order(self) -> None:
         controls = [
             self.stop_button,
             self.resume_button,
             self.retry_button,
+            self.recheck_metadata_button,
             self.open_output_button,
             self.table,
             self.open_run_button,

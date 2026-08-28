@@ -45,6 +45,17 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Qt 6.11 on Windows links against the operating system's ICU shim.  Some
+# development environments put an unrelated Poppler ICU build on PATH, which
+# PyInstaller can otherwise mistake for Qt's dependency.  Shipping that DLL
+# makes QtCore fail with ERROR_PROC_NOT_FOUND before the application starts.
+_foreign_icu_dlls = {"icuuc.dll", "icudt78.dll"}
+a.binaries = [
+    binary
+    for binary in a.binaries
+    if binary[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    not in _foreign_icu_dlls
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(

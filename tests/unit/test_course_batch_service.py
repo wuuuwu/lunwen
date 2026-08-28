@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 from typing import Any
 
+import pymupdf
 import pytest
 
+import paper_reviewer.application.service as service_module
+from paper_reviewer.application.artifacts import RunArtifactStore
 from paper_reviewer.application.batch_output import (
     BATCH_SUMMARY_FILENAME,
     BatchOutputConflictError,
     BatchOutputOwnedByAnotherBatchError,
     BatchOutputSummaryExistsError,
+    allocate_report_path,
     batch_output_conflict_message,
     build_report_filename,
     claim_batch_output_directory,
@@ -22,6 +27,8 @@ from paper_reviewer.application.batch_store import (
     BatchStore,
     scan_batch_sources,
 )
+from paper_reviewer.application.metadata_recheck import submission_metadata_sha256
+from paper_reviewer.application.models import MetadataRecheckDecision
 from paper_reviewer.application.service import ReviewApplicationService
 from paper_reviewer.config import Settings, load_review_profile, load_rubric
 from paper_reviewer.domain.batch import (
@@ -980,6 +987,16 @@ async def test_metadata_correction_refreshes_local_artifacts_without_model_call(
 ) -> None:
     store = MemoryBatchStore()
     service, record, run_dir, old_report = _metadata_update_case(tmp_path, store)
+    protected_artifacts = {
+        "dimension-scores.json": b"unchanged scores",
+        "reviewer-result.json": b"unchanged reviewer",
+        "review-checkpoint.json": b"unchanged checkpoint",
+    }
+    for name, content in protected_artifacts.items():
+        (run_dir / name).write_bytes(content)
+    record.items[0].dimension_scores = {"task_completion": 82.0}
+    record.items[0].total_score = 82.0
+    store.save(record)
     calls: list[str] = []
     _install_metadata_update_fakes(monkeypatch, service, record, calls=calls)
 
@@ -1000,6 +1017,11 @@ async def test_metadata_correction_refreshes_local_artifacts_without_model_call(
     assert (run_dir / "report.md").read_bytes() == b"new report.md"
     assert corrected.summary_path is not None
     assert corrected.summary_path.read_bytes() == b"new csv"
+    assert corrected.items[0].dimension_scores == {"task_completion": 82.0}
+    assert corrected.items[0].total_score == 82.0
+    assert {
+        name: (run_dir / name).read_bytes() for name in protected_artifacts
+    } == protected_artifacts
 
 
 @pytest.mark.asyncio
@@ -1028,6 +1050,434 @@ async def test_metadata_correction_does_not_delete_unverified_output_file(
 
 
 @pytest.mark.asyncio
+async def test_metadata_correction_rejects_stale_dialog_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = MemoryBatchStore()
+    service, record, run_dir, old_report = _metadata_update_case(tmp_path, store)
+    item = record.items[0]
+    assert item.metadata is not None
+    expected_hash = submission_metadata_sha256(item.metadata)
+    concurrent = _metadata("其他窗口修改")
+    persisted = store.load(record.batch_id)
+    persisted.items[0].metadata = concurrent
+    store.save(persisted)
+    before_artifacts = {
+        path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()
+    }
+
+    with pytest.raises(ValueError, match="其他窗口更新"):
+        await service.update_submission_metadata(
+            record.batch_id,
+            item.item_id,
+            _metadata("当前窗口修改"),
+            expected_metadata_sha256=expected_hash,
+        )
+
+    assert store.load(record.batch_id).items[0].metadata == concurrent
+    assert old_report.read_bytes() == b"old local pdf"
+    assert {
+        path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()
+    } == before_artifacts
+
+
+@pytest.mark.asyncio
+async def test_metadata_correction_retires_exact_schema_1_0_standard_report_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryBatchStore()
+    service, record, run_dir, original_report = _metadata_update_case(tmp_path, store)
+    original_report.unlink()
+    legacy = _metadata("旧姓名")
+    legacy_evidence = {
+        **legacy.field_evidence,
+        "paper_title": legacy.field_evidence["paper_title"].model_copy(
+            update={"confidence": 0.7}
+        ),
+    }
+    legacy = legacy.model_copy(
+        update={"schema_version": "1.0", "field_evidence": legacy_evidence}
+    )
+    legacy_standard_name = build_report_filename(
+        legacy.model_copy(update={"human_reviewed": True}),
+        record.items[0].run_id or "",
+    )
+    legacy_report = record.request.output_dir / legacy_standard_name
+    legacy_report.write_bytes(b"legacy schema 1.0 report")
+    record.items[0].metadata = legacy
+    record.items[0].report_path = legacy_report
+    store.save(record)
+    RunArtifactStore(run_dir).write_model("submission-metadata.json", legacy)
+    _install_metadata_update_fakes(monkeypatch, service, record)
+
+    corrected = await service.update_submission_metadata(
+        record.batch_id,
+        record.items[0].item_id,
+        _metadata("新姓名"),
+    )
+
+    assert not legacy_report.exists()
+    assert corrected.items[0].report_path is not None
+    assert corrected.items[0].report_path.read_bytes() == b"new local pdf"
+
+
+@pytest.mark.asyncio
+async def test_metadata_correction_retires_allocator_collision_report_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryBatchStore()
+    service, record, _run_dir, base_report = _metadata_update_case(tmp_path, store)
+    base_report.write_bytes(b"user collision file")
+    item = record.items[0]
+    assert item.metadata is not None and item.run_id is not None
+    collision_report = allocate_report_path(
+        record.request.output_dir,
+        item.metadata,
+        item.run_id,
+        source_filename=item.source.filename,
+    )
+    collision_report.write_bytes(b"batch managed collision report")
+    item.report_path = collision_report
+    store.save(record)
+    _install_metadata_update_fakes(monkeypatch, service, record)
+
+    await service.update_submission_metadata(
+        record.batch_id,
+        item.item_id,
+        _metadata("新姓名"),
+    )
+
+    assert base_report.read_bytes() == b"user collision file"
+    assert not collision_report.exists()
+
+
+def test_metadata_transaction_never_overwrites_target_appearing_after_allocation(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "new-report.pdf"
+    transaction = service_module._MetadataUpdateFileTransaction()
+    prepared = transaction.prepare_replacement(destination, must_be_absent=True)
+    prepared.write_bytes(b"generated report")
+    destination.write_bytes(b"user file created during render")
+
+    with pytest.raises(FileExistsError, match="appeared after allocation"):
+        transaction.commit()
+    assert transaction.rollback() == []
+
+    assert destination.read_bytes() == b"user file created during render"
+    assert not prepared.exists()
+
+
+@pytest.mark.asyncio
+async def test_metadata_service_preserves_report_appearing_during_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryBatchStore()
+    service, record, run_dir, old_report = _metadata_update_case(tmp_path, store)
+    _install_metadata_update_fakes(monkeypatch, service, record)
+    old_run_files = {
+        path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()
+    }
+    original_commit = service_module._MetadataUpdateFileTransaction.commit
+
+    def create_user_collision_then_commit(
+        transaction: service_module._MetadataUpdateFileTransaction,
+    ) -> None:
+        destination = next(
+            operation.destination
+            for operation in transaction._operations
+            if operation.must_be_absent
+        )
+        destination.write_bytes(b"user file created while PDF rendered")
+        original_commit(transaction)
+
+    monkeypatch.setattr(
+        service_module._MetadataUpdateFileTransaction,
+        "commit",
+        create_user_collision_then_commit,
+    )
+
+    with pytest.raises(FileExistsError, match="appeared after allocation"):
+        await service.update_submission_metadata(
+            record.batch_id,
+            record.items[0].item_id,
+            _metadata("新姓名"),
+        )
+
+    destination = record.request.output_dir / build_report_filename(
+        _metadata("新姓名"),
+        record.items[0].run_id or "",
+        source_filename=record.items[0].source.filename,
+    )
+    assert destination.read_bytes() == b"user file created while PDF rendered"
+    assert old_report.read_bytes() == b"old local pdf"
+    assert {
+        name: (run_dir / name).read_bytes() for name in old_run_files
+    } == old_run_files
+
+
+@pytest.mark.asyncio
+async def test_metadata_thread_waits_for_worker_after_repeated_cancellation() -> None:
+    started = Event()
+    release = Event()
+
+    def blocking_file_operation() -> None:
+        started.set()
+        assert release.wait(timeout=5)
+
+    task = asyncio.create_task(
+        service_module._metadata_update_to_thread(blocking_file_operation)
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_metadata_cleanup_preserves_rollback_errors_after_repeated_cancellation() -> None:
+    started = Event()
+    release = Event()
+    rollback_error = OSError("rollback failed")
+
+    def blocking_rollback() -> list[BaseException]:
+        started.set()
+        assert release.wait(timeout=5)
+        return [rollback_error]
+
+    task = asyncio.create_task(
+        service_module._metadata_cleanup_to_thread(blocking_rollback)
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()
+
+    release.set()
+    assert await task == [rollback_error]
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_cannot_hide_incomplete_metadata_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryBatchStore()
+    service, record, _run_dir, _old_report = _metadata_update_case(tmp_path, store)
+    _install_metadata_update_fakes(
+        monkeypatch,
+        service,
+        record,
+        failure_stage="metadata",
+    )
+    rollback_started = Event()
+    release_rollback = Event()
+
+    def failing_rollback(
+        _transaction: service_module._MetadataUpdateFileTransaction,
+    ) -> list[BaseException]:
+        rollback_started.set()
+        assert release_rollback.wait(timeout=5)
+        return [OSError("injected rollback failure")]
+
+    monkeypatch.setattr(
+        service_module._MetadataUpdateFileTransaction,
+        "rollback",
+        failing_rollback,
+    )
+    task = asyncio.create_task(
+        service.update_submission_metadata(
+            record.batch_id,
+            record.items[0].item_id,
+            _metadata("新姓名"),
+        )
+    )
+    assert await asyncio.to_thread(rollback_started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()
+
+    release_rollback.set()
+    with pytest.raises(
+        service_module._MetadataUpdateRollbackError,
+        match="自动回滚未完全完成",
+    ):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_batch_metadata_recheck_reraises_incomplete_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _record(tmp_path, [BatchItemStatus.COMPLETED])
+    item = record.items[0]
+    item.run_id = "run-fatal-rollback"
+    item.metadata = _metadata("旧姓名")
+    store = MemoryBatchStore()
+    store.create(record)
+    service = _service(tmp_path, store)
+    base_hash = submission_metadata_sha256(item.metadata)
+    preview = SimpleNamespace(base_metadata_sha256=base_hash)
+    prepared = SimpleNamespace(
+        preview=preview,
+        current=item.metadata,
+        candidate=item.metadata.model_copy(update={"student_name": "新姓名"}),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_prepare_batch_metadata_recheck_item",
+        lambda *_args: prepared,
+    )
+
+    async def fatal_update(*_args: Any, **_kwargs: Any) -> BatchRecord:
+        raise service_module._MetadataUpdateRollbackError("rollback incomplete")
+
+    monkeypatch.setattr(service, "_update_submission_metadata_locked", fatal_update)
+    decision = MetadataRecheckDecision(
+        item_id=item.item_id,
+        base_metadata_sha256=base_hash,
+        values={"student_name": "新姓名"},
+        accepted_fields=["student_name"],
+        human_reviewed=True,
+    )
+
+    with pytest.raises(
+        service_module._MetadataUpdateRollbackError,
+        match="rollback incomplete",
+    ):
+        await service.apply_batch_metadata_recheck(record.batch_id, [decision])
+
+
+@pytest.mark.asyncio
+async def test_batch_metadata_recheck_continues_after_ordinary_item_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _record(
+        tmp_path,
+        [BatchItemStatus.COMPLETED, BatchItemStatus.COMPLETED],
+    )
+    prepared_by_id: dict[str, Any] = {}
+    decisions: list[MetadataRecheckDecision] = []
+    for index, item in enumerate(record.items, start=1):
+        item.run_id = f"run-partial-{index}"
+        item.metadata = _metadata(f"旧姓名{index}")
+        base_hash = submission_metadata_sha256(item.metadata)
+        prepared_by_id[item.item_id] = SimpleNamespace(
+            preview=SimpleNamespace(base_metadata_sha256=base_hash),
+            current=item.metadata,
+            candidate=item.metadata.model_copy(update={"student_name": f"新姓名{index}"}),
+        )
+        decisions.append(
+            MetadataRecheckDecision(
+                item_id=item.item_id,
+                base_metadata_sha256=base_hash,
+                values={"student_name": f"新姓名{index}"},
+                accepted_fields=["student_name"],
+                human_reviewed=True,
+            )
+        )
+    store = MemoryBatchStore()
+    store.create(record)
+    service = _service(tmp_path, store)
+    monkeypatch.setattr(
+        service_module,
+        "_prepare_batch_metadata_recheck_item",
+        lambda _runs_dir, item: prepared_by_id[item.item_id],
+    )
+    calls: list[str] = []
+
+    async def update_one(
+        _batch_id: str,
+        item_id: str,
+        metadata: SubmissionMetadata,
+    ) -> BatchRecord:
+        calls.append(item_id)
+        if item_id == record.items[0].item_id:
+            raise OSError("ordinary per-item failure")
+        updated = store.load(record.batch_id)
+        updated.items[1].metadata = metadata
+        store.save(updated)
+        return updated
+
+    monkeypatch.setattr(service, "_update_submission_metadata_locked", update_one)
+
+    result = await service.apply_batch_metadata_recheck(record.batch_id, decisions)
+
+    assert calls == [item.item_id for item in record.items]
+    assert result.updated_item_ids == [record.items[1].item_id]
+    assert result.failed_items == {
+        record.items[0].item_id: "本地重检结果应用失败；原报告和批次记录已保持不变。"
+    }
+
+
+@pytest.mark.asyncio
+async def test_batch_metadata_recheck_rejects_missing_or_false_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _record(
+        tmp_path,
+        [BatchItemStatus.COMPLETED, BatchItemStatus.COMPLETED],
+    )
+    prepared_by_id: dict[str, Any] = {}
+    decisions: list[MetadataRecheckDecision] = []
+    for index, item in enumerate(record.items):
+        item.run_id = f"run-unconfirmed-{index}"
+        item.metadata = _metadata(f"旧姓名{index}")
+        base_hash = submission_metadata_sha256(item.metadata)
+        prepared_by_id[item.item_id] = SimpleNamespace(
+            preview=SimpleNamespace(base_metadata_sha256=base_hash),
+            current=item.metadata,
+            candidate=item.metadata.model_copy(update={"student_name": f"新姓名{index}"}),
+        )
+        payload: dict[str, Any] = {
+            "item_id": item.item_id,
+            "base_metadata_sha256": base_hash,
+            "values": {"student_name": f"新姓名{index}"},
+            "accepted_fields": ["student_name"],
+        }
+        if index == 1:
+            payload["human_reviewed"] = False
+        decisions.append(MetadataRecheckDecision.model_validate(payload))
+    store = MemoryBatchStore()
+    store.create(record)
+    service = _service(tmp_path, store)
+    monkeypatch.setattr(
+        service_module,
+        "_prepare_batch_metadata_recheck_item",
+        lambda _runs_dir, item: prepared_by_id[item.item_id],
+    )
+
+    async def must_not_update(*_args: Any, **_kwargs: Any) -> BatchRecord:
+        pytest.fail("unconfirmed metadata decision must not update files")
+
+    monkeypatch.setattr(service, "_update_submission_metadata_locked", must_not_update)
+
+    result = await service.apply_batch_metadata_recheck(record.batch_id, decisions)
+
+    assert result.updated_item_ids == []
+    assert result.failed_items == {
+        item.item_id: "应用重新检查结果前，必须明确确认已人工核对。"
+        for item in record.items
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure_stage", ["metadata", "report_bundle", "pdf", "csv", "manifest"])
 async def test_metadata_correction_rolls_back_every_published_file_on_failure(
     tmp_path: Path,
@@ -1040,11 +1490,7 @@ async def test_metadata_correction_rolls_back_every_published_file_on_failure(
         else BatchStore(tmp_path / "batches")
     )
     service, record, run_dir, old_report = _metadata_update_case(tmp_path, store)
-    old_run_files = {
-        path.name: path.read_bytes()
-        for path in run_dir.iterdir()
-        if path.is_file()
-    }
+    old_run_files = {path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()}
     old_pdf = old_report.read_bytes()
     assert record.summary_path is not None
     csv_path = record.summary_path
@@ -1068,10 +1514,7 @@ async def test_metadata_correction_rolls_back_every_published_file_on_failure(
             _metadata("新姓名"),
         )
 
-    assert {
-        name: (run_dir / name).read_bytes()
-        for name in old_run_files
-    } == old_run_files
+    assert {name: (run_dir / name).read_bytes() for name in old_run_files} == old_run_files
     assert old_report.read_bytes() == old_pdf
     assert csv_path.read_bytes() == old_csv
     assert store.load(record.batch_id) == old_manifest
@@ -1204,7 +1647,154 @@ def _install_metadata_update_fakes(
     if failure_stage == "metadata":
         monkeypatch.setattr(
             "paper_reviewer.application.artifacts.RunArtifactStore.write_model",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                OSError("injected metadata failure")
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("injected metadata failure")),
         )
+
+
+def _create_recheck_pdf(path: Path) -> None:
+    document = pymupdf.open()
+    cover = document.new_page()
+    cover.insert_text((70, 80), "《人工智能导论》课程试题", fontsize=16, fontname="china-s")
+    cover.insert_text((70, 130), "任课教师：李老师", fontsize=12, fontname="china-s")
+    cover.insert_text((70, 165), "姓名：张三 得分：", fontsize=12, fontname="china-s")
+    cover.insert_text((70, 200), "学号：202600010001", fontsize=12, fontname="china-s")
+    page = document.new_page()
+    page.insert_textbox(
+        pymupdf.Rect(40, 65, page.rect.width - 40, 105),
+        "智能时代学习能力重构：挑战、框架与实践路径",
+        fontsize=18,
+        fontname="china-s",
+        align=pymupdf.TEXT_ALIGN_CENTER,
+    )
+    page.insert_text(
+        (70, 145), "摘要：本文讨论大学生核心能力重构。", fontsize=11, fontname="china-s"
+    )
+    page.insert_textbox(
+        pymupdf.Rect(70, 180, page.rect.width - 70, 700),
+        "本文依据课程评价标准分析人工智能时代的学习能力、论证结构和培养路径。" * 20,
+        fontsize=11,
+        fontname="china-s",
+    )
+    document.set_metadata({"title": "示例学院"})
+    document.save(path)
+    document.close()
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_batch_metadata_recheck_preview_is_local_read_only_and_apply_is_per_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request(tmp_path)
+    source = request.source_dir / "平台下载论文.pdf"
+    _create_recheck_pdf(source)
+    item = scan_batch_sources(request)[0]
+    item.status = BatchItemStatus.COMPLETED
+    item.run_id = "run-recheck"
+    current = _metadata("张三 得分：").model_copy(
+        update={
+            "schema_version": "1.0",
+            "paper_title": "示例学院",
+            "field_evidence": {
+                **_metadata().field_evidence,
+                "student_name": SubmissionFieldEvidence(
+                    source=SubmissionMetadataSource.COVER_LABEL,
+                    confidence=0.95,
+                    page=1,
+                    evidence="姓名：张三 得分：",
+                ),
+                "paper_title": SubmissionFieldEvidence(
+                    source=SubmissionMetadataSource.PDF_METADATA,
+                    confidence=0.95,
+                    evidence="示例学院",
+                ),
+            },
+        }
+    )
+    item.metadata = current
+    record = BatchRecord(
+        batch_id="batch-recheck",
+        status=BatchStatus.COMPLETED,
+        request=request,
+        rubric_snapshot=load_rubric(COURSE_RUBRIC),
+        profile_snapshot=load_review_profile(COURSE_PROFILE),
+        provider_snapshot=_provider(),
+        items=[item],
+    )
+    store = BatchStore(tmp_path / "batches")
+    store.create(record)
+    run_dir = tmp_path / "runs" / item.run_id
+    run_dir.mkdir(parents=True)
+    RunArtifactStore(run_dir).write_model("submission-metadata.json", current)
+    service = _service(tmp_path, store)
+    monkeypatch.setattr(
+        service,
+        "_start_review_from_snapshots",
+        lambda *_args, **_kwargs: pytest.fail("metadata recheck must not call a model"),
+    )
+    protected = [source, store.manifest_path(record.batch_id), run_dir / "submission-metadata.json"]
+    before = {path: _file_digest(path) for path in protected}
+
+    preview = await service.preview_batch_metadata_recheck(record.batch_id)
+
+    assert {path: _file_digest(path) for path in protected} == before
+    assert len(preview.items) == 1
+    recheck_item = preview.items[0]
+    by_field = {suggestion.field: suggestion for suggestion in recheck_item.suggestions}
+    assert by_field["student_name"].suggested_value == "张三"
+    assert by_field["paper_title"].suggested_value == (
+        "智能时代学习能力重构：挑战、框架与实践路径"
+    )
+    assert by_field["paper_title"].evidence.source is SubmissionMetadataSource.VISIBLE_HEADING
+
+    missing = await service.preview_batch_metadata_recheck(
+        record.batch_id,
+        item_ids=["missing-item"],
+    )
+    assert missing.items == []
+    assert missing.skipped == {"missing-item": "批次中不存在该论文。"}
+
+    captured: list[SubmissionMetadata] = []
+
+    async def apply_local(
+        _batch_id: str,
+        _item_id: str,
+        metadata: SubmissionMetadata,
+    ) -> BatchRecord:
+        captured.append(metadata.model_copy(deep=True))
+        updated = store.load(record.batch_id)
+        updated.items[0].metadata = metadata
+        store.save(updated)
+        return updated
+
+    monkeypatch.setattr(service, "_update_submission_metadata_locked", apply_local)
+    values = {
+        "student_name": by_field["student_name"].suggested_value,
+        "student_id": current.student_id,
+        "major": current.major,
+        "paper_title": by_field["paper_title"].suggested_value,
+    }
+    decision = MetadataRecheckDecision(
+        item_id=item.item_id,
+        base_metadata_sha256=recheck_item.base_metadata_sha256,
+        values=values,
+        accepted_fields=["student_name", "paper_title"],
+        human_reviewed=True,
+    )
+
+    result = await service.apply_batch_metadata_recheck(record.batch_id, [decision])
+
+    assert result.updated_item_ids == [item.item_id]
+    assert result.failed_items == {}
+    assert len(captured) == 1
+    assert captured[0].student_name == "张三"
+    assert captured[0].paper_title == values["paper_title"]
+    assert captured[0].human_reviewed is True
+    assert captured[0].field_evidence["paper_title"].source is (
+        SubmissionMetadataSource.HUMAN_CORRECTION
+    )
+    assert submission_metadata_sha256(current) == recheck_item.base_metadata_sha256

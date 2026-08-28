@@ -6,7 +6,7 @@ import re
 import shutil
 import tempfile
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
@@ -33,6 +33,7 @@ from paper_reviewer.application.batch_output import (
     allocate_report_path,
     build_report_filename,
     claim_batch_output_directory,
+    is_allocated_report_filename,
     release_batch_output_directory_claim,
     write_batch_summary_csv,
 )
@@ -43,7 +44,19 @@ from paper_reviewer.application.batch_store import (
     scan_batch_sources,
     validate_source_snapshot,
 )
+from paper_reviewer.application.metadata_extractor import suggest_submission_metadata_locally
+from paper_reviewer.application.metadata_recheck import (
+    MetadataRecheckValidationError,
+    apply_metadata_recheck_decision,
+    build_metadata_suggestions,
+    metadata_requires_local_recheck,
+    submission_metadata_sha256,
+)
 from paper_reviewer.application.models import (
+    BatchMetadataRecheckItem,
+    BatchMetadataRecheckPreview,
+    BatchMetadataRecheckResult,
+    MetadataRecheckDecision,
     ProviderCompatibilityResult,
     ProviderErrorDetails,
     ProviderResponseDiagnostics,
@@ -970,6 +983,7 @@ class ReviewApplicationService:
                 record.request.output_dir,
                 metadata,
                 run.run_id,
+                source_filename=item.source.filename,
             )
             item.updated_at = datetime.now(UTC)
             record.updated_at = item.updated_at
@@ -1001,11 +1015,131 @@ class ReviewApplicationService:
         record.updated_at = item.updated_at
         await asyncio.to_thread(store.save, record)
 
+    async def preview_batch_metadata_recheck(
+        self,
+        batch_id: str,
+        item_ids: Sequence[str] | None = None,
+    ) -> BatchMetadataRecheckPreview:
+        """Reparse historical sources and preview local-only metadata improvements."""
+
+        lock_store = BatchStore(self.paths.batches_dir)
+        with lock_store.execution_lock(batch_id):
+            record = await asyncio.to_thread(self._batch_store().load, batch_id)
+            items: list[BatchMetadataRecheckItem] = []
+            skipped: dict[str, str] = {}
+            requested_ids = set(item_ids) if item_ids is not None else None
+            if requested_ids is not None:
+                known_ids = {item.item_id for item in record.items}
+                for missing_id in sorted(requested_ids - known_ids):
+                    skipped[missing_id] = "批次中不存在该论文。"
+            for item in record.items:
+                if requested_ids is not None and item.item_id not in requested_ids:
+                    continue
+                if (
+                    requested_ids is None
+                    and item.metadata is not None
+                    and not metadata_requires_local_recheck(item.metadata)
+                ):
+                    continue
+                try:
+                    prepared = await _metadata_update_to_thread(
+                        _prepare_batch_metadata_recheck_item,
+                        self.settings.runs_dir,
+                        item,
+                    )
+                except _MetadataRecheckUnavailable as error:
+                    skipped[item.item_id] = error.public_message
+                except Exception:
+                    skipped[item.item_id] = "本地重检失败；源 PDF 或任务快照无法读取。"
+                else:
+                    items.append(prepared.preview)
+            return BatchMetadataRecheckPreview(
+                batch_id=batch_id,
+                items=items,
+                skipped=skipped,
+            )
+
+    async def apply_batch_metadata_recheck(
+        self,
+        batch_id: str,
+        decisions: Sequence[MetadataRecheckDecision],
+    ) -> BatchMetadataRecheckResult:
+        """Apply verified local suggestions item by item without invoking a model."""
+
+        lock_store = BatchStore(self.paths.batches_dir)
+        with lock_store.execution_lock(batch_id):
+            store = self._batch_store()
+            record = await asyncio.to_thread(store.load, batch_id)
+            updated: list[str] = []
+            failed: dict[str, str] = {}
+            skipped: list[str] = []
+            seen: set[str] = set()
+            for decision in decisions:
+                item_id = decision.item_id
+                if item_id in seen:
+                    failed[item_id] = "同一论文出现重复决定，请重新预检。"
+                    continue
+                seen.add(item_id)
+                try:
+                    item = _batch_item(record, item_id)
+                except ValueError:
+                    failed[item_id] = "批次中不存在该论文。"
+                    continue
+                try:
+                    prepared = await _metadata_update_to_thread(
+                        _prepare_batch_metadata_recheck_item,
+                        self.settings.runs_dir,
+                        item,
+                    )
+                except _MetadataRecheckUnavailable as error:
+                    failed[item_id] = error.public_message
+                    continue
+                except Exception:
+                    failed[item_id] = "本地重检失败；源 PDF 或任务快照无法读取。"
+                    continue
+                if decision.base_metadata_sha256 != prepared.preview.base_metadata_sha256:
+                    failed[item_id] = "元数据已变化，请重新预检后再应用。"
+                    continue
+                try:
+                    replacement = apply_metadata_recheck_decision(
+                        prepared.current,
+                        prepared.candidate,
+                        decision,
+                    )
+                except MetadataRecheckValidationError as error:
+                    failed[item_id] = str(error)
+                    continue
+                if replacement is None:
+                    skipped.append(item_id)
+                    continue
+                try:
+                    record = await self._update_submission_metadata_locked(
+                        batch_id,
+                        item_id,
+                        replacement,
+                    )
+                except _MetadataUpdateRollbackError:
+                    # The on-disk state may now need manual recovery. Continuing
+                    # could build later updates on an inconsistent manifest.
+                    raise
+                except Exception:
+                    failed[item_id] = "本地重检结果应用失败；原报告和批次记录已保持不变。"
+                    continue
+                updated.append(item_id)
+            return BatchMetadataRecheckResult(
+                batch_id=batch_id,
+                updated_item_ids=updated,
+                failed_items=failed,
+                skipped_item_ids=skipped,
+            )
+
     async def update_submission_metadata(
         self,
         batch_id: str,
         item_id: str,
         metadata: SubmissionMetadata,
+        *,
+        expected_metadata_sha256: str | None = None,
     ) -> BatchRecord:
         """Apply a local correction and rebuild Markdown, PDF and CSV without an LLM."""
 
@@ -1015,6 +1149,7 @@ class ReviewApplicationService:
                 batch_id,
                 item_id,
                 metadata,
+                expected_metadata_sha256=expected_metadata_sha256,
             )
 
     async def _update_submission_metadata_locked(
@@ -1022,6 +1157,8 @@ class ReviewApplicationService:
         batch_id: str,
         item_id: str,
         metadata: SubmissionMetadata,
+        *,
+        expected_metadata_sha256: str | None = None,
     ) -> BatchRecord:
         """Stage and atomically publish one metadata correction."""
 
@@ -1029,6 +1166,15 @@ class ReviewApplicationService:
         record = await asyncio.to_thread(store.load, batch_id)
         original_record = record.model_copy(deep=True)
         item = _batch_item(record, item_id)
+        if expected_metadata_sha256 is not None:
+            if (
+                item.metadata is None
+                or submission_metadata_sha256(item.metadata)
+                != expected_metadata_sha256
+            ):
+                raise ValueError(
+                    "论文信息已被其他窗口更新，请重新打开核对窗口。"
+                )
         if item.run_id is None:
             raise ValueError("该论文尚未创建评测任务，不能修改报告信息。")
 
@@ -1041,7 +1187,11 @@ class ReviewApplicationService:
         await asyncio.to_thread(_ensure_batch_output_directory, output_dir)
 
         old_report_path = _managed_item_report_path(record, item)
-        desired_name = build_report_filename(metadata, item.run_id)
+        desired_name = build_report_filename(
+            metadata,
+            item.run_id,
+            source_filename=item.source.filename,
+        )
         same_destination = (
             old_report_path is not None
             and old_report_path.name.casefold() == desired_name.casefold()
@@ -1049,7 +1199,12 @@ class ReviewApplicationService:
         destination = (
             old_report_path
             if same_destination and old_report_path is not None
-            else allocate_report_path(output_dir, metadata, item.run_id)
+            else allocate_report_path(
+                output_dir,
+                metadata,
+                item.run_id,
+                source_filename=item.source.filename,
+            )
         )
         destination = _validated_export_destination(
             destination,
@@ -1078,6 +1233,7 @@ class ReviewApplicationService:
                     else None
                 ),
                 destination=destination,
+                destination_must_be_absent=not same_destination,
                 run=report.run,
                 rubric=report.rubric,
                 selected_report=selected_report,
@@ -1095,16 +1251,18 @@ class ReviewApplicationService:
             restore_errors: list[BaseException] = []
             if manifest_save_started:
                 try:
-                    await _metadata_update_to_thread(
+                    await _metadata_cleanup_to_thread(
                         _restore_batch_manifest_if_needed,
                         store,
                         original_record,
                     )
                 except BaseException as restore_error:
                     restore_errors.append(restore_error)
-            restore_errors.extend(await _metadata_update_to_thread(transaction.rollback))
+            restore_errors.extend(
+                await _metadata_cleanup_to_thread(transaction.rollback)
+            )
             if restore_errors:
-                raise RuntimeError(
+                raise _MetadataUpdateRollbackError(
                     "元数据修正失败，且自动回滚未完全完成；旧文件备份已保留，请勿继续操作该批次。"
                 ) from error
             raise
@@ -1859,11 +2017,81 @@ def _write_batch_csv(record: BatchRecord) -> None:
     )
 
 
+class _MetadataUpdateRollbackError(RuntimeError):
+    """A fatal metadata update failure whose rollback was incomplete."""
+
+
+class _MetadataRecheckUnavailable(ValueError):
+    def __init__(self, public_message: str) -> None:
+        super().__init__(public_message)
+        self.public_message = public_message
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMetadataRecheck:
+    preview: BatchMetadataRecheckItem
+    current: SubmissionMetadata
+    candidate: SubmissionMetadata
+
+
+def _prepare_batch_metadata_recheck_item(
+    runs_dir: Path,
+    item: BatchItem,
+) -> _PreparedMetadataRecheck:
+    if item.status is not BatchItemStatus.COMPLETED:
+        raise _MetadataRecheckUnavailable("仅已完成评测的论文可以进行本地元数据重检。")
+    if item.run_id is None or item.metadata is None:
+        raise _MetadataRecheckUnavailable("该论文缺少已完成的元数据快照。")
+
+    run_dir = _validated_run_dir(runs_dir, item.run_id)
+    if not run_dir.is_dir():
+        raise _MetadataRecheckUnavailable("该论文的任务快照目录不存在。")
+    try:
+        artifact_metadata = RunArtifactStore(run_dir).load_model(
+            "submission-metadata.json",
+            SubmissionMetadata,
+        )
+    except (OSError, UnicodeError, ValueError):
+        raise _MetadataRecheckUnavailable("该论文的元数据快照缺失或无法读取。") from None
+
+    current_hash = submission_metadata_sha256(item.metadata)
+    if submission_metadata_sha256(artifact_metadata) != current_hash:
+        raise _MetadataRecheckUnavailable("批次清单与任务元数据不一致，不能自动重检。")
+
+    try:
+        validate_source_snapshot(item.source)
+        parsed = PyMuPDFParser().parse(item.source.path)
+        validate_source_snapshot(item.source)
+    except (OSError, UnicodeError, ValueError):
+        raise _MetadataRecheckUnavailable("源 PDF 已变化、缺失或无法进行本地重检。") from None
+    if parsed.info.sha256 != item.source.sha256:
+        raise _MetadataRecheckUnavailable("源 PDF 哈希与批次快照不一致。")
+
+    candidate = suggest_submission_metadata_locally(
+        document=parsed.info,
+        blocks=parsed.blocks,
+        current=item.metadata,
+    )
+    suggestions, unresolved = build_metadata_suggestions(item.metadata, candidate)
+    return _PreparedMetadataRecheck(
+        preview=BatchMetadataRecheckItem(
+            item_id=item.item_id,
+            source_filename=item.source.filename,
+            base_metadata_sha256=current_hash,
+            suggestions=suggestions,
+            unresolved_fields=unresolved,
+        ),
+        current=item.metadata.model_copy(deep=True),
+        candidate=candidate,
+    )
+
+
 @dataclass(slots=True)
 class _MetadataFileOperation:
     destination: Path
     prepared: Path | None
     backup: Path
+    must_be_absent: bool = False
     original_moved: bool = False
     replacement_installed: bool = False
 
@@ -1887,7 +2115,12 @@ class _MetadataUpdateFileTransaction:
             prepared.unlink(missing_ok=True)
             raise
 
-    def prepare_replacement(self, destination: Path) -> Path:
+    def prepare_replacement(
+        self,
+        destination: Path,
+        *,
+        must_be_absent: bool = False,
+    ) -> Path:
         destination = Path(os.path.abspath(destination))
         destination.parent.mkdir(parents=True, exist_ok=True)
         self._reserve_destination(destination)
@@ -1899,6 +2132,7 @@ class _MetadataUpdateFileTransaction:
                 destination=destination,
                 prepared=prepared,
                 backup=destination.with_name(f".{destination.name}.{self._token}.bak"),
+                must_be_absent=must_be_absent,
             )
         )
         return prepared
@@ -1923,6 +2157,10 @@ class _MetadataUpdateFileTransaction:
                 raise FileExistsError(
                     f"metadata update backup path already exists: {operation.backup.name}"
                 )
+            if operation.must_be_absent and _path_present(destination):
+                raise FileExistsError(
+                    f"metadata update target appeared after allocation: {destination.name}"
+                )
             if _path_present(destination):
                 if not destination.is_file():
                     raise ValueError(f"metadata update target is not a file: {destination.name}")
@@ -1933,6 +2171,13 @@ class _MetadataUpdateFileTransaction:
                     raise FileNotFoundError(
                         f"metadata update staged file is missing: {destination.name}"
                     )
+                if operation.must_be_absent:
+                    # A hard-link publish is atomic and fails rather than
+                    # replacing a file created after path allocation.
+                    os.link(operation.prepared, destination)
+                    operation.replacement_installed = True
+                    operation.prepared.unlink()
+                    continue
                 os.replace(operation.prepared, destination)
                 operation.replacement_installed = True
 
@@ -1984,6 +2229,7 @@ def _stage_metadata_update_files(
     output_dir: Path,
     old_report_path: Path | None,
     destination: Path,
+    destination_must_be_absent: bool,
     run: RunRecord,
     rubric: RubricProfile,
     selected_report: Any,
@@ -2032,7 +2278,10 @@ def _stage_metadata_update_files(
             transaction.stage_copy(run_dir / presentation_source.name, presentation_source)
 
         markdown = (build_dir / "report.md").read_text(encoding="utf-8")
-        staged_pdf = transaction.prepare_replacement(destination)
+        staged_pdf = transaction.prepare_replacement(
+            destination,
+            must_be_absent=destination_must_be_absent,
+        )
         title = _markdown_title(markdown) or Path(run.input_path).stem
         render_pdf(markdown, staged_pdf, title=title)
         validate_pdf(staged_pdf, markdown)
@@ -2063,8 +2312,24 @@ def _managed_item_report_path(record: BatchRecord, item: BatchItem) -> Path | No
     output_dir = record.request.output_dir.resolve()
     if candidate.parent != output_dir or candidate.is_symlink():
         return None
-    expected_name = build_report_filename(item.metadata, item.run_id)
-    if candidate.name.casefold() != expected_name.casefold():
+    managed_metadata = [item.metadata]
+    if item.metadata.schema_version == "1.0" and item.metadata.needs_review:
+        # Before schema 1.1 introduced safe pending-review names, completed
+        # reports always used the standard metadata-derived name. Accept that
+        # one exact legacy name so it can be retired, while still rejecting
+        # arbitrary files merely referenced by a modified manifest.
+        legacy_confirmed = item.metadata.model_copy(update={"human_reviewed": True})
+        managed_metadata.append(legacy_confirmed)
+    if not any(
+        is_allocated_report_filename(
+            output_dir,
+            candidate.name,
+            metadata,
+            item.run_id,
+            source_filename=item.source.filename,
+        )
+        for metadata in managed_metadata
+    ):
         return None
     if _path_present(candidate) and not candidate.is_file():
         return None
@@ -2099,14 +2364,39 @@ async def _metadata_update_to_thread(
     """Let an in-flight file operation settle before cancellation rollback."""
 
     operation_task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    try:
-        return await asyncio.shield(operation_task)
-    except asyncio.CancelledError:
+    cancellation_requested = False
+    while not operation_task.done():
         try:
-            await operation_task
+            await asyncio.shield(operation_task)
+        except asyncio.CancelledError:
+            # Repeated Task.cancel() calls must not let the caller escape while
+            # the filesystem thread can still mutate files outside its lock.
+            cancellation_requested = True
+            continue
+    if cancellation_requested:
+        try:
+            operation_task.result()
         except BaseException:
             pass
-        raise
+        raise asyncio.CancelledError
+    return operation_task.result()
+
+
+async def _metadata_cleanup_to_thread(
+    function: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Finish rollback work and preserve its result despite repeated cancellation."""
+
+    operation_task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    while not operation_task.done():
+        try:
+            await asyncio.shield(operation_task)
+        except asyncio.CancelledError:
+            continue
+    return operation_task.result()
 
 
 def _path_present(path: Path) -> bool:

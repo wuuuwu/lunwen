@@ -149,16 +149,77 @@ def test_batch_items_model_exposes_chinese_status_metadata_and_accessibility(
     model.set_item_stage(item.item_id, "Meta 汇总")
 
     assert model.rowCount() == 1
-    assert model.columnCount() == 9
+    assert model.columnCount() == 10
     assert model.data(model.index(0, 1)) == "张三"
-    assert model.data(model.index(0, 5)) == "Meta 汇总"
-    assert model.data(model.index(0, 6)) == "已完成"
-    assert model.data(model.index(0, 7)) == "82.5"
-    assert model.data(model.index(0, 8)) == "已生成"
+    assert model.data(model.index(0, 5)) == "待核对（姓名、学号、专业、题目）"
+    assert model.data(model.index(0, 6)) == "Meta 汇总"
+    assert model.data(model.index(0, 7)) == "已完成"
+    assert model.data(model.index(0, 8)) == "82.5"
+    assert model.data(model.index(0, 9)) == "已生成"
     assert model.data(model.index(0, 0), model.ItemIdRole) == "item-1"
     assert "需要人工核对" in str(
         model.data(model.index(0, 1), Qt.ItemDataRole.AccessibleDescriptionRole)
     )
+
+    automatic = _item(tmp_path, item_id="item-auto")
+    automatic.metadata = _metadata(needs_review=False)
+    model.set_items([automatic])
+    assert model.data(model.index(0, 5)) == "自动提取"
+    assert model.data(model.index(0, 5), model.MetadataReviewRole) == "automatic"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "source", "column"),
+    [
+        (
+            "paper_title",
+            "示例学院",
+            SubmissionMetadataSource.PDF_METADATA,
+            4,
+        ),
+        (
+            "student_name",
+            "张三 得分：",
+            SubmissionMetadataSource.COVER_LABEL,
+            1,
+        ),
+    ],
+)
+def test_batch_items_model_marks_historical_metadata_anomalies_for_recheck(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    source: SubmissionMetadataSource,
+    column: int,
+) -> None:
+    item = _item(tmp_path, item_id=f"legacy-{field}")
+    assert item.metadata is not None
+    item.metadata = item.metadata.model_copy(
+        update={
+            "field_evidence": {
+                metadata_field: detail.model_copy(update={"confidence": 0.95})
+                for metadata_field, detail in item.metadata.field_evidence.items()
+            }
+        }
+    )
+    evidence = item.metadata.field_evidence[field].model_copy(
+        update={"source": source, "confidence": 0.95}
+    )
+    item.metadata = item.metadata.model_copy(
+        update={
+            field: value,
+            "field_evidence": {**item.metadata.field_evidence, field: evidence},
+        }
+    )
+
+    model = BatchItemsTableModel()
+    model.set_items([item])
+
+    expected_field = "题目" if field == "paper_title" else "姓名"
+    assert model.data(model.index(0, 5)) == f"建议重新检查（{expected_field}）"
+    assert model.data(model.index(0, 5), model.MetadataReviewRole) == "recheck"
+    tooltip = str(model.data(model.index(0, column), Qt.ItemDataRole.ToolTipRole))
+    assert "建议重新检查" in tooltip
 
 
 def test_course_batch_new_page_scans_top_level_and_emits_valid_request(
@@ -374,7 +435,10 @@ def test_course_batch_detail_actions_events_and_keyboard_open(
     assert not page.resume_button.isEnabled()
     assert page.open_run_button.isEnabled()
     assert page.edit_metadata_button.isEnabled()
+    assert not page.recheck_metadata_button.isEnabled()
     assert "已处理 2 / 2" in page.batch_progress.text()
+    assert "待核对 2 篇" in page.metadata_review_summary.text()
+    assert "尚未人工核对" in page.selection_review_message.message_label.text()
 
     stopped: list[str] = []
     opened: list[str] = []
@@ -405,16 +469,115 @@ def test_course_batch_detail_actions_events_and_keyboard_open(
         payload={"stage": "报告生成"},
     )
     page.apply_event(event)
-    assert page.model.data(page.model.index(1, 5)) == "报告生成"
+    assert page.model.data(page.model.index(1, 6)) == "报告生成"
     assert "正在生成报告" in page.message.message_label.text()
 
     page.set_batch(
         _batch(tmp_path, [completed, failed], status=BatchStatus.COMPLETED_WITH_ERRORS)
     )
     assert page.retry_button.isEnabled()
+    assert page.recheck_metadata_button.isEnabled()
     page.set_busy(True, action="retry")
     assert page.retry_button.property("fluentBusy") is True
     assert not page.retry_button.isEnabled()
+
+
+def test_batch_metadata_review_summary_signal_busy_and_reviewed_selection(
+    qapp: QApplication,
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    pending = _item(tmp_path)
+    reviewed = _item(tmp_path, item_id="item-2")
+    assert reviewed.metadata is not None
+    reviewed.metadata = reviewed.metadata.model_copy(update={"human_reviewed": True})
+    page = CourseBatchDetailPage(_icons(qapp))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    page.set_batch(
+        _batch(tmp_path, [pending, reviewed], status=BatchStatus.COMPLETED)
+    )
+    page.show()
+
+    assert "待核对 1 篇" in page.metadata_review_summary.text()
+    assert "已核对 1 篇" in page.metadata_review_summary.text()
+    assert page.recheck_metadata_button.objectName() == "recheckBatchMetadataButton"
+    assert page.recheck_metadata_button.accessibleName()
+    assert page.recheck_metadata_button.isEnabled()
+
+    requested: list[str] = []
+    page.metadata_recheck_requested.connect(requested.append)
+    page.recheck_metadata_button.click()
+    assert requested == ["batch-1"]
+
+    page.table.selectRow(0)
+    assert page.selection_review_message.isVisible()
+    assert page.edit_metadata_button.text() == "核对/修改信息"
+    page.table.selectRow(1)
+    assert not page.selection_review_message.isVisible()
+    assert page.edit_metadata_button.text() == "查看/修改信息"
+
+    page.set_busy(True, action="metadata_recheck")
+    assert page.recheck_metadata_button.property("fluentBusy") is True
+
+
+def test_batch_detail_busy_token_cannot_be_released_by_stale_operation(
+    qapp: QApplication,
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    page = CourseBatchDetailPage(_icons(qapp))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    first = _batch(tmp_path, [_item(tmp_path)], status=BatchStatus.COMPLETED)
+    second = first.model_copy(update={"batch_id": "batch-2"})
+    page.set_batch(first)
+    first_key = (first.batch_id, 1)
+    second_key = (first.batch_id, 2)
+
+    page.set_busy(True, action="metadata_recheck", token=first_key)
+    page.set_busy(False, token=second_key)
+    assert page.recheck_metadata_button.property("fluentBusy") is True
+
+    page.set_batch(second)
+    current_key = (second.batch_id, 3)
+    page.set_busy(True, action="metadata_recheck", token=current_key)
+    page.set_busy(False, token=first_key)
+    assert page.recheck_metadata_button.property("fluentBusy") is True
+
+
+def test_batch_detail_summary_and_warning_include_historical_metadata_anomalies(
+    qapp: QApplication,
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    item = _item(tmp_path)
+    assert item.metadata is not None
+    title_evidence = item.metadata.field_evidence["paper_title"].model_copy(
+        update={"source": SubmissionMetadataSource.PDF_METADATA, "confidence": 0.95}
+    )
+    item.metadata = item.metadata.model_copy(
+        update={
+            "field_evidence": {
+                **item.metadata.field_evidence,
+                "paper_title": title_evidence,
+            }
+        }
+    )
+    page = CourseBatchDetailPage(_icons(qapp))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    page.set_batch(_batch(tmp_path, [item], status=BatchStatus.COMPLETED))
+    page.show()
+    page.table.selectRow(0)
+
+    assert "待核对 1 篇" in page.metadata_review_summary.text()
+    assert "自动提取" not in page.metadata_review_summary.text()
+    assert page.selection_review_message.isVisible()
+    assert "题目" in page.selection_review_message.message_label.text()
+
+    item.metadata = item.metadata.model_copy(update={"human_reviewed": True})
+    page.set_batch(_batch(tmp_path, [item], status=BatchStatus.COMPLETED))
+    assert "待核对 0 篇" in page.metadata_review_summary.text()
+    assert "已核对 1 篇" in page.metadata_review_summary.text()
+    assert not page.selection_review_message.isVisible()
 
 
 def test_course_batch_pages_have_stable_accessible_controls(
@@ -436,3 +599,5 @@ def test_course_batch_pages_have_stable_accessible_controls(
     assert detail_page.table.objectName() == "courseBatchItemsTable"
     assert detail_page.stop_button.accessibleName()
     assert detail_page.edit_metadata_button.accessibleName()
+    assert detail_page.recheck_metadata_button.accessibleName()
+    assert detail_page.selection_review_message.accessibleName()

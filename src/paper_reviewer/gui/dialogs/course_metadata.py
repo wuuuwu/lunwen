@@ -5,6 +5,7 @@ from itertools import pairwise
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -15,6 +16,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from paper_reviewer.application.metadata_recheck import (
+    metadata_recheck_fields,
+    metadata_requires_local_recheck,
+)
 from paper_reviewer.domain.submission import (
     SUBMISSION_METADATA_FIELDS,
     SubmissionFieldEvidence,
@@ -28,6 +33,15 @@ _FIELD_LABELS: Mapping[str, str] = {
     "student_id": "学号",
     "major": "专业",
     "paper_title": "题目",
+}
+_SOURCE_LABELS: Mapping[SubmissionMetadataSource, str] = {
+    SubmissionMetadataSource.COVER_LABEL: "封面明确标签",
+    SubmissionMetadataSource.VISIBLE_HEADING: "正文可见标题",
+    SubmissionMetadataSource.MODEL_EVIDENCE: "模型证据候选",
+    SubmissionMetadataSource.PDF_METADATA: "旧版 PDF 隐藏元数据",
+    SubmissionMetadataSource.FILE_NAME: "结构化文件名",
+    SubmissionMetadataSource.HUMAN_CORRECTION: "人工修正",
+    SubmissionMetadataSource.PLACEHOLDER: "未识别占位值",
 }
 
 
@@ -49,10 +63,13 @@ class CourseMetadataDialog(QDialog):
         self._original = metadata.model_copy(deep=True)
         self._result_metadata: SubmissionMetadata | None = None
         self._edits: dict[str, QLineEdit] = {}
+        self._evidence_labels: dict[str, QLabel] = {}
+        self._edit_revision = 0
+        self._confirmed_revision: int | None = None
 
         self.setObjectName("courseMetadataDialog")
         self.setModal(True)
-        self.setWindowTitle("修改论文信息")
+        self.setWindowTitle("核对/修改论文信息")
         self.setMinimumWidth(560)
 
         root = QVBoxLayout(self)
@@ -96,13 +113,51 @@ class CourseMetadataDialog(QDialog):
             edit.setObjectName(f"courseMetadata{_camel_case(field)}Edit")
             edit.setAccessibleName(f"论文{_FIELD_LABELS[field]}")
             edit.setClearButtonEnabled(True)
-            edit.textChanged.connect(self._clear_field_error)
+            edit.textChanged.connect(self._field_changed)
+            detail = self._original.field_evidence[field]
+            review_reason = (
+                "；待核对：置信度低于阈值或尚未识别"
+                if field in self._original.pending_review_fields
+                else _legacy_review_reason(self._original, field)
+            )
+            evidence_text = (
+                f"来源：{_SOURCE_LABELS.get(detail.source, detail.source.value)}；"
+                f"置信度：{detail.confidence:.0%}{review_reason}"
+            )
+            edit.setAccessibleDescription(evidence_text)
+            evidence_label = QLabel(evidence_text)
+            evidence_label.setObjectName(f"courseMetadata{_camel_case(field)}Evidence")
+            evidence_label.setProperty("fluentType", "secondary")
+            evidence_label.setWordWrap(True)
+            evidence_label.setAccessibleName(f"论文{_FIELD_LABELS[field]}提取依据")
+            evidence_label.setAccessibleDescription(evidence_text)
             self._edits[field] = edit
+            self._evidence_labels[field] = evidence_label
             # Keep the conventional snake_case handles used by the existing
             # pages while retaining the field map for schema-driven code.
             setattr(self, field, edit)
-            form.addRow(_FIELD_LABELS[field], edit)
+            field_container = QWidget()
+            field_layout = QVBoxLayout(field_container)
+            field_layout.setContentsMargins(0, 0, 0, 0)
+            field_layout.setSpacing(4)
+            field_layout.addWidget(edit)
+            field_layout.addWidget(evidence_label)
+            form.addRow(_FIELD_LABELS[field], field_container)
         root.addLayout(form)
+
+        self.review_confirmation = QCheckBox(
+            "我已逐项核对姓名、学号、专业和题目，确认以上信息可用于报告和文件命名。"
+        )
+        self.review_confirmation.setObjectName("confirmCourseMetadataReviewCheckBox")
+        self.review_confirmation.setAccessibleName("确认已人工核对全部论文信息")
+        self.review_confirmation.setAccessibleDescription(
+            "必须明确确认后才能保存；保存只在本地更新报告和汇总表。"
+        )
+        self.review_confirmation.setToolTip(
+            "确认已对照论文原文核对姓名、学号、专业和题目"
+        )
+        self.review_confirmation.stateChanged.connect(self._confirmation_changed)
+        root.addWidget(self.review_confirmation)
 
         self.error_label = QLabel()
         self.error_label.setObjectName("courseMetadataError")
@@ -133,6 +188,7 @@ class CourseMetadataDialog(QDialog):
         root.addWidget(self.buttons)
 
         self._set_status()
+        self._confirmation_changed()
         self._set_tab_order()
         self._edits["student_name"].setFocus(Qt.FocusReason.OtherFocusReason)
 
@@ -161,11 +217,27 @@ class CourseMetadataDialog(QDialog):
             edit = self._edits[field]
             invalid = not value
             set_fluent_property(edit, "fluentInvalid", invalid)
+            evidence_description = self._evidence_labels[field].text()
             edit.setAccessibleDescription(
-                f"{_FIELD_LABELS[field]}不能为空" if invalid else ""
+                f"{evidence_description}；{_FIELD_LABELS[field]}不能为空"
+                if invalid
+                else evidence_description
             )
             if invalid:
                 errors.append(f"{_FIELD_LABELS[field]}不能为空")
+        confirmed = self.review_confirmation.isChecked()
+        set_fluent_property(self.review_confirmation, "fluentInvalid", not confirmed)
+        self.review_confirmation.setAccessibleDescription(
+            "请先确认已逐项核对全部信息" if not confirmed else "已确认人工核对"
+        )
+        if confirmed and self._confirmed_revision != self._edit_revision:
+            confirmed = False
+            set_fluent_property(self.review_confirmation, "fluentInvalid", True)
+            self.review_confirmation.setAccessibleDescription(
+                "信息已变化，请重新核对并勾选确认"
+            )
+        if not confirmed:
+            errors.append("请确认已逐项核对姓名、学号、专业和题目")
         if errors:
             self.error_label.setText("；".join(errors))
             self.error_label.setAccessibleDescription(self.error_label.text())
@@ -198,20 +270,59 @@ class CourseMetadataDialog(QDialog):
             paper_title=values["paper_title"],
             field_evidence=evidence,
             warnings=warnings,
+            human_reviewed=True,
         )
 
     def _clear_field_error(self, _value: str) -> None:
         sender = self.sender()
         if isinstance(sender, QLineEdit) and sender.property("fluentInvalid"):
             set_fluent_property(sender, "fluentInvalid", False)
-            sender.setAccessibleDescription("")
+            field = next(
+                (name for name, edit in self._edits.items() if edit is sender),
+                None,
+            )
+            sender.setAccessibleDescription(
+                self._evidence_labels[field].text() if field is not None else ""
+            )
+        if self.error_label.isVisible():
+            self.error_label.hide()
+
+    def _field_changed(self, value: str) -> None:
+        """Clear an acknowledgement when any editable value changes."""
+
+        self._edit_revision += 1
+        self._clear_field_error(value)
+        if self.review_confirmation.isChecked():
+            self.review_confirmation.setChecked(False)
+        else:
+            self._confirmed_revision = None
+
+    def _confirmation_changed(self, _state: int = 0) -> None:
+        confirmed = self.review_confirmation.isChecked()
+        self._confirmed_revision = self._edit_revision if confirmed else None
+        set_fluent_property(self.review_confirmation, "fluentInvalid", False)
+        self.review_confirmation.setAccessibleDescription(
+            "已确认人工核对"
+            if confirmed
+            else "必须明确确认后才能保存；保存只在本地更新报告和汇总表。"
+        )
+        self.save_button.setEnabled(confirmed)
+        self.save_button.setAccessibleDescription(
+            "" if confirmed else "请先勾选人工核对确认"
+        )
         if self.error_label.isVisible():
             self.error_label.hide()
 
     def _set_status(self) -> None:
-        self.needs_review_label.setText(
-            "状态：需要人工核对" if self._original.needs_review else "状态：自动提取完成"
-        )
+        if self._original.human_reviewed:
+            status = "状态：已人工核对"
+        elif self._original.needs_review:
+            status = "状态：需要人工核对"
+        elif metadata_requires_local_recheck(self._original):
+            status = "状态：建议重新检查"
+        else:
+            status = "状态：自动提取完成"
+        self.needs_review_label.setText(status)
         warnings = self._original.warnings
         self.warnings_label.setText(
             "提示：\n" + "\n".join(f"• {warning}" for warning in warnings)
@@ -224,10 +335,28 @@ class CourseMetadataDialog(QDialog):
 
     def _set_tab_order(self) -> None:
         fields = [self._edits[field] for field in SUBMISSION_METADATA_FIELDS]
-        controls = [*fields, self.save_button, self.cancel_button]
+        controls = [
+            *fields,
+            self.review_confirmation,
+            self.save_button,
+            self.cancel_button,
+        ]
         for current, following in pairwise(controls):
             QWidget.setTabOrder(current, following)
 
 
 def _camel_case(field: str) -> str:
     return "".join(part.capitalize() for part in field.split("_"))
+
+
+def _legacy_review_reason(metadata: SubmissionMetadata, field: str) -> str:
+    """Explain why a high-confidence historical value needs local review."""
+
+    if field not in metadata_recheck_fields(metadata):
+        return ""
+    if (
+        field == "paper_title"
+        and metadata.field_evidence[field].source is SubmissionMetadataSource.PDF_METADATA
+    ):
+        return "；建议重新检查：历史版本可能误用了 PDF 隐藏标题"
+    return "；建议重新检查：历史版本可能把后续字段标签混入字段值"

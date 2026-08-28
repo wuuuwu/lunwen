@@ -61,6 +61,10 @@ class CourseFixtureParser:
                 source_path=str(path),
                 sha256="a" * 64,
                 title="张三_20260001_历史学_课程论文中的公共治理分析",
+                embedded_title="示例学院",
+                visible_title="课程论文中的公共治理分析",
+                visible_title_page=2,
+                visible_title_block_ids=[self.body.block_id],
                 page_count=4,
             ),
             blocks=[self.cover, self.body, self.late_cover],
@@ -227,6 +231,9 @@ async def test_course_run_extracts_once_blinds_reviewers_and_writes_course_artif
         paper.name,
         "姓名：",
         "学号：",
+        "示例学院",
+        '"visible_title": "课程论文中的公共治理分析"',
+        '"visible_title_block_ids"',
     ):
         assert secret not in downstream_text
     assert '"discipline_name": ""' in downstream_message_text

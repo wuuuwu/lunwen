@@ -20,6 +20,7 @@ from paper_reviewer.application.batch_output import (
     batch_output_conflict_message,
     build_report_filename,
     claim_batch_output_directory,
+    is_allocated_report_filename,
     sanitize_filename_component,
     write_batch_summary_csv,
 )
@@ -44,7 +45,13 @@ from paper_reviewer.domain.submission import (
 )
 
 
-def _metadata(**values: str) -> SubmissionMetadata:
+def _metadata(
+    *,
+    confidence: float = 0.9,
+    field_confidences: dict[str, float] | None = None,
+    human_reviewed: bool = False,
+    **values: str,
+) -> SubmissionMetadata:
     defaults = {
         "student_name": "张三",
         "student_id": "20260001",
@@ -57,11 +64,12 @@ def _metadata(**values: str) -> SubmissionMetadata:
         field_evidence={
             field: SubmissionFieldEvidence(
                 source=SubmissionMetadataSource.COVER_LABEL,
-                confidence=0.9,
+                confidence=(field_confidences or {}).get(field, confidence),
                 page=1,
             )
             for field in SUBMISSION_METADATA_FIELDS
         },
+        human_reviewed=human_reviewed,
     )
 
 
@@ -138,6 +146,38 @@ def test_report_filename_normalizes_windows_names_and_limits_utf16() -> None:
     assert not any(character in filename for character in '<>:"/\\|?*')
 
 
+def test_low_confidence_critical_metadata_uses_source_filename_and_pending_marker() -> None:
+    metadata = _metadata(field_confidences={"student_name": 0.5})
+
+    filename = build_report_filename(
+        metadata,
+        "abcdef123456",
+        source_filename="原始交稿.pdf",
+    )
+
+    assert filename == "原始交稿__待核对__abcdef12_课程论文评测报告.pdf"
+    assert "张三" not in filename
+    assert "20260001" not in filename
+
+
+def test_human_review_or_only_unknown_major_keeps_standard_filename() -> None:
+    reviewed = _metadata(
+        field_confidences={"student_name": 0.2, "paper_title": 0.2},
+        human_reviewed=True,
+    )
+    major_only = _metadata(
+        major="未识别专业",
+        field_confidences={"major": 0.1},
+    )
+
+    assert build_report_filename(reviewed, "abcdef123456").startswith(
+        "张三_20260001_经济学_课程论文题目"
+    )
+    assert build_report_filename(major_only, "abcdef123456").startswith(
+        "张三_20260001_未识别专业_课程论文题目"
+    )
+
+
 def test_sanitize_filename_component_uses_nfkc_and_placeholder() -> None:
     assert sanitize_filename_component(" \uff21\uff22\uff23 ", fallback="missing") == "ABC"
     assert sanitize_filename_component("...", fallback="missing") == "missing"
@@ -157,6 +197,49 @@ def test_allocate_report_path_never_overwrites_and_uses_run_suffix(tmp_path: Pat
     assert allocated.name.endswith("__12345678_课程论文评测报告.pdf")
     assert third.name.endswith("__12345678_2_课程论文评测报告.pdf")
     assert original.read_bytes() == b"keep"
+
+
+def test_allocated_report_name_recognizer_accepts_only_current_run_suffixes(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "reports"
+    output.mkdir()
+    metadata = _metadata()
+    run_id = "12345678abcdef"
+    base = build_report_filename(metadata, run_id)
+    stem = base.removesuffix("_课程论文评测报告.pdf")
+
+    assert is_allocated_report_filename(output, base, metadata, run_id)
+    assert is_allocated_report_filename(
+        output,
+        f"{stem}__12345678_课程论文评测报告.pdf",
+        metadata,
+        run_id,
+    )
+    assert is_allocated_report_filename(
+        output,
+        f"{stem}__12345678_27_课程论文评测报告.pdf",
+        metadata,
+        run_id,
+    )
+    assert not is_allocated_report_filename(
+        output,
+        f"{stem}__87654321_课程论文评测报告.pdf",
+        metadata,
+        run_id,
+    )
+    assert not is_allocated_report_filename(
+        output,
+        f"{stem}__12345678_1_课程论文评测报告.pdf",
+        metadata,
+        run_id,
+    )
+    assert not is_allocated_report_filename(
+        output,
+        "用户文件__12345678_2_课程论文评测报告.pdf",
+        metadata,
+        run_id,
+    )
 
 
 def test_batch_csv_is_bom_atomic_dynamic_and_formula_safe(tmp_path: Path) -> None:
@@ -181,8 +264,42 @@ def test_batch_csv_is_bom_atomic_dynamic_and_formula_safe(tmp_path: Path) -> Non
     assert rows[0]["课程任务完成度"] == "88"
     assert rows[0]["文字表达"] == "77"
     assert rows[0]["元数据置信度"] == "0.90"
+    assert rows[0]["待核对字段"] == ""
+    assert rows[0]["人工已核对"] == "否"
     assert rows[0]["重复PDF内容"] == "否"
     assert not destination.with_suffix(".csv.tmp").exists()
+
+
+def test_batch_csv_lists_pending_fields_and_human_confirmation(tmp_path: Path) -> None:
+    (tmp_path / "pending").mkdir()
+    (tmp_path / "confirmed").mkdir()
+    pending = _record(
+        tmp_path / "pending",
+        _metadata(field_confidences={"student_id": 0.4, "major": 0.3}),
+    )
+    confirmed = _record(
+        tmp_path / "confirmed",
+        _metadata(
+            field_confidences={"student_id": 0.4, "major": 0.3},
+            human_reviewed=True,
+        ),
+    )
+    pending_destination = tmp_path / "pending-output" / "summary.csv"
+    confirmed_destination = tmp_path / "confirmed-output" / "summary.csv"
+
+    write_batch_summary_csv(pending_destination, pending, [])
+    write_batch_summary_csv(confirmed_destination, confirmed, [])
+
+    with pending_destination.open(encoding="utf-8-sig", newline="") as handle:
+        pending_row = next(csv.DictReader(handle))
+    with confirmed_destination.open(encoding="utf-8-sig", newline="") as handle:
+        confirmed_row = next(csv.DictReader(handle))
+    assert pending_row["元数据待核对"] == "是"
+    assert pending_row["待核对字段"] == "学号、专业"
+    assert pending_row["人工已核对"] == "否"
+    assert confirmed_row["元数据待核对"] == "否"
+    assert confirmed_row["待核对字段"] == ""
+    assert confirmed_row["人工已核对"] == "是"
 
 
 def test_batch_csv_does_not_replace_a_summary_claimed_by_another_batch(

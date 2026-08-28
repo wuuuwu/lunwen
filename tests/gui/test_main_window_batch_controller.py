@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import QDialog, QMessageBox
 
+from paper_reviewer.application.metadata_recheck import submission_metadata_sha256
 from paper_reviewer.domain.batch import (
     BatchEvent,
     BatchRecord,
     BatchReviewRequest,
     BatchStatus,
+)
+from paper_reviewer.domain.submission import (
+    SUBMISSION_METADATA_FIELDS,
+    SubmissionFieldEvidence,
+    SubmissionMetadata,
+    SubmissionMetadataSource,
 )
 from paper_reviewer.gui.main_window import MainWindow
 
@@ -93,6 +102,17 @@ class _BatchDetail:
     def clear(self) -> None:
         self.batch = None
         self._batch_id = ""
+
+
+class _TokenBatchDetail(_BatchDetail):
+    def set_busy(
+        self,
+        busy: bool,
+        *,
+        action: str = "",
+        token: object | None = None,
+    ) -> None:
+        self.busy.append((busy, action, token))  # type: ignore[arg-type]
 
 
 class _Pages:
@@ -382,3 +402,225 @@ def test_batch_owned_run_cannot_be_cancelled_or_resumed_directly(
     assert len(message.messages) == 3
     assert all("停止批次" in value[0] for value in message.messages)
     assert worker.cancel_calls == 0
+
+
+def test_metadata_recheck_confirmation_is_explicitly_local_and_non_billable(
+    monkeypatch: Any,
+) -> None:
+    detail = _BatchDetail("batch-local")
+    detail.batch = _record("batch-local", BatchStatus.COMPLETED)
+    prompts: list[str] = []
+    scheduled: list[object] = []
+    window = SimpleNamespace(
+        _metadata_recheck_inflight=set(),
+        _batch_view_generation=4,
+        batch_detail_page=detail,
+    )
+    window._has_active_evaluation_worker = lambda: False
+    window._run_async = lambda operation, success, failure: scheduled.append(operation)
+
+    def question(*args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        prompts.append(str(args[2]))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", question)
+
+    MainWindow.recheck_batch_metadata(window, "batch-local")
+
+    assert len(prompts) == 1
+    assert "只会在本机" in prompts[0]
+    assert "不会联网" in prompts[0]
+    assert "不会调用模型" in prompts[0]
+    assert "不会自动覆盖" in prompts[0]
+    assert window._metadata_recheck_inflight == {"batch-local"}
+    assert detail.busy[-1] == (True, "metadata_recheck")
+    assert len(scheduled) == 1
+
+
+def test_manual_metadata_editor_passes_opening_snapshot_hash(monkeypatch: Any) -> None:
+    original = SubmissionMetadata(
+        student_name="张三",
+        student_id="20260001",
+        major="公共管理",
+        paper_title="课程论文",
+        field_evidence={
+            field: SubmissionFieldEvidence(
+                source=SubmissionMetadataSource.COVER_LABEL,
+                confidence=0.95,
+            )
+            for field in SUBMISSION_METADATA_FIELDS
+        },
+    )
+    corrected = original.model_copy(update={"student_name": "李四"})
+    item = SimpleNamespace(item_id="item-1", metadata=original)
+    detail = _BatchDetail("batch-a")
+    detail.batch = SimpleNamespace(batch_id="batch-a", items=[item])
+    scheduled: list[object] = []
+    observed: dict[str, object] = {}
+
+    class Dialog:
+        result_metadata = corrected
+
+        def __init__(self, metadata: SubmissionMetadata, *, parent: object) -> None:
+            assert metadata is original
+            assert parent is window
+
+        def exec(self) -> int:
+            return int(QDialog.DialogCode.Accepted)
+
+    class Service:
+        async def update_submission_metadata(
+            self,
+            batch_id: str,
+            item_id: str,
+            metadata: SubmissionMetadata,
+            *,
+            expected_metadata_sha256: str | None = None,
+        ) -> object:
+            observed.update(
+                batch_id=batch_id,
+                item_id=item_id,
+                metadata=metadata,
+                expected=expected_metadata_sha256,
+            )
+            return object()
+
+    window = SimpleNamespace(
+        batch_detail_page=detail,
+        service=Service(),
+        _batch_view_generation=3,
+    )
+    window._has_active_evaluation_worker = lambda: False
+    window._run_async = lambda operation, success, failure: scheduled.append(operation)
+    monkeypatch.setattr(
+        "paper_reviewer.gui.main_window.CourseMetadataDialog",
+        Dialog,
+    )
+
+    MainWindow.edit_batch_metadata(window, "batch-a", "item-1")
+    assert len(scheduled) == 1
+    asyncio.run(scheduled[0](None))  # type: ignore[operator]
+
+    assert observed == {
+        "batch_id": "batch-a",
+        "item_id": "item-1",
+        "metadata": corrected,
+        "expected": submission_metadata_sha256(original),
+    }
+
+
+def test_stale_metadata_callback_cannot_release_newer_batch_operation() -> None:
+    detail = _TokenBatchDetail("batch-a")
+    window = MainWindow.__new__(MainWindow)
+    window._metadata_recheck_inflight = set()
+    window._metadata_recheck_operations = {}
+    window._metadata_recheck_token = 0
+    window.batch_detail_page = detail
+    window.pages = _Pages(detail)
+    window._batch_view_generation = 1
+
+    first = MainWindow._begin_metadata_recheck(window, "batch-a", "preview")
+    assert first is not None
+    MainWindow._set_metadata_recheck_busy(
+        window, True, batch_id="batch-a", operation_key=first
+    )
+    MainWindow._finish_metadata_recheck(window, first)
+
+    second = MainWindow._begin_metadata_recheck(window, "batch-a", "apply")
+    assert second is not None
+    MainWindow._set_metadata_recheck_busy(
+        window, True, batch_id="batch-a", operation_key=second
+    )
+    MainWindow._metadata_recheck_failed(
+        window,
+        "旧预览失败",
+        "",
+        expected_batch_id="batch-a",
+        view_generation=1,
+        operation_key=first,
+    )
+
+    assert window._metadata_recheck_inflight == {"batch-a"}
+    assert window._metadata_recheck_operations == {"batch-a": (second[1], "apply")}
+    assert detail.busy[-1] == (True, "metadata_recheck", second)
+
+
+def test_cancelled_metadata_apply_refreshes_batch_without_touching_current_busy() -> None:
+    detail = _TokenBatchDetail("batch-a")
+    scheduled: list[object] = []
+    window = MainWindow.__new__(MainWindow)
+    window._metadata_recheck_inflight = {"batch-a"}
+    window._metadata_recheck_operations = {"batch-a": (7, "apply")}
+    window._metadata_recheck_token = 7
+    window._closing = False
+    window.batch_detail_page = detail
+    window.pages = _Pages(detail)
+    window._batch_view_generation = 3
+    window.service = object()
+    window._run_async = lambda operation, success, failure: scheduled.append(operation)
+
+    key = ("batch-a", 7)
+    MainWindow._set_metadata_recheck_busy(
+        window, True, batch_id="batch-a", operation_key=key
+    )
+    MainWindow._metadata_recheck_cancelled(window, "batch-a", 3, key)
+
+    assert window._metadata_recheck_inflight == set()
+    assert detail.busy[-1] == (False, "", key)
+    assert len(scheduled) == 1
+
+
+def test_close_timeout_restores_closing_mode_for_late_metadata_cancellation(
+    monkeypatch: Any,
+) -> None:
+    class _RunningWorker:
+        def cancel_task(self) -> None:
+            return
+
+        def wait(self, _timeout: int) -> None:
+            return
+
+        def isRunning(self) -> bool:
+            return True
+
+    class _Registry:
+        def __init__(self, worker: _RunningWorker) -> None:
+            self.worker = worker
+
+        def cancel_running(self) -> list[_RunningWorker]:
+            self.worker.cancel_task()
+            return [self.worker]
+
+    class _Status:
+        def __init__(self) -> None:
+            self.value = ""
+
+        def setText(self, value: str) -> None:
+            self.value = value
+
+    worker = _RunningWorker()
+    prompts: list[str] = []
+    window = MainWindow.__new__(MainWindow)
+    window._review_worker = None
+    window._batch_worker = None
+    window._metadata_recheck_inflight = {"batch-a"}
+    window._metadata_recheck_operations = {"batch-a": (7, "apply")}
+    window._closing = False
+    window._operation_registry = _Registry(worker)
+    window.global_status = _Status()
+    window._settings = SimpleNamespace(setValue=lambda *_args: None)
+    window._save_preferences = lambda: True
+
+    def question(*args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        prompts.append(str(args[1]))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", question)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: None)
+
+    event = QCloseEvent()
+    MainWindow.closeEvent(window, event)
+
+    assert prompts == ["信息核对正在应用"]
+    assert window._closing is False
+    assert not event.isAccepted()

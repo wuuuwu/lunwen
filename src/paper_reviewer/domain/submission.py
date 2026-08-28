@@ -3,14 +3,16 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, computed_field, model_validator
 
-SUBMISSION_METADATA_SCHEMA_VERSION: Literal["1.0"] = "1.0"
+SUBMISSION_METADATA_SCHEMA_VERSION: Literal["1.1"] = "1.1"
+SubmissionMetadataSchemaVersion = Literal["1.0", "1.1"]
 SUBMISSION_METADATA_FIELDS = ("student_name", "student_id", "major", "paper_title")
 
 
 class SubmissionMetadataSource(StrEnum):
     COVER_LABEL = "cover_label"
+    VISIBLE_HEADING = "visible_heading"
     MODEL_EVIDENCE = "model_evidence"
     PDF_METADATA = "pdf_metadata"
     FILE_NAME = "file_name"
@@ -23,6 +25,7 @@ class SubmissionFieldEvidence(BaseModel):
     confidence: float = Field(ge=0, le=1)
     page: int | None = Field(default=None, ge=1)
     block_id: str | None = None
+    block_ids: list[str] | None = None
     evidence: str | None = None
 
 
@@ -34,14 +37,36 @@ class SubmissionMetadata(BaseModel):
     can evolve without changing those projections.
     """
 
-    schema_version: Literal["1.0"] = SUBMISSION_METADATA_SCHEMA_VERSION
+    schema_version: SubmissionMetadataSchemaVersion = SUBMISSION_METADATA_SCHEMA_VERSION
     student_name: str
     student_id: str
     major: str
     paper_title: str
     field_evidence: dict[str, SubmissionFieldEvidence]
     warnings: list[str] = Field(default_factory=list)
-    needs_review: bool = False
+    human_reviewed: bool = False
+
+    @computed_field(return_type=tuple[str, ...])  # type: ignore[prop-decorator]
+    @property
+    def pending_review_fields(self) -> tuple[str, ...]:
+        """Fields whose current automatic evidence still requires confirmation."""
+
+        if self.human_reviewed:
+            return ()
+        return tuple(
+            field
+            for field in SUBMISSION_METADATA_FIELDS
+            if (detail := self.field_evidence[field]).source
+            is SubmissionMetadataSource.PLACEHOLDER
+            or detail.confidence < 0.75
+        )
+
+    @computed_field(return_type=bool)  # type: ignore[prop-decorator]
+    @property
+    def needs_review(self) -> bool:
+        """Whether field-level evidence, rather than historical warnings, needs review."""
+
+        return bool(self.pending_review_fields)
 
     @model_validator(mode="after")
     def validate_complete_provenance(self) -> SubmissionMetadata:
@@ -57,9 +82,4 @@ class SubmissionMetadata(BaseModel):
         values = (self.student_name, self.student_id, self.major, self.paper_title)
         if any(not value.strip() for value in values):
             raise ValueError("submission metadata values must not be blank")
-        self.needs_review = bool(self.warnings) or any(
-            detail.source is SubmissionMetadataSource.PLACEHOLDER
-            or detail.confidence < 0.75
-            for detail in self.field_evidence.values()
-        )
         return self

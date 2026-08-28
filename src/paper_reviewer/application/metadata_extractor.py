@@ -32,11 +32,33 @@ _LABELS = {
     "major": ("专业名称", "所学专业", "专业"),
     "paper_title": ("课程论文题目", "论文题目", "题目"),
 }
+_FIELD_BOUNDARY_LABELS = tuple(
+    dict.fromkeys(
+        (
+            *(label for labels in _LABELS.values() for label in labels),
+            "得分",
+            "成绩",
+            "分数",
+            "评分",
+            "班级",
+            "任课教师",
+            "考核方法",
+            "考核方式",
+            "教师评语",
+        )
+    )
+)
+_FIELD_BOUNDARY_ALTERNATION = "|".join(
+    map(re.escape, sorted(_FIELD_BOUNDARY_LABELS, key=len, reverse=True))
+)
+_LAYOUT_BOUNDARY_PREFIX = r"(?:\s+|[;；|]\s*)"
+_ADJACENT_BOUNDARY_PREFIX = r"\s*"
 _LABEL_PATTERN = {
     field: re.compile(
         rf"(?:^|[\s;；|])(?:{'|'.join(map(re.escape, labels))})\s*[:：]\s*"
-        r"(?P<value>[^;；|]{1,200}?)(?=(?:\s+(?:姓名|学生姓名|作者|学号|学生学号|"
-        r"学生编号|专业|专业名称|所学专业|题目|论文题目|课程论文题目)\s*[:：])|$)",
+        rf"(?P<value>[^;；|]{{1,200}}?)(?=(?:"
+        rf"{_LAYOUT_BOUNDARY_PREFIX if field == 'paper_title' else _ADJACENT_BOUNDARY_PREFIX}"
+        rf"(?:{_FIELD_BOUNDARY_ALTERNATION})\s*[:：])|$)",
         flags=re.IGNORECASE,
     )
     for field, labels in _LABELS.items()
@@ -46,6 +68,20 @@ _IDENTITY_LABEL_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 _TITLE_LABEL_PATTERN = re.compile(r"(?:课程论文题目|论文题目|题目)\s*[:：]", re.IGNORECASE)
+# A following field label is a boundary only when the layout separates it from
+# the current value.  Matching at an arbitrary substring would truncate valid
+# titles such as ``课程评分：……`` or ``专业：……的课程设计``.
+_FIELD_BOUNDARY_PATTERN = re.compile(
+    rf"{_LAYOUT_BOUNDARY_PREFIX}(?:{_FIELD_BOUNDARY_ALTERNATION})\s*[:：]",
+    re.IGNORECASE,
+)
+_ADJACENT_FIELD_BOUNDARY_PATTERN = re.compile(
+    rf"{_ADJACENT_BOUNDARY_PREFIX}(?:{_FIELD_BOUNDARY_ALTERNATION})\s*[:：]",
+    re.IGNORECASE,
+)
+_METADATA_LABEL_AT_START_PATTERN = re.compile(
+    rf"^(?:{_FIELD_BOUNDARY_ALTERNATION})\s*(?:[:：]|$)", re.IGNORECASE
+)
 _STUDENT_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]?\d{6,20})(?![A-Za-z0-9])")
 _EXACT_LABEL_TO_FIELD = {
     normalize_text(label).casefold(): field
@@ -106,18 +142,62 @@ async def extract_submission_metadata(
         )
     )
     model_candidates = _validated_model_candidates(response.tool_calls, ordered_blocks)
-    pdf_candidates = _pdf_metadata_candidates(document, pdf_metadata)
+    return _build_submission_metadata(
+        document=document,
+        local_candidates=local,
+        model_candidates=model_candidates,
+        pdf_metadata=pdf_metadata,
+    )
+
+
+def suggest_submission_metadata_locally(
+    *,
+    document: DocumentInfo,
+    blocks: Sequence[DocumentBlock],
+    current: SubmissionMetadata | None = None,
+    pdf_metadata: Mapping[str, str | None] | None = None,
+) -> SubmissionMetadata:
+    """Recheck metadata from local evidence without making a model request.
+
+    Previously validated model evidence may be reused only when its page, block ID,
+    quote, and value all remain verifiable against the freshly supplied blocks.
+    """
+
+    ordered_blocks = _ordered_front_blocks(blocks)
+    return _build_submission_metadata(
+        document=document,
+        local_candidates=_cover_label_candidates(ordered_blocks),
+        model_candidates=_revalidated_current_model_candidates(current, ordered_blocks),
+        pdf_metadata=pdf_metadata,
+    )
+
+
+def _build_submission_metadata(
+    *,
+    document: DocumentInfo,
+    local_candidates: Mapping[str, _Candidate],
+    model_candidates: Mapping[str, _Candidate],
+    pdf_metadata: Mapping[str, str | None] | None,
+) -> SubmissionMetadata:
+    visible_title_candidate = _visible_title_candidate(document)
     filename_candidates = _filename_candidates(Path(document.source_path))
 
     warnings: list[str] = []
     selected: dict[str, _Candidate] = {}
     for field in SUBMISSION_METADATA_FIELDS:
-        candidate = (
-            local.get(field)
-            or model_candidates.get(field)
-            or pdf_candidates.get(field)
-            or filename_candidates.get(field)
-        )
+        if field == "paper_title":
+            candidate = (
+                local_candidates.get(field)
+                or visible_title_candidate
+                or model_candidates.get(field)
+                or filename_candidates.get(field)
+            )
+        else:
+            candidate = (
+                local_candidates.get(field)
+                or model_candidates.get(field)
+                or filename_candidates.get(field)
+            )
         if candidate is None:
             candidate = _Candidate(
                 value=_PLACEHOLDERS[field],
@@ -130,6 +210,20 @@ async def extract_submission_metadata(
         elif candidate.evidence.confidence < 0.75:
             warnings.append(f"{_field_title(field)}识别置信度较低，请人工核对")
         selected[field] = candidate
+
+    embedded_title = _embedded_title(document, pdf_metadata)
+    selected_title = selected["paper_title"]
+    if (
+        embedded_title is not None
+        and selected_title.evidence.source
+        in {
+            SubmissionMetadataSource.COVER_LABEL,
+            SubmissionMetadataSource.VISIBLE_HEADING,
+            SubmissionMetadataSource.MODEL_EVIDENCE,
+        }
+        and not _same_title(embedded_title, selected_title.value)
+    ):
+        warnings.append("PDF 隐藏标题与正文题目不一致")
 
     return SubmissionMetadata(
         student_name=selected["student_name"].value,
@@ -207,7 +301,7 @@ def _cover_label_candidates(blocks: Sequence[DocumentBlock]) -> dict[str, _Candi
         exact_field = _exact_label_field(block.text)
         if exact_field is not None and exact_field not in candidates and index + 1 < len(blocks):
             value_block = blocks[index + 1]
-            value = _clean_value(value_block.text)
+            value = _clean_field_value(exact_field, value_block.text)
             if (
                 value_block.page == block.page
                 and not _is_metadata_label(value_block.text)
@@ -229,7 +323,7 @@ def _cover_label_candidates(blocks: Sequence[DocumentBlock]) -> dict[str, _Candi
             match = pattern.search(block.text)
             if match is None:
                 continue
-            value = _clean_value(match.group("value"))
+            value = _clean_field_value(field, match.group("value"))
             if not _plausible(field, value):
                 continue
             candidates[field] = _Candidate(
@@ -265,12 +359,14 @@ def _validated_model_candidates(
         block = by_id.get(extracted.block_id)
         if block is None or block.page != extracted.page:
             continue
-        quote = normalize_text(extracted.quote)
-        value = _clean_value(extracted.value)
+        quote = _normalize_layout_whitespace(extracted.quote)
+        block_text = _normalize_layout_whitespace(block.text)
+        value = _clean_field_value(field, extracted.value)
+        normalized_value = _normalize_layout_whitespace(value)
         if (
             not quote
-            or quote not in block.text
-            or value not in quote
+            or quote not in block_text
+            or normalized_value not in quote
             or not _plausible(field, value)
         ):
             continue
@@ -281,39 +377,90 @@ def _validated_model_candidates(
                 confidence=min(extracted.confidence, 0.9),
                 page=block.page,
                 block_id=block.block_id,
-                evidence=_bounded_evidence(quote),
+                evidence=_bounded_evidence(extracted.quote),
             ),
         )
     return candidates
 
 
-def _pdf_metadata_candidates(
+def _revalidated_current_model_candidates(
+    current: SubmissionMetadata | None,
+    blocks: Sequence[DocumentBlock],
+) -> dict[str, _Candidate]:
+    if current is None:
+        return {}
+    by_id = {block.block_id: block for block in blocks}
+    candidates: dict[str, _Candidate] = {}
+    for field in SUBMISSION_METADATA_FIELDS:
+        evidence = current.field_evidence[field]
+        if (
+            evidence.source is not SubmissionMetadataSource.MODEL_EVIDENCE
+            or evidence.block_id is None
+            or evidence.page is None
+            or evidence.evidence is None
+        ):
+            continue
+        block = by_id.get(evidence.block_id)
+        if block is None or block.page != evidence.page:
+            continue
+        value = _clean_field_value(field, getattr(current, field))
+        quote = _normalize_layout_whitespace(evidence.evidence)
+        if (
+            not quote
+            or quote not in _normalize_layout_whitespace(block.text)
+            or _normalize_layout_whitespace(value) not in quote
+            or not _plausible(field, value)
+        ):
+            continue
+        candidates[field] = _Candidate(value=value, evidence=evidence)
+    return candidates
+
+
+def _visible_title_candidate(document: DocumentInfo) -> _Candidate | None:
+    raw_title = getattr(document, "visible_title", None)
+    if not isinstance(raw_title, str):
+        return None
+    title = _clean_title_text(raw_title)
+    if not _plausible("paper_title", title):
+        return None
+
+    raw_page = getattr(document, "visible_title_page", None)
+    page = raw_page if isinstance(raw_page, int) and raw_page >= 1 else None
+    raw_block_ids = getattr(document, "visible_title_block_ids", None)
+    block_ids = (
+        list(dict.fromkeys(item for item in raw_block_ids if isinstance(item, str) and item))
+        if isinstance(raw_block_ids, Sequence) and not isinstance(raw_block_ids, str)
+        else []
+    )
+    return _Candidate(
+        value=title,
+        evidence=SubmissionFieldEvidence(
+            source=SubmissionMetadataSource.VISIBLE_HEADING,
+            confidence=0.96,
+            page=page,
+            block_id=block_ids[0] if block_ids else None,
+            block_ids=block_ids or None,
+            evidence=_bounded_evidence(raw_title),
+        ),
+    )
+
+
+def _embedded_title(
     document: DocumentInfo,
     metadata: Mapping[str, str | None] | None,
-) -> dict[str, _Candidate]:
+) -> str | None:
     raw = metadata or {}
-    values = {
-        "student_name": raw.get("author"),
-        "paper_title": raw.get("title") or document.title,
-    }
-    return {
-        field: _Candidate(
-            value=clean,
-            evidence=SubmissionFieldEvidence(
-                source=SubmissionMetadataSource.PDF_METADATA,
-                confidence=0.65,
-            ),
-        )
-        for field, value in values.items()
-        if value and (clean := _clean_value(value)) and _plausible(field, clean)
-    }
+    for value in (raw.get("title"), getattr(document, "embedded_title", None)):
+        if isinstance(value, str) and (clean := _clean_title_text(value)):
+            return clean
+    return None
 
 
 def _filename_candidates(path: Path) -> dict[str, _Candidate]:
     stem = unicodedata.normalize("NFKC", path.stem).strip()
     parts = [_clean_value(part) for part in re.split(r"_+", stem) if part.strip()]
     values: dict[str, str] = {}
-    if len(parts) >= 4:
+    if len(parts) >= 4 and _STUDENT_ID_PATTERN.fullmatch(parts[1]) is not None:
         values = {
             "student_name": parts[0],
             "student_id": parts[1],
@@ -324,18 +471,23 @@ def _filename_candidates(path: Path) -> dict[str, _Candidate]:
         match = _STUDENT_ID_PATTERN.search(stem)
         if match is not None:
             values["student_id"] = match.group(1)
-        if stem:
-            values["paper_title"] = stem
     return {
         field: _Candidate(
-            value=value,
+            value=clean,
             evidence=SubmissionFieldEvidence(
                 source=SubmissionMetadataSource.FILE_NAME,
                 confidence=0.55,
             ),
         )
         for field, value in values.items()
-        if _plausible(field, value)
+        if (
+            clean := (
+                _clean_title_text(value)
+                if field == "paper_title"
+                else _clean_field_value(field, value)
+            )
+        )
+        and _plausible(field, clean)
     }
 
 
@@ -386,6 +538,44 @@ def _clean_value(value: str) -> str:
     return unicodedata.normalize("NFKC", normalize_text(value)).strip(" :：;；|_-")
 
 
+def _clean_field_value(field: str, value: str) -> str:
+    if field == "paper_title":
+        # Visible headings are report-facing text.  Keep their original
+        # punctuation (notably Chinese full-width punctuation) and only remove
+        # layout whitespace introduced between adjacent Chinese characters.
+        normalized_title = normalize_text(value)
+        boundary = _FIELD_BOUNDARY_PATTERN.search(normalized_title)
+        if boundary is not None:
+            normalized_title = normalized_title[: boundary.start()]
+        return _clean_title_text(normalized_title)
+    normalized = unicodedata.normalize("NFKC", normalize_text(value))
+    boundary = _ADJACENT_FIELD_BOUNDARY_PATTERN.search(normalized)
+    if boundary is not None:
+        normalized = normalized[: boundary.start()]
+    return _clean_value(normalized)
+
+
+def _normalize_layout_whitespace(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", normalize_text(value))
+    return re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", normalized)
+
+
+def _normalize_title_layout_whitespace(value: str) -> str:
+    normalized = normalize_text(value)
+    return re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", normalized)
+
+
+def _clean_title_text(value: str) -> str:
+    clean = normalize_text(value).strip(" :：;；|_-")
+    return _normalize_title_layout_whitespace(clean)
+
+
+def _same_title(left: str, right: str) -> bool:
+    return _normalize_layout_whitespace(left).casefold() == _normalize_layout_whitespace(
+        right
+    ).casefold()
+
+
 def _exact_label_field(value: str) -> str | None:
     normalized = normalize_text(value).strip(" :：").casefold()
     return _EXACT_LABEL_TO_FIELD.get(normalized)
@@ -397,10 +587,7 @@ def _is_metadata_label(value: str) -> bool:
     if _exact_label_field(value) is not None:
         return True
     normalized = unicodedata.normalize("NFKC", normalize_text(value))
-    return bool(
-        _IDENTITY_LABEL_PATTERN.search(normalized)
-        or _TITLE_LABEL_PATTERN.search(normalized)
-    )
+    return _METADATA_LABEL_AT_START_PATTERN.search(normalized) is not None
 
 
 def _plausible(field: str, value: str) -> bool:
