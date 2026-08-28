@@ -70,6 +70,7 @@ def run_system_credential_backend_self_test() -> None:
 
     import keyring
 
+    ExpectedBackend: type[object]
     if sys.platform == "darwin":
         from keyring.backends.macOS import Keyring as ExpectedBackend
     elif sys.platform == "win32":
