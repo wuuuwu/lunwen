@@ -39,6 +39,8 @@ jobs:
         run: uv run pytest tests/unit/test_course_packaging.py
       - name: Run macOS report export tests
         run: uv run pytest tests/unit/test_report_export.py
+        env:
+          QT_QPA_PLATFORM: offscreen
       - name: Build and self-test app bundle
         run: ./scripts/build_course_macos.sh
       - name: Upload ad-hoc-signed test build
