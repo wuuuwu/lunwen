@@ -307,7 +307,18 @@ async def test_pdf_export_is_a4_searchable_and_contains_metadata(tmp_path: Path)
     (run_dir / "report.md").write_text(markdown, encoding="utf-8")
     destination = tmp_path / "report.pdf"
 
-    result = await service.export_report("run-1", ReportExportFormat.PDF, destination)
+    try:
+        result = await service.export_report("run-1", ReportExportFormat.PDF, destination)
+    except ReportPdfExportError as error:
+        diagnostic = tmp_path / "report-text-layer-diagnostic.pdf"
+        render_pdf(markdown, diagnostic, title="中文评测报告")
+        with pymupdf.open(diagnostic) as document:  # type: ignore[no-untyped-call]
+            extracted_tail = "\n".join(
+                page.get_text("text") for page in document
+            )[-2000:]
+        raise AssertionError(
+            f"PDF validation failed: {error}; extracted fixture tail: {extracted_tail!r}"
+        ) from error
 
     assert result.size_bytes == destination.stat().st_size
     assert destination.read_bytes().startswith(b"%PDF-")
