@@ -53,7 +53,16 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
       - name: Build and self-test app bundle
-        run: ./scripts/build_course_macos.sh
+        shell: bash
+        run: |
+          set +e
+          ./scripts/build_course_macos.sh 2>&1 | tee build-course-macos.log
+          build_status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$build_status" -ne 0 ]]; then
+            uv run python -c 'from pathlib import Path; text = Path("build-course-macos.log").read_text(encoding="utf-8")[-12000:]; escaped = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print(f"::error title=macOS app build::{escaped}")'
+            exit "$build_status"
+          fi
       - name: Upload ad-hoc-signed test build
         uses: actions/upload-artifact@v4
         with:
