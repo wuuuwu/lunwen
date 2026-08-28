@@ -169,8 +169,7 @@ def _batch_execution_lock(lock_path: Path) -> Iterator[None]:
 def _lock_file_nonblocking(handle: BinaryIO) -> None:
     try:
         if os.name == "nt":
-            import msvcrt
-
+            msvcrt = importlib.import_module("msvcrt")
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             fcntl = importlib.import_module("fcntl")
@@ -183,8 +182,7 @@ def _unlock_file(handle: BinaryIO) -> None:
     handle.seek(0)
     try:
         if os.name == "nt":
-            import msvcrt
-
+            msvcrt = importlib.import_module("msvcrt")
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             fcntl = importlib.import_module("fcntl")
