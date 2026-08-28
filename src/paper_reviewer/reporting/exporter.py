@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import unicodedata
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -135,7 +136,9 @@ def validate_pdf(path: Path, markdown: str) -> None:
     except Exception as error:
         raise ReportPdfExportError("无法重新打开生成的 PDF。") from error
 
-    normalized_text = re.sub(r"\s+", "", extracted)
+    # CoreText-backed fonts may expose visually equivalent CJK compatibility
+    # characters (for example, ⾃ instead of 自) in the PDF text layer.
+    normalized_text = _normalize_pdf_text(extracted)
     if not normalized_text:
         raise ReportPdfExportError("生成的 PDF 不包含可抽取文本。")
     expected_disclaimers = (
@@ -144,10 +147,16 @@ def validate_pdf(path: Path, markdown: str) -> None:
         else [line for line in DISCLAIMER_LINES if line in markdown]
     )
     missing = [
-        line for line in expected_disclaimers if re.sub(r"\s+", "", line) not in normalized_text
+        line
+        for line in expected_disclaimers
+        if _normalize_pdf_text(line) not in normalized_text
     ]
     if missing:
         raise ReportPdfExportError(f"生成的 PDF 缺少关键免责声明：{missing[0]}")
+
+
+def _normalize_pdf_text(value: str) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value))
 
 
 def _ensure_gui_application() -> QGuiApplication:

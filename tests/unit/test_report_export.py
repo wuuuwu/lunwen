@@ -32,6 +32,7 @@ from paper_reviewer.domain.rubric import RubricProfile
 from paper_reviewer.domain.run import RunRecord, RunStatus
 from paper_reviewer.reporting.exporter import (
     ReportPdfExportError,
+    _normalize_pdf_text,
     _ResourceBlockingDocument,
     render_pdf,
     validate_pdf,
@@ -307,18 +308,7 @@ async def test_pdf_export_is_a4_searchable_and_contains_metadata(tmp_path: Path)
     (run_dir / "report.md").write_text(markdown, encoding="utf-8")
     destination = tmp_path / "report.pdf"
 
-    try:
-        result = await service.export_report("run-1", ReportExportFormat.PDF, destination)
-    except ReportPdfExportError as error:
-        diagnostic = tmp_path / "report-text-layer-diagnostic.pdf"
-        render_pdf(markdown, diagnostic, title="中文评测报告")
-        with pymupdf.open(diagnostic) as document:  # type: ignore[no-untyped-call]
-            extracted_tail = "\n".join(
-                page.get_text("text") for page in document
-            )[-2000:]
-        raise AssertionError(
-            f"PDF validation failed: {error}; extracted fixture tail: {extracted_tail!r}"
-        ) from error
+    result = await service.export_report("run-1", ReportExportFormat.PDF, destination)
 
     assert result.size_bytes == destination.stat().st_size
     assert destination.read_bytes().startswith(b"%PDF-")
@@ -328,9 +318,13 @@ async def test_pdf_export_is_a4_searchable_and_contains_metadata(tmp_path: Path)
         assert document.metadata["creator"] == "Paper Reviewer report exporter"
         assert document.metadata["author"] == "Paper Reviewer"
         extracted = "\n".join(page.get_text("text") for page in document)
-        assert "中文评测报告" in extracted
-        assert "选题意义" in extracted
-        assert all(line in extracted for line in DISCLAIMER_LINES)
+        normalized_extracted = _normalize_pdf_text(extracted)
+        assert _normalize_pdf_text("中文评测报告") in normalized_extracted
+        assert _normalize_pdf_text("选题意义") in normalized_extracted
+        assert all(
+            _normalize_pdf_text(line) in normalized_extracted
+            for line in DISCLAIMER_LINES
+        )
         assert all(
             abs(float(page.rect.width) - 595.28) < 3 and abs(float(page.rect.height) - 841.89) < 3
             for page in document
