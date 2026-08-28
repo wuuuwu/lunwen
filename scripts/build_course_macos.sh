@@ -41,8 +41,13 @@ run_probe() {
     local argument="$1"
     local name="$2"
     shift 2
-    "$@" "$app_executable" "$argument"
-    echo "$name packaged self-test: passed"
+    if "$@" "$app_executable" "$argument"; then
+        echo "$name packaged self-test: passed"
+    else
+        local status="$?"
+        echo "$name packaged self-test: failed (exit $status)" >&2
+        return "$status"
+    fi
 }
 
 # The Keychain probe only verifies backend discovery. It intentionally does

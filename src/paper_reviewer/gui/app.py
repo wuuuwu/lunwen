@@ -357,7 +357,10 @@ def run_report_export_self_test() -> None:
         raise RuntimeError("PyMuPDF is required for the report export self-test") from exc
 
     try:
-        from paper_reviewer.reporting.exporter import render_pdf
+        from paper_reviewer.reporting.exporter import (
+            _normalize_pdf_text,
+            render_pdf,
+        )
     except ImportError as exc:  # pragma: no cover - exercised by an incomplete bundle
         raise RuntimeError("report PDF exporter is missing from the application bundle") from exc
 
@@ -406,9 +409,10 @@ def run_report_export_self_test() -> None:
                 )
             finally:
                 document.close()  # type: ignore[no-untyped-call]
-            if "中文论文 AI 辅助评测报告" not in extracted:
+            normalized_extracted = _normalize_pdf_text(extracted)
+            if _normalize_pdf_text("中文论文 AI 辅助评测报告") not in normalized_extracted:
                 raise RuntimeError("report PDF exporter lost Chinese text")
-            if _REPORT_DISCLAIMER not in extracted:
+            if _normalize_pdf_text(_REPORT_DISCLAIMER) not in normalized_extracted:
                 raise RuntimeError("report PDF exporter lost the report disclaimer")
     finally:
         if owns_application and app is not None:
