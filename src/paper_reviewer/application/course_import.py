@@ -1,6 +1,6 @@
 """One-time, read-only import from the thesis desktop edition.
 
-The course edition owns a separate data directory and Credential Manager
+The course edition owns a separate data directory and system credential-store
 service.  On its first start it may copy the user's existing provider catalog
 and credentials so setup is convenient without ever making the two products
 share mutable configuration afterwards.
@@ -47,7 +47,7 @@ def import_thesis_provider_settings(
     """Copy provider setup once, without modifying the thesis edition.
 
     Existing course-edition configuration always wins.  Secrets move directly
-    between Credential Manager entries and are never returned, logged, written
+    between system credential-store entries and are never returned, logged, written
     to JSON, or placed in environment variables.
     """
 

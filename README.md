@@ -1,6 +1,6 @@
 # Course Paper Reviewer（课程论文批量评测版）
 
-Course Paper Reviewer 是面向普通课程论文的 Windows 桌面评测工具。它使用课程 Rubric、
+Course Paper Reviewer 是面向普通课程论文的 Windows/macOS 桌面评测工具。它使用课程 Rubric、
 有边界的多 Reviewer Agent 和确定性程序校验，为一个文件夹中的 PDF 依次生成课程评分、
 改进意见、个人报告及汇总表。
 
@@ -40,7 +40,9 @@ Course Paper Reviewer 是面向普通课程论文的 Windows 桌面评测工具�
 这是一套适当放宽的通用课程模板，不是所有课程的正式评分标准。正式使用前，教师应根据
 课程大纲、作业要求和教学目标检查或替换 Rubric；不得仅凭 AI 结果直接形成学生正式成绩。
 
-## 直接使用 Windows 便携版
+## 直接使用桌面版
+
+### Windows 便携版
 
 1. 解压整个 `CoursePaperReviewer-portable.zip`，不要只复制其中的 EXE。
 2. 双击 `CoursePaperReviewer\CoursePaperReviewer.exe`。
@@ -50,6 +52,20 @@ Course Paper Reviewer 是面向普通课程论文的 Windows 桌面评测工具�
 6. 在“批次记录/批次详情”中查看进度、停止、继续、重试失败项或核对论文信息。
 
 课程批量流程目前只在桌面端提供，不新增 CLI 批量命令。
+
+### macOS Apple Silicon 测试版
+
+1. 从 GitHub Actions 的 `Build course app for macOS arm64` 构建记录下载
+   `CoursePaperReviewer-macos-arm64` Artifact。
+2. 用 `shasum -a 256 CoursePaperReviewer-macos-arm64.zip` 核对随附的 `.sha256`。
+3. 解压后将 `CoursePaperReviewer.app` 移到“应用程序”，第一次启动在 Finder 中右键应用并选择
+   “打开”。
+4. 当前产物仅做 PyInstaller ad-hoc 签名，未使用 Developer ID 签名或 Apple 公证；如果系统仍
+   阻止启动，并且你确认文件来自可信构建，可执行
+   `xattr -dr com.apple.quarantine /Applications/CoursePaperReviewer.app` 后重试。
+
+不要全局关闭 Gatekeeper。当前 macOS 构建要求 Apple Silicon（`arm64`）和 macOS 12 或更高版本；
+Intel Mac 不在本阶段支持范围内。
 
 ### 批次输出
 
@@ -91,10 +107,10 @@ Course Paper Reviewer 是面向普通课程论文的 Windows 桌面评测工具�
 自定义 Provider。自定义 Provider 的协议在创建时固定为 Chat Completions 或 Responses。
 
 首次启动且课程版尚无配置时，程序会自动尝试一次从本机论文版只读复制 Provider 目录和
-Windows Credential Manager 凭据。复制完成后两套产品完全独立，后续修改互不影响。课程版不会从
+系统凭据存储中的凭据。复制完成后两套产品完全独立，后续修改互不影响。课程版不会从
 `OPENAI_API_KEY` 或 `DEEPSEEK_API_KEY` 环境变量回退读取密钥。
 
-运行数据位于：
+运行数据位于 Windows 的：
 
 ```text
 %LOCALAPPDATA%\CoursePaperReviewer\CoursePaperReviewer\
@@ -105,7 +121,9 @@ Windows Credential Manager 凭据。复制完成后两套产品完全独立，�
 └─ config\     非秘密偏好和 Provider 目录
 ```
 
-API Key 存放在 Windows Credential Manager 的 `CoursePaperReviewer` 服务命名空间中，
+macOS 数据位于
+`~/Library/Application Support/CoursePaperReviewer/`。API Key 存放在当前系统的安全凭据存储
+（Windows Credential Manager 或 macOS 钥匙串）的 `CoursePaperReviewer` 服务命名空间中，
 不会写入批次清单、数据库、Trace、报告或日志。用户选择的批次输出目录会包含学生个人信息，
 应按学校的数据管理要求保存、传输和备份。
 
@@ -133,7 +151,9 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-## 构建便携版
+## 构建桌面版
+
+### Windows
 
 ```powershell
 .\scripts\build_course_portable.ps1
@@ -150,6 +170,28 @@ dist-course\CoursePaperReviewer-portable.zip.sha256
 
 目标 Windows 10/11 计算机无需安装 Python。`build-course/` 和 `dist-course/` 是本地构建产物，
 不会提交到 Git。
+
+### macOS Apple Silicon
+
+macOS 必须在 Apple Silicon Mac 上原生构建，PyInstaller 不能从 Windows 交叉生成 `.app`：
+
+```bash
+uv sync --extra dev
+./scripts/build_course_macos.sh
+```
+
+脚本使用独立的 `course-paper-reviewer-macos.spec`，验证 macOS Keychain 后端（不访问真实密码）、
+SQLite、资源、PDF、Rubric/Profile、CSV/XLSX 和 GUI 启动，然后生成：
+
+```text
+dist-course-macos/CoursePaperReviewer.app
+dist-course-macos/CoursePaperReviewer-macos-arm64.zip
+dist-course-macos/CoursePaperReviewer-macos-arm64.zip.sha256
+```
+
+仓库中的 `.github/workflows/build-course-macos.yml` 会在 `macos-14` Apple Silicon runner 上执行
+相同构建并保留 14 天 Artifact。测试版为 ad-hoc 签名且未公证；正式公开发布仍需要 Apple
+Developer ID Application 签名和 notarization。
 
 ## 文档与架构
 

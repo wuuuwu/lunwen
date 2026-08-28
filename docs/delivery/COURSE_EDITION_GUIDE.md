@@ -2,7 +2,7 @@
 
 > 适用分支：`codex/course-paper-reviewer`
 >
-> 交付日期：2026-08-26
+> 交付日期：2026-08-28
 >
 > 产品名称：Course Paper Reviewer
 >
@@ -26,7 +26,7 @@
 | 3+2 独立专家面板 | 不使用 | 使用 |
 | 批量文件夹评测 | 支持 | 首版不支持 |
 | 数据根目录 | `CoursePaperReviewer` | `PaperReviewer` |
-| Credential Manager 服务 | `CoursePaperReviewer` | `PaperReviewer` |
+| 系统凭据服务名 | `CoursePaperReviewer` | `PaperReviewer` |
 
 两套产品不会共享可变数据库、批次、任务、偏好或凭据。课程版首次启动且本身尚无配置时，
 会自动尝试一次只读复制，后续互不影响。不得将课程评分报告解释为教育主管部门的抽检意见。
@@ -71,7 +71,7 @@
 
 ## 3. 安装与启动
 
-### 3.1 使用便携版
+### 3.1 使用 Windows 便携版
 
 1. 将 `CoursePaperReviewer-portable.zip` 解压到本地可写目录。
 2. 保留解压后的完整目录结构，不要只取出 EXE。
@@ -80,7 +80,23 @@
 
 目标计算机不需要预装 Python。程序使用 Windows 原生标题栏，并跟随 Fluent 主题设置。
 
-### 3.2 开发环境启动
+### 3.2 使用 macOS Apple Silicon 测试版
+
+1. 从 GitHub Actions 的 `Build course app for macOS arm64` 构建记录下载 Artifact。
+2. 运行 `shasum -a 256 CoursePaperReviewer-macos-arm64.zip`，与随附校验文件比较。
+3. 解压并将 `CoursePaperReviewer.app` 移到“应用程序”。
+4. 第一次启动在 Finder 中右键应用并选择“打开”。
+
+测试版仅做 ad-hoc 签名，未使用 Developer ID 签名或 Apple 公证。若 Gatekeeper 仍阻止启动，且已
+确认 Artifact 来源可信，可执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/CoursePaperReviewer.app
+```
+
+不得全局关闭 Gatekeeper。当前最低系统版本为 macOS 12，只支持 Apple Silicon（`arm64`）。
+
+### 3.3 开发环境启动
 
 ```powershell
 py -3.12 -m venv .venv
@@ -111,11 +127,11 @@ Base URL、API Key 和默认模型；程序不会自动追加 `/v1`。远程端�
 
 ### 4.1 首次启动导入
 
-仅当课程版尚无 Provider 配置和内置 Provider 凭据时，程序会尝试从同一 Windows 用户下的
+仅当课程版尚无 Provider 配置和内置 Provider 凭据时，程序会尝试从同一操作系统用户下的
 论文版只读复制：
 
 - 非秘密 `providers.json`；
-- OpenAI、DeepSeek 及自定义 Provider 的 Credential Manager 条目。
+- OpenAI、DeepSeek 及自定义 Provider 的系统凭据条目。
 
 导入结果写入一次性标记；课程版不会持续读取论文版配置，也不会修改论文版。课程桌面程序
 明确禁用 `OPENAI_API_KEY` 和 `DEEPSEEK_API_KEY` 环境变量回退，避免两套产品意外共享密钥。
@@ -253,7 +269,7 @@ PDF `/Author` 提取姓名，更不会根据“示例252”“课程252”等班
 ```
 
 报告顶部与 CSV 会列出具体待核对字段，并标明人工核对是否完成。仅专业未识别时仍使用标准
-格式和“未识别专业”。人工确认后，报告、Markdown、PDF、批次清单、CSV 和文件名同步本地更新。
+格式和“未识别专业”。人工确认后，报告、Markdown、PDF、批次清单、CSV、XLSX 和文件名同步本地更新。
 
 报告包含：
 
@@ -266,10 +282,18 @@ PDF `/Author` 提取姓名，更不会根据“示例252”“课程252”等班
 PDF 在本地由规范 Markdown 快照生成，不再次调用 LLM。程序在单篇处理前及解析后校验源论文
 SHA-256；报告 PDF 临时文件验证成功后才原子发布。文件名冲突时追加短任务标识，不覆盖其他报告。
 
-### 9.2 汇总 CSV
+### 9.2 汇总 CSV 与 XLSX
 
 固定名称：`课程论文评测汇总.csv`。它使用 UTF-8 BOM，Excel 可直接识别中文；维度列从当前
 Rubric 动态生成。CSV 原子更新，并对可能触发电子表格公式的文本加前导单引号。
+
+同时生成 `课程论文评测汇总.xlsx`，包含身份信息、置信度与待核对状态、当前 Rubric 的动态维度、
+总分、等级、结论、任务状态、报告文件名和脱敏错误摘要。XLSX 提供冻结表头、筛选、交替行样式、
+适配列宽和维度权重/分值范围批注；学号按文本保存，成绩按数值保存。所有外部文本都禁止公式和
+自动链接。写入采用临时文件和原子替换，文件被 Excel 或 Numbers 占用时不会中断批次。
+
+批次详情的“生成并打开 Excel 成绩表”会按当前数据刷新后调用系统默认表格软件打开，不调用模型；
+旧批次也可补导出。
 
 批次详情中的“打开单篇详情”可进入完整任务报告页；规范 Markdown 和 JSON 等审计 Artifact
 保存在应用数据目录，用户也可从报告页另存 Markdown 或 PDF。
@@ -291,6 +315,7 @@ Rubric 动态生成。CSV 原子更新，并对可能触发电子表格公式的
 | 输出目录权限失败 | 无写权限、路径过长或文件被占用 | 释放文件、缩短路径并确保权限 | 保留 |
 | 元数据不准确 | 封面不规范、隐藏 PDF 标题污染旧记录或证据置信度低 | 点击“核对/修改信息”，历史批次可先用“重新检查待核对项” | 不重新评分；本地重检不调用模型 |
 | EXE 无法启动 | 只复制了 EXE 或冻结资源缺失 | 重新解压完整 ZIP 并核验哈希 | 用户数据通常保留 |
+| macOS 拒绝打开 | 测试版未做 Developer ID 签名/公证 | 核验哈希后右键“打开”；可信时仅移除该应用的 quarantine | 用户数据通常保留 |
 
 更完整的 Provider、Responses、PDF、数据库和报告导出错误说明见
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。日志位于应用数据目录的 `logs` 子目录。提交问题时
@@ -299,7 +324,7 @@ Bearer Header、论文正文或第三方服务的原始响应。
 
 ## 11. 数据、备份与升级
 
-默认目录：
+Windows 默认目录：
 
 ```text
 %LOCALAPPDATA%\CoursePaperReviewer\CoursePaperReviewer\
@@ -310,14 +335,20 @@ Bearer Header、论文正文或第三方服务的原始响应。
 └─ config\
 ```
 
+macOS 默认目录为：
+
+```text
+~/Library/Application Support/CoursePaperReviewer/
+```
+
 建议在程序完全退出且没有活动批次时备份整个目录，并另行备份用户选择的批次输出目录。
-Credential Manager 中的 API Key 不包含在文件备份里，迁移电脑后需要重新保存。升级便携版时，
+系统凭据存储中的 API Key 不包含在文件备份里，迁移电脑后需要重新保存。升级便携版时，
 将新版解压到新程序目录，不要覆盖或删除 `%LOCALAPPDATA%` 数据；先保留旧版，完成代表性恢复和
 导出测试后再移除旧程序目录。
 
 ## 12. 构建与自检
 
-构建命令：
+Windows 构建命令：
 
 ```powershell
 .\scripts\build_course_portable.ps1
@@ -330,7 +361,7 @@ Credential Manager 中的 API Key 不包含在文件备份里，迁移电脑后�
 3. 打包资源；
 4. Markdown/PDF 报告导出；
 5. 课程 Rubric/Profile；
-6. 批量文件命名和 CSV；
+6. 批量文件命名和 CSV/XLSX；
 7. Qt GUI 启动。
 
 课程版 spec 会排除开发机 PATH 中可能出现的 Poppler ICU DLL，避免其覆盖 PySide6 在
@@ -340,10 +371,22 @@ Windows 10/11 上使用的系统 ICU；冻结版自检会实际导入 QtCore 并
 
 | 交付件 | 相对路径 | 字节数 | SHA-256 |
 | --- | --- | ---: | --- |
-| EXE | `dist-course/CoursePaperReviewer/CoursePaperReviewer.exe` | 17,156,406 | `917BB53EC9A969826D44BBEFF6284A01E7A64A3F2D4BC6E8DC5AAB390AFE8822` |
-| 便携 ZIP | `dist-course/CoursePaperReviewer-portable.zip` | 96,619,246 | `BB0E42F050F84D2CB72374E820755B5B7BAD631A585F01CF1C4B8877D5E8B42D` |
+| EXE | `dist-course/CoursePaperReviewer/CoursePaperReviewer.exe` | 17,702,466 | 以交付 ZIP 校验值为准 |
+| 便携 ZIP | `dist-course/CoursePaperReviewer-portable.zip` | 97,160,571 | `37650B017FFB46062D7708F3DCE19552E2E997203E5C8B37A30E5518640F32B2` |
 
 发布时应分发整个 ZIP；Git 不跟踪 `build-course/` 或 `dist-course/`。
+
+macOS Apple Silicon 必须在 Apple Silicon Mac 上原生构建，不能在 Windows 上交叉生成：
+
+```bash
+uv sync --extra dev
+./scripts/build_course_macos.sh
+```
+
+脚本使用 `course-paper-reviewer-macos.spec` 生成 `.app`，执行不读写密码的 Keychain 后端发现自检及
+其余冻结版自检，并输出 `dist-course-macos/CoursePaperReviewer-macos-arm64.zip` 和 SHA-256。
+`.github/workflows/build-course-macos.yml` 在 `macos-14` runner 上提供同一构建产物，保留 14 天。
+该产物仅 ad-hoc 签名且未公证；正式发布需另行配置 Developer ID Application 与 notarization。
 
 ## 13. 当前验证结果
 
@@ -351,12 +394,13 @@ Windows 10/11 上使用的系统 ICU；冻结版自检会实际导入 QtCore 并
 
 ```text
 Ruff: All checks passed
-mypy: Success: no issues found in 116 source files
-pytest: 520 passed in 204.14s（约 3 分 24 秒）
+mypy: Success: no issues found in 119 source files
+pytest: 549 passed in 363.33s（约 6 分 3 秒）
 git diff --check: clean（仅 Git 的 CRLF 转换提示）
 ```
 
-源码自检和冻结 EXE 的七项自检均通过。自动测试覆盖课程 Rubric、元数据、匿名化、批次清单、
+Windows 源码自检和既有冻结 EXE 的七项自检均通过；macOS `.app` 需由 Apple Silicon Actions
+runner 构建并执行同等的非交互冻结自检。自动测试覆盖课程 Rubric、元数据、匿名化、批次清单、
 可见标题与隐藏标题冲突、历史本地重检、原子更新、跨进程锁、停止恢复、失败范围、安全命名、
 CSV 防护、课程报告、Provider 导入、GUI 控制器、PyInstaller 资源和历史论文任务兼容边界。
 

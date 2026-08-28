@@ -103,7 +103,9 @@ _SUMMARY: Mapping[BatchErrorKind, str] = {
     BatchErrorKind.AUTHENTICATION: "Provider 认证失败；请检查 API Key 和账号权限。",
     BatchErrorKind.AUTHORIZATION: "批次处理授权或非涉密确认无效；请重新创建批次。",
     BatchErrorKind.MISSING_API_KEY: "Provider 尚未配置 API Key；请先完成配置。",
-    BatchErrorKind.CREDENTIAL_ACCESS: "无法读取 Provider 凭据；请检查 Windows 凭据管理器。",
+    BatchErrorKind.CREDENTIAL_ACCESS: (
+        "无法读取 Provider 凭据；请检查系统凭据存储（Windows 凭据管理器或 macOS 钥匙串）。"
+    ),
     BatchErrorKind.INVALID_MODEL: "Provider 不支持所选模型；请检查模型名称和权限。",
     BatchErrorKind.INVALID_PROTOCOL: "Provider 不支持当前接口协议或工具调用格式。",
     BatchErrorKind.INVALID_RUBRIC: "课程 Rubric 配置无效；请修正后重新创建批次。",

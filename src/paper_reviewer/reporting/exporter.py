@@ -24,7 +24,15 @@ from PySide6.QtWidgets import QApplication
 
 from paper_reviewer.reporting.renderer import DISCLAIMER_LINES
 
-_FONT_CANDIDATES = ("Microsoft YaHei UI", "Microsoft YaHei", "SimSun")
+_FONT_CANDIDATES = (
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Songti SC",
+    "Heiti SC",
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "SimSun",
+)
 _WINDOWS_FONT_FILES = ("msyh.ttc", "simsun.ttc")
 _V2_REPORT_MARKERS = ("## 九项诊断评分", "## 独立专家面板", "## 确定性决策路径")
 _A4_WIDTH_POINTS = 595.28
@@ -130,7 +138,9 @@ def _ensure_gui_application() -> QGuiApplication:
     instance = QGuiApplication.instance()
     if isinstance(instance, QGuiApplication):
         return instance
-    if sys.platform != "win32" and not os.environ.get("DISPLAY"):
+    # macOS GUI sessions normally have no DISPLAY variable; forcing the
+    # offscreen plugin there would make the packaged app invisible.
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     # Keep the internally created application alive for the process lifetime.
     # Destroying and recreating Qt's application singleton in one process can
@@ -162,6 +172,6 @@ def _preferred_chinese_font() -> str:
                 if family in registered:
                     return family
     raise ReportPdfExportError(
-        "未找到可用中文字体（Microsoft YaHei UI、Microsoft YaHei 或 SimSun），"
+        "未找到可用中文字体（macOS 可使用苹方/冬青黑体/宋体，Windows 可使用微软雅黑/宋体），"
         "已取消 PDF 导出以避免生成乱码。"
     )

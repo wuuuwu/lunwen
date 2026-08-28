@@ -166,7 +166,12 @@ class FluentThemeManager(QObject):
             preferred.append("Segoe UI Variable")
         elif "Segoe UI" in families:
             preferred.append("Segoe UI")
-        for family in ("Microsoft YaHei UI", "Microsoft YaHei"):
+        for family in (
+            "PingFang SC",
+            "Hiragino Sans GB",
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+        ):
             if family in families:
                 preferred.append(family)
         if preferred:

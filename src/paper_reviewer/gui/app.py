@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from paper_reviewer.application.app_state import AppPaths
 
 CREDENTIAL_SELF_TEST_FLAG = "--self-test-credentials"
+SYSTEM_CREDENTIAL_BACKEND_SELF_TEST_FLAG = "--self-test-system-credential-backend"
 DATABASE_SELF_TEST_FLAG = "--self-test-database"
 RESOURCE_SELF_TEST_FLAG = "--self-test-resources"
 REPORT_EXPORT_SELF_TEST_FLAG = "--self-test-report-export"
@@ -62,6 +63,26 @@ def configure_credential_namespace() -> SystemCredentialStore:
         # do not share mutable environment-variable fallback afterwards.
         environments={},
     )
+
+
+def run_system_credential_backend_self_test() -> None:
+    """Check frozen backend discovery without reading or writing a secret."""
+
+    import keyring
+
+    if sys.platform == "darwin":
+        from keyring.backends.macOS import Keyring as ExpectedBackend
+    elif sys.platform == "win32":
+        from keyring.backends.Windows import WinVaultKeyring as ExpectedBackend
+    else:
+        raise RuntimeError("system credential backend self-test requires Windows or macOS")
+
+    backend = keyring.get_keyring()
+    if not isinstance(backend, ExpectedBackend):
+        raise RuntimeError(
+            f"unexpected system credential backend: {type(backend).__module__}."
+            f"{type(backend).__name__}"
+        )
 
 
 def configure_logging(paths: AppPaths) -> None:
@@ -395,6 +416,12 @@ def run_report_export_self_test() -> None:
 
 
 def main() -> int:
+    if SYSTEM_CREDENTIAL_BACKEND_SELF_TEST_FLAG in sys.argv[1:]:
+        try:
+            run_system_credential_backend_self_test()
+        except Exception:
+            return 1
+        return 0
     if CREDENTIAL_SELF_TEST_FLAG in sys.argv[1:]:
         try:
             from paper_reviewer.adapters.security.keyring_store import SystemCredentialStore
@@ -481,7 +508,7 @@ def main() -> int:
             import_thesis_provider_settings(paths)
         except Exception:
             # Import is a convenience-only, read-only migration.  A damaged source
-            # catalog or unavailable Credential Manager must never prevent the
+            # catalog or unavailable system credential store must never prevent the
             # isolated course application from starting.
             logging.getLogger(__name__).warning(
                 "Thesis provider configuration import was skipped",

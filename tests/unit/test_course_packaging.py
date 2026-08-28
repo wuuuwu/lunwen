@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
+import pytest
 from pytest import MonkeyPatch
 
 from paper_reviewer.application import app_state
@@ -10,8 +12,10 @@ from paper_reviewer.gui.app import (
     configure_credential_namespace,
     run_batch_output_self_test,
     run_batch_resource_self_test,
+    run_system_credential_backend_self_test,
 )
 from paper_reviewer.gui.resource_paths import bundled_config
+from paper_reviewer.reporting.exporter import _FONT_CANDIDATES
 
 
 def test_course_app_paths_are_isolated_and_include_batches(
@@ -76,3 +80,53 @@ def test_course_credential_namespace_is_independent(monkeypatch: MonkeyPatch) ->
 def test_course_batch_packaging_self_tests() -> None:
     run_batch_resource_self_test()
     run_batch_output_self_test()
+
+
+def test_native_system_credential_backend_is_discoverable() -> None:
+    if sys.platform in {"win32", "darwin"}:
+        run_system_credential_backend_self_test()
+    else:
+        with pytest.raises(RuntimeError, match="requires Windows or macOS"):
+            run_system_credential_backend_self_test()
+
+
+def test_pdf_export_has_macos_chinese_font_candidates() -> None:
+    assert _FONT_CANDIDATES[:4] == (
+        "PingFang SC",
+        "Hiragino Sans GB",
+        "Songti SC",
+        "Heiti SC",
+    )
+
+
+def test_macos_packaging_contract_is_arm64_and_separate_from_windows() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    spec = (project_root / "course-paper-reviewer-macos.spec").read_text(
+        encoding="utf-8"
+    )
+    script = (project_root / "scripts/build_course_macos.sh").read_text(
+        encoding="utf-8"
+    )
+    workflow = (
+        project_root / ".github/workflows/build-course-macos.yml"
+    ).read_text(encoding="utf-8")
+
+    assert 'target_arch="arm64"' in spec
+    assert 'name="CoursePaperReviewer.app"' in spec
+    assert 'bundle_identifier="com.coursepaperreviewer.app"' in spec
+    assert '"keyring.backends.macOS.api"' in spec
+    assert "win32ctypes" not in spec
+    assert '"$(uname -s)" != "Darwin"' in script
+    assert '"$(uname -m)" != "arm64"' in script
+    assert "--self-test-system-credential-backend" in script
+    assert "/usr/bin/ditto -c -k --sequesterRsrc --keepParent" in script
+    assert "CoursePaperReviewer-macos-arm64.zip.sha256" in workflow
+    assert 'test "$(uname -m)" = "arm64"' in workflow
+
+
+def test_windows_spec_remains_windows_specific() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    spec = (project_root / "course-paper-reviewer.spec").read_text(encoding="utf-8")
+
+    assert "win32ctypes.pywin32.win32cred" in spec
+    assert "BUNDLE(" not in spec
