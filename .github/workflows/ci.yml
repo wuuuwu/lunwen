@@ -16,4 +16,14 @@ jobs:
       - run: uv sync --extra dev
       - run: uv run ruff check .
       - run: uv run mypy src
-      - run: uv run pytest
+      - name: Run pytest
+        shell: bash
+        run: |
+          set +e
+          uv run pytest --tb=short 2>&1 | tee pytest-linux.log
+          test_status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$test_status" -ne 0 ]]; then
+            uv run python -c 'from pathlib import Path; text = Path("pytest-linux.log").read_text(encoding="utf-8")[-4000:]; escaped = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print(f"::error title=Linux pytest::{escaped}")'
+            exit "$test_status"
+          fi
