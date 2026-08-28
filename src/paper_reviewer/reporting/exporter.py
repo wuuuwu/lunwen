@@ -18,7 +18,9 @@ from PySide6.QtGui import (
     QPageLayout,
     QPageSize,
     QPdfWriter,
+    QTextCursor,
     QTextDocument,
+    QTextFormat,
 )
 from PySide6.QtWidgets import QApplication
 
@@ -78,6 +80,7 @@ def render_pdf(
     )
     printable_markdown = re.sub(r"[\u2010-\u2015]", "-", markdown)
     document.setMarkdown(printable_markdown, features)
+    _start_disclaimer_section_on_new_page(document)
 
     writer = QPdfWriter(str(destination))
     writer.setResolution(96)
@@ -96,6 +99,21 @@ def render_pdf(
     # An unpaginated QTextDocument uses Qt's native print layout: roughly 2 cm
     # content margins, automatic page breaks, and a current-page footer.
     document.print_(writer)
+
+
+def _start_disclaimer_section_on_new_page(document: QTextDocument) -> None:
+    """Keep the short mandatory disclaimer list away from page boundaries."""
+
+    block = document.begin()
+    while block.isValid():
+        if block.text().strip() == "重要说明":
+            block_format = block.blockFormat()
+            block_format.setPageBreakPolicy(
+                QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore
+            )
+            QTextCursor(block).setBlockFormat(block_format)
+            return
+        block = block.next()
 
 
 def validate_pdf(path: Path, markdown: str) -> None:
