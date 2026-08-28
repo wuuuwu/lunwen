@@ -147,11 +147,16 @@ def run_batch_resource_self_test() -> None:
 
 
 def run_batch_output_self_test() -> None:
-    """Exercise batch naming and UTF-8-BOM CSV output without user data."""
+    """Exercise batch naming plus packaged CSV/XLSX output without user data."""
+
+    from openpyxl import load_workbook  # type: ignore[import-untyped]
 
     from paper_reviewer.application.batch_output import (
+        BATCH_SUMMARY_FILENAME,
+        BATCH_WORKBOOK_FILENAME,
         build_report_filename,
         write_batch_summary_csv,
+        write_batch_summary_xlsx,
     )
     from paper_reviewer.config import load_review_profile, load_rubric
     from paper_reviewer.domain.batch import (
@@ -239,7 +244,7 @@ def run_batch_output_self_test() -> None:
             ),
             items=[item],
         )
-        destination = root / "reports" / "summary.csv"
+        destination = root / "reports" / BATCH_SUMMARY_FILENAME
         write_batch_summary_csv(destination, batch, [("task_completion", "课程任务完成度")])
         payload = destination.read_bytes()
         if not payload.startswith(b"\xef\xbb\xbf"):
@@ -247,6 +252,24 @@ def run_batch_output_self_test() -> None:
         text = payload.decode("utf-8-sig")
         if "'=2+2" not in text or "课程任务完成度" not in text:
             raise RuntimeError("batch CSV safety or dynamic columns self-test failed")
+        workbook_destination = root / "reports" / BATCH_WORKBOOK_FILENAME
+        write_batch_summary_xlsx(
+            workbook_destination,
+            batch,
+            batch.rubric_snapshot.dimensions,
+        )
+        workbook = load_workbook(workbook_destination, read_only=False, data_only=False)
+        try:
+            worksheet = workbook["成绩汇总"]
+            values = [cell.value for cell in worksheet[1]]
+            if "课程任务完成度" not in values or worksheet.freeze_panes != "A2":
+                raise RuntimeError("batch XLSX layout or dynamic columns self-test failed")
+            name_column = values.index("姓名") + 1
+            name_cell = worksheet.cell(row=2, column=name_column)
+            if name_cell.value != "=2+2" or name_cell.data_type == "f":
+                raise RuntimeError("batch XLSX literal-text safety self-test failed")
+        finally:
+            workbook.close()
 
 
 def _call_report_pdf_renderer(

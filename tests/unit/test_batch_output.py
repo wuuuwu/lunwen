@@ -6,12 +6,14 @@ from pathlib import Path
 from threading import Barrier
 
 import pytest
+from openpyxl import load_workbook
 
 from paper_reviewer.application.batch_output import (
     BATCH_OUTPUT_OWNED_MESSAGE,
     BATCH_OUTPUT_OWNERSHIP_UNVERIFIABLE_MESSAGE,
     BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE,
     BATCH_SUMMARY_FILENAME,
+    BATCH_WORKBOOK_FILENAME,
     BatchOutputConflictError,
     BatchOutputOwnedByAnotherBatchError,
     BatchOutputOwnershipUnverifiableError,
@@ -23,6 +25,7 @@ from paper_reviewer.application.batch_output import (
     is_allocated_report_filename,
     sanitize_filename_component,
     write_batch_summary_csv,
+    write_batch_summary_xlsx,
 )
 from paper_reviewer.application.batch_store import scan_batch_sources
 from paper_reviewer.config import ReviewerProfile, ReviewProfile
@@ -36,7 +39,7 @@ from paper_reviewer.domain.provider import (
     ProviderSnapshot,
     endpoint_fingerprint,
 )
-from paper_reviewer.domain.rubric import RubricProfile
+from paper_reviewer.domain.rubric import RubricDimension, RubricProfile
 from paper_reviewer.domain.submission import (
     SUBMISSION_METADATA_FIELDS,
     SubmissionFieldEvidence,
@@ -128,6 +131,29 @@ def _record(tmp_path: Path, metadata: SubmissionMetadata) -> BatchRecord:
         ),
         items=[item],
     )
+
+
+def _workbook_dimensions() -> list[RubricDimension]:
+    return [
+        RubricDimension(
+            dimension_id="completion",
+            title="共同维度",
+            description="课程任务完成情况",
+            weight=60,
+            minimum_score=0,
+            maximum_score=100,
+            checks=["检查任务完成情况"],
+        ),
+        RubricDimension(
+            dimension_id="writing",
+            title="共同维度",
+            description="文字表达情况",
+            weight=40,
+            minimum_score=10,
+            maximum_score=90,
+            checks=["检查文字表达"],
+        ),
+    ]
 
 
 def test_report_filename_normalizes_windows_names_and_limits_utf16() -> None:
@@ -302,6 +328,107 @@ def test_batch_csv_lists_pending_fields_and_human_confirmation(tmp_path: Path) -
     assert confirmed_row["人工已核对"] == "是"
 
 
+def test_batch_xlsx_is_styled_dynamic_typed_and_formula_safe(tmp_path: Path) -> None:
+    metadata = _metadata(
+        student_name="=HYPERLINK(\"https://invalid.example\")",
+        student_id="0012300",
+        paper_title="+SUM(1,1)",
+        field_confidences={"major": 0.4},
+    )
+    record = _record(tmp_path, metadata)
+    failed = record.items[0].model_copy(deep=True)
+    failed.item_id = "failed-item"
+    failed.status = BatchItemStatus.FAILED
+    failed.metadata = None
+    failed.dimension_scores = {}
+    failed.total_score = None
+    failed.grade = None
+    failed.conclusion = None
+    failed.report_path = None
+    failed.error = "@external-error"
+    record.items.append(failed)
+    destination = record.request.output_dir / BATCH_WORKBOOK_FILENAME
+
+    write_batch_summary_xlsx(destination, record, _workbook_dimensions())
+
+    workbook = load_workbook(destination, data_only=False, keep_links=True)
+    try:
+        assert workbook.sheetnames == ["成绩汇总"]
+        worksheet = workbook["成绩汇总"]
+        headers = [cell.value for cell in worksheet[1]]
+        assert "共同维度（completion）" in headers
+        assert "共同维度（writing）" in headers
+        assert worksheet.freeze_panes == "A2"
+        assert worksheet.auto_filter.ref == worksheet.tables["CoursePaperScores"].ref
+        assert worksheet.tables["CoursePaperScores"].tableStyleInfo.showRowStripes
+        assert max(dimension.width or 0 for dimension in worksheet.column_dimensions.values()) <= 48
+
+        by_header = {value: index for index, value in enumerate(headers, start=1)}
+        student_id = worksheet.cell(row=2, column=by_header["学号"])
+        confidence = worksheet.cell(row=2, column=by_header["元数据置信度"])
+        first_score = worksheet.cell(row=2, column=by_header["共同维度（completion）"])
+        total = worksheet.cell(row=2, column=by_header["总分"])
+        assert student_id.value == "0012300"
+        assert student_id.data_type == "s"
+        assert confidence.value == pytest.approx(0.775)
+        assert confidence.data_type == "n"
+        assert first_score.value == 88
+        assert first_score.data_type == "n"
+        assert total.value == 84.5
+        assert total.data_type == "n"
+        assert worksheet.cell(row=3, column=by_header["总分"]).value is None
+        assert worksheet.cell(row=3, column=by_header["任务状态"]).value == "failed"
+
+        completion_header = worksheet.cell(
+            row=1,
+            column=by_header["共同维度（completion）"],
+        )
+        writing_header = worksheet.cell(
+            row=1,
+            column=by_header["共同维度（writing）"],
+        )
+        assert completion_header.comment is not None
+        assert "权重：60%" in completion_header.comment.text
+        assert "分值范围：0–100" in completion_header.comment.text
+        assert writing_header.comment is not None
+        assert "分值范围：10–90" in writing_header.comment.text
+
+        assert not workbook._external_links
+        for row in worksheet.iter_rows():
+            for cell in row:
+                assert cell.data_type != "f"
+                assert cell.hyperlink is None
+        assert worksheet.cell(row=2, column=by_header["姓名"]).value.startswith("=")
+        assert worksheet.cell(row=2, column=by_header["原文件名"]).value == "=paper.pdf"
+        assert worksheet.cell(row=2, column=by_header["题目"]).value.startswith("+")
+        assert worksheet.cell(row=3, column=by_header["错误摘要"]).value.startswith("@")
+    finally:
+        workbook.close()
+
+
+def test_batch_xlsx_replace_failure_preserves_old_file_and_cleans_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _record(tmp_path, _metadata())
+    output_dir = record.request.output_dir
+    output_dir.mkdir(parents=True)
+    claim_batch_output_directory(output_dir, record.batch_id)
+    destination = output_dir / BATCH_WORKBOOK_FILENAME
+    destination.write_bytes(b"old workbook")
+
+    def deny_replace(_source: Path, _destination: Path) -> None:
+        raise PermissionError("locked by spreadsheet application")
+
+    monkeypatch.setattr("paper_reviewer.application.batch_output.os.replace", deny_replace)
+
+    with pytest.raises(PermissionError):
+        write_batch_summary_xlsx(destination, record, _workbook_dimensions())
+
+    assert destination.read_bytes() == b"old workbook"
+    assert not list(output_dir.glob(f".{BATCH_WORKBOOK_FILENAME}.*.tmp.xlsx"))
+
+
 def test_batch_csv_does_not_replace_a_summary_claimed_by_another_batch(
     tmp_path: Path,
 ) -> None:
@@ -364,6 +491,21 @@ def test_batch_output_conflict_probe_is_static_and_has_no_side_effects(
 
     assert str(captured.value) == BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE
     assert tuple(output_dir.iterdir()) == before
+
+
+def test_batch_output_conflict_probe_also_protects_unowned_xlsx(tmp_path: Path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    workbook = output_dir / BATCH_WORKBOOK_FILENAME
+    workbook.write_bytes(b"existing workbook")
+    before = tuple(output_dir.iterdir())
+
+    assert batch_output_conflict_message(output_dir) == BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE
+    with pytest.raises(BatchOutputSummaryExistsError):
+        claim_batch_output_directory(output_dir, "new-batch")
+
+    assert tuple(output_dir.iterdir()) == before
+    assert workbook.read_bytes() == b"existing workbook"
 
 
 def test_batch_output_claim_allows_only_its_batch_to_resume(tmp_path: Path) -> None:

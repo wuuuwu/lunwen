@@ -102,6 +102,8 @@ class BatchRecord(BaseModel):
     current_item_id: str | None = None
     retry_item_ids: list[str] | None = None
     summary_path: Path | None = None
+    workbook_path: Path | None = None
+    workbook_export_error: str | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -136,6 +138,10 @@ class BatchRecord(BaseModel):
             summary = self.summary_path.resolve(strict=False)
             if summary.parent != output_root or summary.suffix.casefold() != ".csv":
                 raise ValueError("batch summary must be a CSV inside output_dir")
+        if self.workbook_path is not None:
+            workbook = self.workbook_path.resolve(strict=False)
+            if workbook.parent != output_root or workbook.suffix.casefold() != ".xlsx":
+                raise ValueError("batch workbook must be an XLSX inside output_dir")
         return self
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -80,6 +81,8 @@ class _BatchDetail:
         self.events: list[BatchEvent] = []
         self.busy: list[tuple[bool, str]] = []
         self.errors: list[str] = []
+        self.workbook_errors: list[str] = []
+        self.workbook_exported = 0
         self.message = _Message()
 
     @property
@@ -98,6 +101,12 @@ class _BatchDetail:
 
     def show_error(self, message: str) -> None:
         self.errors.append(message)
+
+    def show_workbook_error(self, message: str) -> None:
+        self.workbook_errors.append(message)
+
+    def show_workbook_exported(self) -> None:
+        self.workbook_exported += 1
 
     def clear(self) -> None:
         self.batch = None
@@ -338,6 +347,96 @@ def test_late_metadata_or_pause_result_does_not_overwrite_current_batch() -> Non
     assert [record.batch_id for record in window.remembered] == ["batch-a"]
     assert window.refreshed_batches == 1
     assert window.refreshed_runs == 1
+
+
+def test_batch_workbook_controller_runs_async_refresh_opens_and_reports_success(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    destination = tmp_path / "课程论文评测汇总.xlsx"
+    destination.write_bytes(b"xlsx")
+    record = _record("batch-a", BatchStatus.COMPLETED)
+
+    class Service:
+        async def export_batch_workbook(self, batch_id: str) -> Path:
+            assert batch_id == "batch-a"
+            return destination
+
+        async def get_batch(self, batch_id: str) -> BatchRecord:
+            assert batch_id == "batch-a"
+            return record
+
+    detail = _BatchDetail("batch-a")
+    scheduled: list[tuple[object, object, object]] = []
+    window = MainWindow.__new__(MainWindow)
+    window.service = Service()
+    window.batch_detail_page = detail
+    window.pages = _Pages(detail)
+    window._batch_view_generation = 4
+    window._run_async = lambda operation, success, failure: scheduled.append(
+        (operation, success, failure)
+    )
+    window._set_global_status = lambda *args, **kwargs: None
+    window.refresh_batches = lambda: None
+    window._remember_batch_record = lambda _record: None
+    window._set_batch_detail_record = detail.set_batch
+    opened: list[str] = []
+    monkeypatch.setattr(
+        "paper_reviewer.gui.main_window.QDesktopServices.openUrl",
+        lambda url: opened.append(url.toLocalFile()) or True,
+    )
+
+    MainWindow.export_batch_workbook(window, "batch-a")
+
+    assert detail.busy == [(True, "workbook")]
+    operation, success, _failure = scheduled[0]
+    value = asyncio.run(operation(None))  # type: ignore[operator]
+    success(value)  # type: ignore[operator]
+    assert len(opened) == 1
+    assert Path(opened[0]) == destination
+    assert detail.workbook_exported == 1
+    assert detail.workbook_errors == []
+
+
+def test_batch_workbook_controller_shows_safe_failure_for_current_batch() -> None:
+    detail = _BatchDetail("batch-a")
+    window = MainWindow.__new__(MainWindow)
+    window.batch_detail_page = detail
+    window.pages = _Pages(detail)
+    window._batch_view_generation = 2
+    window._set_global_status = lambda *args, **kwargs: None
+    window.refresh_batches = lambda: None
+
+    MainWindow._batch_workbook_export_failed(
+        window,
+        "请关闭成绩表后重试更新。",
+        "private traceback",
+        expected_batch_id="batch-a",
+        view_generation=2,
+    )
+
+    assert detail.workbook_errors == ["请关闭成绩表后重试更新。"]
+
+
+def test_hidden_batch_workbook_callback_releases_transient_busy_state() -> None:
+    detail = _BatchDetail("batch-a")
+    window = MainWindow.__new__(MainWindow)
+    window.batch_detail_page = detail
+    window.pages = _Pages(object())
+    window._batch_view_generation = 3
+    window._set_global_status = lambda *args, **kwargs: None
+    window.refresh_batches = lambda: None
+
+    MainWindow._batch_workbook_export_failed(
+        window,
+        "请关闭成绩表后重试更新。",
+        "",
+        expected_batch_id="batch-a",
+        view_generation=2,
+    )
+
+    assert detail.busy == [(False, "")]
+    assert detail.workbook_errors == []
 
 
 def test_stale_running_record_is_presented_as_resumable_without_mutating_source() -> None:

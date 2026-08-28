@@ -22,7 +22,7 @@ try {
         @{ Argument = "--self-test-resources"; Name = "Bundled resources" },
         @{ Argument = "--self-test-report-export"; Name = "Markdown/PDF report export" },
         @{ Argument = "--self-test-batch-resources"; Name = "Course batch resources" },
-        @{ Argument = "--self-test-batch-output"; Name = "Batch naming/CSV output" },
+        @{ Argument = "--self-test-batch-output"; Name = "Batch naming/CSV/XLSX output" },
         @{ Argument = "--self-test-gui-startup"; Name = "Qt GUI startup" }
     )) {
         $ProbeProcess = Start-Process -FilePath $PortableExecutable `
@@ -34,8 +34,14 @@ try {
     }
     $Archive = Join-Path $DistRoot "CoursePaperReviewer-portable.zip"
     Compress-Archive -Path "$PortableDirectory\*" -DestinationPath $Archive -Force
+    $ChecksumPath = "$Archive.sha256"
+    $ArchiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Archive).Hash
+    Set-Content -LiteralPath $ChecksumPath `
+        -Value "$ArchiveHash  $([System.IO.Path]::GetFileName($Archive))" `
+        -Encoding ascii
     Write-Host "Portable build: $PortableExecutable"
     Write-Host "Archive: $Archive"
+    Write-Host "SHA-256: $ChecksumPath"
 }
 finally {
     Pop-Location

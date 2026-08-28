@@ -217,6 +217,23 @@ def test_batch_record_binds_frozen_provider_and_top_level_sources(tmp_path: Path
     nested_report.items[0].report_path = request.output_dir / "reports" / "paper.pdf"
     assert BatchRecord.model_validate(nested_report.model_dump()).items[0].report_path is not None
 
+    historical_payload = record.model_dump()
+    historical_payload.pop("workbook_path")
+    historical_payload.pop("workbook_export_error")
+    historical = BatchRecord.model_validate(historical_payload)
+    assert historical.workbook_path is None
+    assert historical.workbook_export_error is None
+
+    escaped_workbook = record.model_copy(deep=True)
+    escaped_workbook.workbook_path = tmp_path / "outside.xlsx"
+    with pytest.raises(ValueError, match="workbook must be an XLSX inside output_dir"):
+        BatchRecord.model_validate(escaped_workbook.model_dump())
+
+    wrong_workbook_suffix = record.model_copy(deep=True)
+    wrong_workbook_suffix.workbook_path = request.output_dir / "summary.xls"
+    with pytest.raises(ValueError, match="workbook must be an XLSX inside output_dir"):
+        BatchRecord.model_validate(wrong_workbook_suffix.model_dump())
+
 
 def test_batch_store_failed_replace_keeps_old_manifest_and_cleans_temp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

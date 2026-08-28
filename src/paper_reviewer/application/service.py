@@ -30,12 +30,14 @@ from paper_reviewer.application.artifacts import RunArtifactStore
 from paper_reviewer.application.batch_errors import classify_batch_error
 from paper_reviewer.application.batch_output import (
     BATCH_SUMMARY_FILENAME,
+    BATCH_WORKBOOK_FILENAME,
     allocate_report_path,
     build_report_filename,
     claim_batch_output_directory,
     is_allocated_report_filename,
     release_batch_output_directory_claim,
     write_batch_summary_csv,
+    write_batch_summary_xlsx,
 )
 from paper_reviewer.application.batch_store import (
     BatchLoadError,
@@ -140,6 +142,17 @@ from paper_reviewer.validation.scoring import aggregate_scores
 
 EventSink = Callable[[RunEvent], None]
 BatchEventSink = Callable[[BatchEvent], None]
+
+BATCH_WORKBOOK_LOCKED_MESSAGE = (
+    "Excel 成绩表暂未更新。请关闭已打开的成绩表后重试更新。"
+)
+BATCH_WORKBOOK_WRITE_FAILED_MESSAGE = (
+    "Excel 成绩表暂未更新。请确认输出目录可写后重试更新。"
+)
+
+
+class BatchWorkbookExportError(RuntimeError):
+    """A path-free workbook export failure safe to show in the desktop UI."""
 
 
 class _BatchReportOutputError(OSError):
@@ -673,18 +686,21 @@ class ReviewApplicationService:
             items=items,
         )
         _ensure_batch_summary_path(record)
+        _ensure_batch_workbook_path(record)
         store = self._batch_store()
         # Claim and manifest persistence form one shielded thread operation.
         # A cancellation can therefore leave either no claim and no manifest,
         # or a matching claim and manifest, but never an orphaned owner marker.
         await _persist_batch_with_output_claim(store, record)
         try:
-            await asyncio.to_thread(_write_batch_csv, record)
+            await asyncio.to_thread(_write_batch_outputs, record)
         except Exception as error:
             classified = classify_batch_error(error, context="output directory")
             record.status = BatchStatus.PAUSED
             record.error = classified.summary
             record.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save, record)
+        else:
             await asyncio.to_thread(store.save, record)
         return record
 
@@ -719,7 +735,7 @@ class ReviewApplicationService:
             for item in record.items
         ) and record.retry_item_ids is None:
             try:
-                await asyncio.to_thread(_write_batch_csv, record)
+                await asyncio.to_thread(_write_batch_outputs, record)
                 await asyncio.to_thread(store.save, record)
             except Exception as error:
                 classified = classify_batch_error(error, context="output directory")
@@ -762,8 +778,9 @@ class ReviewApplicationService:
                 return record
 
         _ensure_batch_summary_path(record)
+        _ensure_batch_workbook_path(record)
         try:
-            await asyncio.to_thread(_write_batch_csv, record)
+            await asyncio.to_thread(_write_batch_outputs, record)
         except Exception as error:
             classified = classify_batch_error(error, context="output directory")
             record.status = BatchStatus.PAUSED
@@ -851,7 +868,8 @@ class ReviewApplicationService:
                     record.updated_at = item.updated_at
                     await asyncio.to_thread(store.save, record)
                     try:
-                        await asyncio.to_thread(_write_batch_csv, record)
+                        await asyncio.to_thread(_write_batch_outputs, record)
+                        await asyncio.to_thread(store.save, record)
                     except OSError:
                         # The shared failure is already durably recorded.  A
                         # later resume retries the summary before completion.
@@ -870,7 +888,8 @@ class ReviewApplicationService:
             record.current_item_id = None
             await asyncio.to_thread(store.save, record)
             try:
-                await asyncio.to_thread(_write_batch_csv, record)
+                await asyncio.to_thread(_write_batch_outputs, record)
+                await asyncio.to_thread(store.save, record)
             except Exception as error:
                 classified = classify_batch_error(error, context="output directory")
                 record.status = BatchStatus.PAUSED
@@ -915,7 +934,7 @@ class ReviewApplicationService:
         )
         final_record.updated_at = datetime.now(UTC)
         try:
-            await asyncio.to_thread(_write_batch_csv, final_record)
+            await asyncio.to_thread(_write_batch_outputs, final_record)
         except Exception as error:
             classified = classify_batch_error(error, context="output directory")
             record.status = BatchStatus.PAUSED
@@ -1003,6 +1022,33 @@ class ReviewApplicationService:
 
     async def get_batch(self, batch_id: str) -> BatchRecord:
         return await asyncio.to_thread(self._batch_store().load, batch_id)
+
+    async def export_batch_workbook(self, batch_id: str) -> Path:
+        """Refresh one batch workbook from local snapshots without calling a model."""
+
+        lock_store = BatchStore(self.paths.batches_dir)
+        with lock_store.execution_lock(batch_id):
+            store = self._batch_store()
+            record = await asyncio.to_thread(store.load, batch_id)
+            await asyncio.to_thread(
+                _ensure_batch_output_directory,
+                record.request.output_dir,
+            )
+            try:
+                await asyncio.to_thread(_write_batch_workbook, record)
+            except Exception as error:
+                message = _workbook_export_message(error)
+                record.workbook_export_error = message
+                record.updated_at = datetime.now(UTC)
+                try:
+                    await asyncio.to_thread(store.save, record)
+                except OSError:
+                    pass
+                raise BatchWorkbookExportError(message) from None
+            record.workbook_export_error = None
+            record.updated_at = datetime.now(UTC)
+            await asyncio.to_thread(store.save, record)
+            return _ensure_batch_workbook_path(record)
 
     async def list_batches(self) -> list[BatchRecord]:
         return await asyncio.to_thread(self._batch_store().list_records)
@@ -1299,6 +1345,7 @@ class ReviewApplicationService:
         selected_report = report.evaluation or report.review
         output_dir = record.request.output_dir.resolve()
         await asyncio.to_thread(_ensure_batch_output_directory, output_dir)
+        _ensure_batch_workbook_path(record)
 
         old_report_path = _managed_item_report_path(record, item)
         desired_name = build_report_filename(
@@ -1382,6 +1429,14 @@ class ReviewApplicationService:
             raise
         else:
             await _metadata_update_to_thread(transaction.finalize)
+            await asyncio.to_thread(_refresh_batch_workbook, record)
+            try:
+                await asyncio.to_thread(store.save, record)
+            except OSError:
+                # The corrected report, CSV and authoritative manifest were
+                # already committed. A later refresh can persist this optional
+                # workbook warning without invalidating the metadata update.
+                pass
             return record
 
     async def resume_review(self, run_id: str, *, event_sink: EventSink | None = None) -> RunRecord:
@@ -2104,6 +2159,18 @@ def _ensure_batch_summary_path(record: BatchRecord) -> Path:
     return record.summary_path
 
 
+def _ensure_batch_workbook_path(record: BatchRecord) -> Path:
+    if record.workbook_path is not None:
+        return _validate_batch_output_path(
+            record.request.output_dir,
+            record.workbook_path,
+            suffix=".xlsx",
+        )
+    output_dir = record.request.output_dir.resolve(strict=False)
+    record.workbook_path = output_dir / BATCH_WORKBOOK_FILENAME
+    return record.workbook_path
+
+
 def _batch_item_error_context(error: BaseException, record: BatchRecord) -> str | None:
     if isinstance(error, _BatchReportOutputError):
         return "output directory"
@@ -2129,6 +2196,48 @@ def _write_batch_csv(record: BatchRecord) -> None:
         record,
         dimensions,
     )
+
+
+def _write_batch_workbook(record: BatchRecord) -> None:
+    destination = _ensure_batch_workbook_path(record)
+    if destination.is_symlink():
+        raise ValueError("batch workbook must not be a symbolic link")
+    write_batch_summary_xlsx(
+        destination,
+        record,
+        record.rubric_snapshot.dimensions,
+    )
+
+
+def _write_batch_outputs(record: BatchRecord) -> None:
+    """Write required CSV, then refresh XLSX without affecting evaluation status."""
+
+    _write_batch_csv(record)
+    _refresh_batch_workbook(record)
+
+
+def _refresh_batch_workbook(record: BatchRecord) -> None:
+    """Best-effort XLSX refresh that records only a safe, path-free warning."""
+
+    previous_error = record.workbook_export_error
+    try:
+        _write_batch_workbook(record)
+    except Exception as error:
+        record.workbook_export_error = _workbook_export_message(error)
+    else:
+        record.workbook_export_error = None
+    if record.workbook_export_error != previous_error:
+        record.updated_at = datetime.now(UTC)
+
+
+def _workbook_export_message(error: BaseException) -> str:
+    if isinstance(error, PermissionError) or getattr(error, "winerror", None) in {
+        5,
+        32,
+        33,
+    }:
+        return BATCH_WORKBOOK_LOCKED_MESSAGE
+    return BATCH_WORKBOOK_WRITE_FAILED_MESSAGE
 
 
 class _MetadataUpdateRollbackError(RuntimeError):

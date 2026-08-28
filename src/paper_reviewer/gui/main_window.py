@@ -285,6 +285,9 @@ class MainWindow(QMainWindow):
         self.batch_detail_page.open_output_requested.connect(
             lambda value: self._open_directory(Path(value))
         )
+        self.batch_detail_page.workbook_export_requested.connect(
+            self.export_batch_workbook
+        )
         self.batch_detail_page.run_open_requested.connect(self._open_batch_run)
         self.batch_detail_page.metadata_edit_requested.connect(self.edit_batch_metadata)
         self.batch_detail_page.metadata_recheck_requested.connect(
@@ -417,6 +420,34 @@ class MainWindow(QMainWindow):
             self.batch_detail_page.set_busy(True, action="retry")
         self._start_batch_worker(operation, action="retry", batch_id=batch_id)
         self._set_global_status(fallback="正在重试批次失败项")
+
+    def export_batch_workbook(self, batch_id: str) -> None:
+        """Refresh and open the local XLSX snapshot for one persisted batch."""
+
+        view_generation = self._batch_view_generation
+        if self._is_batch_detail_visible(batch_id):
+            self.batch_detail_page.set_busy(True, action="workbook")
+
+        async def operation(_emit: EventEmitter) -> tuple[BatchRecord, Path]:
+            path = await self.service.export_batch_workbook(batch_id)
+            record = await self.service.get_batch(batch_id)
+            return record, path
+
+        self._run_async(
+            operation,
+            lambda value: self._batch_workbook_export_completed(
+                value,
+                expected_batch_id=batch_id,
+                view_generation=view_generation,
+            ),
+            lambda message, trace: self._batch_workbook_export_failed(
+                message,
+                trace,
+                expected_batch_id=batch_id,
+                view_generation=view_generation,
+            ),
+        )
+        self._set_global_status(fallback="正在生成 Excel 成绩表")
 
     def stop_batch(self, batch_id: str) -> None:
         answer = QMessageBox.question(
@@ -1235,6 +1266,69 @@ class MainWindow(QMainWindow):
             self.batch_detail_page.set_busy(False)
             self.batch_detail_page.show_error(message)
             self._set_global_status(fallback="批次操作失败，需要处理")
+        self.refresh_batches()
+
+    def _batch_workbook_export_completed(
+        self,
+        value: object,
+        *,
+        expected_batch_id: str,
+        view_generation: int,
+    ) -> None:
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 2
+            or not isinstance(value[0], BatchRecord)
+            or not isinstance(value[1], Path)
+            or value[0].batch_id != expected_batch_id
+        ):
+            self._batch_workbook_export_failed(
+                "Excel 成绩表操作没有返回有效结果。",
+                "",
+                expected_batch_id=expected_batch_id,
+                view_generation=view_generation,
+            )
+            return
+        record, path = value
+        self._remember_batch_record(record)
+        page_matches = self.batch_detail_page.batch_id == expected_batch_id
+        visible = (
+            view_generation == self._batch_view_generation
+            and self._is_batch_detail_visible(expected_batch_id)
+        )
+        if visible:
+            self._set_batch_detail_record(record)
+        elif page_matches:
+            self.batch_detail_page.set_busy(False)
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        if visible:
+            if opened:
+                self.batch_detail_page.show_workbook_exported()
+                self._set_global_status(fallback="Excel 成绩表已生成并打开")
+            else:
+                self.batch_detail_page.show_workbook_error(
+                    "Excel 成绩表已生成，但系统未能自动打开；请从输出目录打开。"
+                )
+                self._set_global_status(fallback="Excel 成绩表已生成，未能自动打开")
+        self.refresh_batches()
+
+    def _batch_workbook_export_failed(
+        self,
+        message: str,
+        _trace: str,
+        *,
+        expected_batch_id: str,
+        view_generation: int,
+    ) -> None:
+        visible = (
+            view_generation == self._batch_view_generation
+            and self._is_batch_detail_visible(expected_batch_id)
+        )
+        if visible:
+            self.batch_detail_page.show_workbook_error(message)
+            self._set_global_status(fallback="Excel 成绩表更新失败，可重试")
+        elif self.batch_detail_page.batch_id == expected_batch_id:
+            self.batch_detail_page.set_busy(False)
         self.refresh_batches()
 
     def _remember_batch_record(self, record: BatchRecord) -> None:

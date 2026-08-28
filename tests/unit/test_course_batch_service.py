@@ -9,11 +9,13 @@ from typing import Any
 
 import pymupdf
 import pytest
+from openpyxl import load_workbook
 
 import paper_reviewer.application.service as service_module
 from paper_reviewer.application.artifacts import RunArtifactStore
 from paper_reviewer.application.batch_output import (
     BATCH_SUMMARY_FILENAME,
+    BATCH_WORKBOOK_FILENAME,
     BatchOutputConflictError,
     BatchOutputOwnedByAnotherBatchError,
     BatchOutputSummaryExistsError,
@@ -29,7 +31,11 @@ from paper_reviewer.application.batch_store import (
 )
 from paper_reviewer.application.metadata_recheck import submission_metadata_sha256
 from paper_reviewer.application.models import MetadataRecheckDecision
-from paper_reviewer.application.service import ReviewApplicationService
+from paper_reviewer.application.service import (
+    BATCH_WORKBOOK_LOCKED_MESSAGE,
+    BatchWorkbookExportError,
+    ReviewApplicationService,
+)
 from paper_reviewer.config import Settings, load_review_profile, load_rubric
 from paper_reviewer.domain.batch import (
     BatchItem,
@@ -207,6 +213,97 @@ async def test_create_batch_freezes_rubric_profile_provider_and_persists_manifes
     assert persisted.provider_snapshot.model == "gpt-test"
     assert persisted.summary_path is not None
     assert persisted.summary_path.name == "课程论文评测汇总.csv"
+    assert persisted.workbook_path is not None
+    assert persisted.workbook_path.name == BATCH_WORKBOOK_FILENAME
+    assert persisted.workbook_path.is_file()
+    assert persisted.workbook_export_error is None
+
+
+@pytest.mark.asyncio
+async def test_create_batch_keeps_running_state_when_workbook_refresh_is_locked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryBatchStore()
+    service = _service(tmp_path, store)
+    (tmp_path / "papers").mkdir()
+    (tmp_path / "papers" / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+
+    def locked(*_args: Any, **_kwargs: Any) -> None:
+        raise PermissionError("private locked path")
+
+    monkeypatch.setattr(service_module, "write_batch_summary_xlsx", locked)
+
+    record = await service.create_batch(_request(tmp_path))
+
+    assert record.status is BatchStatus.CREATED
+    assert record.error is None
+    assert record.summary_path is not None and record.summary_path.is_file()
+    assert record.workbook_export_error == BATCH_WORKBOOK_LOCKED_MESSAGE
+    assert "path" not in record.workbook_export_error
+    assert store.load(record.batch_id).workbook_export_error == BATCH_WORKBOOK_LOCKED_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_manual_workbook_export_supports_historical_batch_and_clears_warning(
+    tmp_path: Path,
+) -> None:
+    store = MemoryBatchStore()
+    record = _record(tmp_path, [BatchItemStatus.COMPLETED], batch_status=BatchStatus.COMPLETED)
+    record.workbook_path = None
+    record.workbook_export_error = "旧警告"
+    record.items[0].metadata = _metadata()
+    record.items[0].dimension_scores = {"task_completion": 81.5}
+    record.items[0].total_score = 81.5
+    store.create(record)
+    service = _service(tmp_path, store)
+
+    destination = await service.export_batch_workbook(record.batch_id)
+
+    assert destination.name == BATCH_WORKBOOK_FILENAME
+    assert destination.is_file()
+    persisted = store.load(record.batch_id)
+    assert persisted.status is BatchStatus.COMPLETED
+    assert persisted.workbook_path == destination
+    assert persisted.workbook_export_error is None
+    workbook = load_workbook(destination, data_only=False)
+    try:
+        worksheet = workbook["成绩汇总"]
+        headers = [cell.value for cell in worksheet[1]]
+        assert worksheet.cell(row=2, column=headers.index("姓名") + 1).value == "张三"
+        assert worksheet.cell(row=2, column=headers.index("总分") + 1).value == 81.5
+    finally:
+        workbook.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_workbook_export_persists_safe_locked_warning_without_status_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryBatchStore()
+    record = _record(
+        tmp_path,
+        [BatchItemStatus.COMPLETED],
+        batch_status=BatchStatus.COMPLETED,
+    )
+    store.create(record)
+    service = _service(tmp_path, store)
+
+    def locked(*_args: Any, **_kwargs: Any) -> None:
+        raise PermissionError("C:/private/student-list.xlsx")
+
+    monkeypatch.setattr(service_module, "write_batch_summary_xlsx", locked)
+
+    with pytest.raises(BatchWorkbookExportError) as captured:
+        await service.export_batch_workbook(record.batch_id)
+
+    assert str(captured.value) == BATCH_WORKBOOK_LOCKED_MESSAGE
+    assert "private" not in str(captured.value)
+    persisted = store.load(record.batch_id)
+    assert persisted.status is BatchStatus.COMPLETED
+    assert persisted.error is None
+    assert persisted.workbook_export_error == BATCH_WORKBOOK_LOCKED_MESSAGE
 
 
 @pytest.mark.asyncio
@@ -461,6 +558,43 @@ async def test_run_batch_is_sequential_and_single_item_failure_does_not_stop_lat
     ]
     assert result.status is BatchStatus.COMPLETED_WITH_ERRORS
     assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_run_batch_completes_when_excel_workbook_is_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryBatchStore()
+    record = _record(tmp_path, [BatchItemStatus.QUEUED])
+    store.create(record)
+    service = _service(tmp_path, store)
+
+    async def complete_item(
+        _record_arg: BatchRecord,
+        item: BatchItem,
+        **_kwargs: Any,
+    ) -> None:
+        item.status = BatchItemStatus.COMPLETED
+        item.metadata = _metadata()
+        item.dimension_scores = {"task_completion": 80.0}
+        item.total_score = 80.0
+
+    def workbook_locked(*_args: Any, **_kwargs: Any) -> None:
+        raise PermissionError("spreadsheet is open")
+
+    monkeypatch.setattr(service, "_run_batch_item", complete_item)
+    monkeypatch.setattr(service_module, "write_batch_summary_xlsx", workbook_locked)
+    monkeypatch.setattr(service_module, "validate_source_snapshot", lambda _source: None)
+
+    result = await service.run_batch(record.batch_id)
+
+    assert result.status is BatchStatus.COMPLETED
+    assert result.error is None
+    assert result.items[0].status is BatchItemStatus.COMPLETED
+    assert result.summary_path is not None and result.summary_path.is_file()
+    assert result.workbook_export_error == BATCH_WORKBOOK_LOCKED_MESSAGE
+    assert store.load(record.batch_id).workbook_export_error == BATCH_WORKBOOK_LOCKED_MESSAGE
 
 
 @pytest.mark.asyncio
@@ -1017,6 +1151,16 @@ async def test_metadata_correction_refreshes_local_artifacts_without_model_call(
     assert (run_dir / "report.md").read_bytes() == b"new report.md"
     assert corrected.summary_path is not None
     assert corrected.summary_path.read_bytes() == b"new csv"
+    assert corrected.workbook_path is not None
+    assert corrected.workbook_path.is_file()
+    workbook = load_workbook(corrected.workbook_path, data_only=False)
+    try:
+        worksheet = workbook["成绩汇总"]
+        headers = [cell.value for cell in worksheet[1]]
+        assert worksheet.cell(row=2, column=headers.index("姓名") + 1).value == "新姓名"
+        assert worksheet.cell(row=2, column=headers.index("总分") + 1).value == 82
+    finally:
+        workbook.close()
     assert corrected.items[0].dimension_scores == {"task_completion": 82.0}
     assert corrected.items[0].total_score == 82.0
     assert {

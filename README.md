@@ -17,8 +17,8 @@ Course Paper Reviewer 是面向普通课程论文的 Windows 桌面评测工具�
 - 低置信度或缺失字段会醒目标记，可逐篇核对，也可对历史批次执行完全本地的“一键重新检查”。
 - 评分 Reviewer 和 Meta Reviewer 不接收姓名、学号、专业或原始文件路径；专用元数据提取步骤
   仍可能通过所选云端模型处理封面内容，因此开始前必须确认处理授权和非涉密属性。
-- 每篇生成固定格式的 PDF 报告，并生成 UTF-8 BOM 编码的
-  `课程论文评测汇总.csv`，方便用 Excel 打开。
+- 每篇生成固定格式的 PDF 报告，并同时生成 UTF-8 BOM 编码的
+  `课程论文评测汇总.csv` 与排版后的 `课程论文评测汇总.xlsx`。
 
 ## 默认评分规则
 
@@ -70,13 +70,19 @@ Course Paper Reviewer 是面向普通课程论文的 Windows 桌面评测工具�
 
 ```text
 课程论文评测汇总.csv
+课程论文评测汇总.xlsx
 ```
 
 汇总表包含原文件名、姓名、学号、专业、题目、待核对字段、人工核对状态、各维度分数、总分、
-等级、结论、状态、报告文件名和脱敏错误摘要。以 `= + - @` 开头的单元格会被安全转义，避免公式注入。
+等级、结论、状态、报告文件名和脱敏错误摘要。XLSX 提供冻结表头、筛选、交替行样式、列宽适配，
+并在维度表头批注中注明权重和分值范围。所有外部文本均按普通文本写入，避免公式注入和自动链接。
+
+批次详情中的“生成并打开 Excel 成绩表”会先按当前本地批次数据刷新 XLSX，再用系统默认表格软件
+打开，全程不调用模型；旧批次也可补生成。如果文件正在 Excel 中占用，评测不会中断，关闭成绩表后
+再次点击即可更新。
 
 每个批次使用独立输出目录。自动建议的目录在提交批次后会立即轮换；如果手工选择了已有
-`课程论文评测汇总.csv` 或批次归属标记的旧目录，程序会在开始前提示选择新目录，或前往
+`课程论文评测汇总.csv`、`课程论文评测汇总.xlsx` 或批次归属标记的旧目录，程序会在开始前提示选择新目录，或前往
 “批次记录”继续原批次，不会覆盖或误报为普通写入权限问题。
 
 ## Provider 与数据隔离
@@ -134,11 +140,12 @@ py -3.12 -m venv .venv
 ```
 
 脚本会构建 onedir 便携目录，依次运行凭据、SQLite、资源、Markdown/PDF、课程 Rubric/Profile、
-批量命名/CSV 和 Qt GUI 启动自检，然后生成：
+批量命名/CSV/XLSX 和 Qt GUI 启动自检，然后生成：
 
 ```text
 dist-course\CoursePaperReviewer\CoursePaperReviewer.exe
 dist-course\CoursePaperReviewer-portable.zip
+dist-course\CoursePaperReviewer-portable.zip.sha256
 ```
 
 目标 Windows 10/11 计算机无需安装 Python。`build-course/` 和 `dist-course/` 是本地构建产物，

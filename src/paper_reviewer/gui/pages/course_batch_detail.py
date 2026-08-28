@@ -39,6 +39,7 @@ class CourseBatchDetailPage(QWidget):
     resume_requested = Signal(str)
     retry_failed_requested = Signal(str)
     open_output_requested = Signal(str)
+    workbook_export_requested = Signal(str)
     run_open_requested = Signal(str)
     metadata_edit_requested = Signal(str, str)
     metadata_recheck_requested = Signal(str)
@@ -155,11 +156,23 @@ class CourseBatchDetailPage(QWidget):
             self.open_output_button, "fluentAppearance", "secondary"
         )
         self.open_output_button.clicked.connect(self._request_open_output)
+
+        self.workbook_button = QPushButton("生成并打开 Excel 成绩表")
+        self.workbook_button.setObjectName("exportBatchWorkbookButton")
+        self.workbook_button.setIcon(icons.icon("arrow_download"))
+        self.workbook_button.setAccessibleName("生成并打开批次 Excel 成绩表")
+        self.workbook_button.setAccessibleDescription(
+            "按当前批次记录在本地刷新成绩表，不调用模型，然后用系统默认表格软件打开。"
+        )
+        self.workbook_button.setToolTip("刷新课程论文评测汇总.xlsx 并打开")
+        set_fluent_property(self.workbook_button, "fluentAppearance", "secondary")
+        self.workbook_button.clicked.connect(self._request_workbook_export)
         toolbar.addWidget(self.stop_button)
         toolbar.addWidget(self.resume_button)
         toolbar.addWidget(self.retry_button)
         toolbar.addWidget(self.recheck_metadata_button)
         toolbar.addStretch(1)
+        toolbar.addWidget(self.workbook_button)
         toolbar.addWidget(self.open_output_button)
         layout.addLayout(toolbar)
 
@@ -275,6 +288,11 @@ class CourseBatchDetailPage(QWidget):
         self.batch_output.setToolTip(str(output))
         if batch.error:
             self.message.show_message(batch.error, severity="danger")
+        elif batch.workbook_export_error:
+            self.message.show_message(
+                batch.workbook_export_error,
+                severity="warning",
+            )
         elif status == "completed_with_errors":
             self.message.show_message(
                 "批次已处理完成，但部分论文失败；可查看错误后重试失败项。",
@@ -342,6 +360,7 @@ class CourseBatchDetailPage(QWidget):
             "retry": self.retry_button,
             "metadata_recheck": self.recheck_metadata_button,
             "metadata": self.edit_metadata_button,
+            "workbook": self.workbook_button,
         }
         for name, button in targets.items():
             set_fluent_property(button, "fluentBusy", busy and name == action)
@@ -350,6 +369,17 @@ class CourseBatchDetailPage(QWidget):
     def show_error(self, message: str) -> None:
         self.set_busy(False)
         self.message.show_message(message, severity="danger")
+
+    def show_workbook_error(self, message: str) -> None:
+        self.set_busy(False)
+        self.message.show_message(message, severity="warning")
+
+    def show_workbook_exported(self) -> None:
+        self.set_busy(False)
+        self.message.show_message(
+            "Excel 成绩表已按当前批次数据刷新并打开。",
+            severity="success",
+        )
 
     def _request_stop(self) -> None:
         if self._batch is not None and self.stop_button.isEnabled():
@@ -370,6 +400,10 @@ class CourseBatchDetailPage(QWidget):
     def _request_open_output(self) -> None:
         if self._batch is not None and self.open_output_button.isEnabled():
             self.open_output_requested.emit(str(self._batch.request.output_dir))
+
+    def _request_workbook_export(self) -> None:
+        if self._batch is not None and self.workbook_button.isEnabled():
+            self.workbook_export_requested.emit(self._batch.batch_id)
 
     def _request_open_selected(self) -> None:
         item = self._selected_item()
@@ -437,6 +471,9 @@ class CourseBatchDetailPage(QWidget):
             )
         )
         self.open_output_button.setEnabled(bool(batch and not busy))
+        self.workbook_button.setEnabled(
+            bool(batch and status != "running" and not busy)
+        )
         item = self._selected_item()
         self.open_run_button.setEnabled(bool(item and item.run_id and not busy))
         self.edit_metadata_button.setEnabled(
@@ -503,6 +540,7 @@ class CourseBatchDetailPage(QWidget):
             self.resume_button,
             self.retry_button,
             self.recheck_metadata_button,
+            self.workbook_button,
             self.open_output_button,
             self.table,
             self.open_run_button,

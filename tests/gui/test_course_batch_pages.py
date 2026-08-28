@@ -9,7 +9,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from paper_reviewer.application.app_state import GuiPreferences
-from paper_reviewer.application.batch_output import BATCH_SUMMARY_FILENAME
+from paper_reviewer.application.batch_output import (
+    BATCH_SUMMARY_FILENAME,
+    BATCH_WORKBOOK_FILENAME,
+)
 from paper_reviewer.application.models import RubricValidationResult
 from paper_reviewer.domain.batch import (
     BatchEvent,
@@ -348,7 +351,11 @@ def test_course_batch_new_page_rotates_automatic_output_for_consecutive_starts(
 
 @pytest.mark.parametrize(
     "marker_name",
-    [BATCH_SUMMARY_FILENAME, f".{BATCH_SUMMARY_FILENAME}.owner"],
+    [
+        BATCH_SUMMARY_FILENAME,
+        BATCH_WORKBOOK_FILENAME,
+        f".{BATCH_SUMMARY_FILENAME}.owner",
+    ],
 )
 def test_course_batch_new_page_rejects_manual_previous_batch_output_accessibly(
     qapp: QApplication,
@@ -436,6 +443,9 @@ def test_course_batch_detail_actions_events_and_keyboard_open(
     assert page.open_run_button.isEnabled()
     assert page.edit_metadata_button.isEnabled()
     assert not page.recheck_metadata_button.isEnabled()
+    assert page.workbook_button.accessibleName()
+    assert "不调用模型" in page.workbook_button.accessibleDescription()
+    assert not page.workbook_button.isEnabled()
     assert "已处理 2 / 2" in page.batch_progress.text()
     assert "待核对 2 篇" in page.metadata_review_summary.text()
     assert "尚未人工核对" in page.selection_review_message.message_label.text()
@@ -444,12 +454,14 @@ def test_course_batch_detail_actions_events_and_keyboard_open(
     opened: list[str] = []
     edited: list[tuple[str, str]] = []
     output_paths: list[str] = []
+    workbook_batches: list[str] = []
     page.stop_requested.connect(stopped.append)
     page.run_open_requested.connect(opened.append)
     page.metadata_edit_requested.connect(
         lambda batch_id, item_id: edited.append((batch_id, item_id))
     )
     page.open_output_requested.connect(output_paths.append)
+    page.workbook_export_requested.connect(workbook_batches.append)
     page.stop_button.click()
     page.edit_metadata_button.click()
     page.open_output_button.click()
@@ -477,9 +489,35 @@ def test_course_batch_detail_actions_events_and_keyboard_open(
     )
     assert page.retry_button.isEnabled()
     assert page.recheck_metadata_button.isEnabled()
+    assert page.workbook_button.isEnabled()
+    page.workbook_button.click()
+    assert workbook_batches == ["batch-1"]
+    page.set_busy(True, action="workbook")
+    assert page.workbook_button.property("fluentBusy") is True
+    assert not page.workbook_button.isEnabled()
+    page.set_busy(False)
     page.set_busy(True, action="retry")
     assert page.retry_button.property("fluentBusy") is True
     assert not page.retry_button.isEnabled()
+
+
+def test_batch_detail_surfaces_workbook_warning_and_success(
+    qapp: QApplication,
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    page = CourseBatchDetailPage(_icons(qapp))
+    qtbot.addWidget(page)  # type: ignore[attr-defined]
+    batch = _batch(tmp_path, [_item(tmp_path)], status=BatchStatus.COMPLETED)
+    batch.workbook_export_error = "请关闭成绩表后重试更新。"
+
+    page.set_batch(batch)
+
+    assert "请关闭成绩表" in page.message.message_label.text()
+    page.show_workbook_exported()
+    assert "已按当前批次数据刷新并打开" in page.message.message_label.text()
+    page.show_workbook_error("请关闭成绩表后重试更新。")
+    assert "请关闭成绩表" in page.message.message_label.text()
 
 
 def test_batch_metadata_review_summary_signal_busy_and_reviewed_selection(

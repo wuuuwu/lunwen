@@ -7,8 +7,19 @@ import tempfile
 import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
+
+from openpyxl import Workbook  # type: ignore[import-untyped]
+from openpyxl.comments import Comment  # type: ignore[import-untyped]
+from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore[import-untyped]
+from openpyxl.utils import get_column_letter  # type: ignore[import-untyped]
+from openpyxl.worksheet.table import (  # type: ignore[import-untyped]
+    Table,
+    TableStyleInfo,
+)
 
 from paper_reviewer.domain.batch import BatchItem, BatchRecord
+from paper_reviewer.domain.rubric import RubricDimension
 from paper_reviewer.domain.submission import SubmissionMetadata
 
 _INVALID_WINDOWS_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -33,6 +44,7 @@ _METADATA_FIELD_LABELS = {
 _MAX_FILENAME_UTF16_UNITS = 240
 _MAX_WINDOWS_PATH_UTF16_UNITS = 259
 BATCH_SUMMARY_FILENAME = "课程论文评测汇总.csv"
+BATCH_WORKBOOK_FILENAME = "课程论文评测汇总.xlsx"
 BATCH_OUTPUT_OWNED_MESSAGE = "该报告输出目录已属于另一个课程论文批次；请选择新的空目录。"
 BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE = (
     "该报告输出目录已存在课程论文评测汇总表，但没有可验证的批次归属；请选择新的空目录。"
@@ -80,7 +92,9 @@ def batch_output_conflict_message(
     Only static, path-free messages are returned.
     """
 
-    destination = output_dir.resolve(strict=False) / BATCH_SUMMARY_FILENAME
+    root = output_dir.resolve(strict=False)
+    destination = root / BATCH_SUMMARY_FILENAME
+    workbook = root / BATCH_WORKBOOK_FILENAME
     owner_path = _owner_path(destination)
     if owner_path.exists() or owner_path.is_symlink():
         if batch_id is None:
@@ -92,7 +106,12 @@ def batch_output_conflict_message(
         if owner != batch_id:
             return BATCH_OUTPUT_OWNED_MESSAGE
         return None
-    if destination.exists() or destination.is_symlink():
+    if (
+        destination.exists()
+        or destination.is_symlink()
+        or workbook.exists()
+        or workbook.is_symlink()
+    ):
         return BATCH_OUTPUT_SUMMARY_EXISTS_MESSAGE
     return None
 
@@ -100,8 +119,15 @@ def batch_output_conflict_message(
 def claim_batch_output_directory(output_dir: Path, batch_id: str) -> None:
     """Atomically claim the fixed summary path for ``batch_id``."""
 
-    destination = output_dir.resolve(strict=False) / BATCH_SUMMARY_FILENAME
+    root = output_dir.resolve(strict=False)
+    destination = root / BATCH_SUMMARY_FILENAME
+    workbook = root / BATCH_WORKBOOK_FILENAME
+    owner_path = _owner_path(destination)
+    owner_existed = owner_path.exists() or owner_path.is_symlink()
     _claim_output_directory(destination, batch_id)
+    if not owner_existed and (workbook.exists() or workbook.is_symlink()):
+        owner_path.unlink(missing_ok=True)
+        raise BatchOutputSummaryExistsError
 
 
 def release_batch_output_directory_claim(output_dir: Path, batch_id: str) -> None:
@@ -337,6 +363,192 @@ def write_batch_summary_csv(
         temporary.unlink(missing_ok=True)
 
 
+def write_batch_summary_xlsx(
+    destination: Path,
+    batch: BatchRecord,
+    dimensions: Sequence[RubricDimension],
+) -> None:
+    """Atomically write a styled, formula-safe Excel grade workbook."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    claim_batch_output_directory(destination.parent, batch.batch_id)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp.xlsx",
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    workbook: Any | None = None
+    try:
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "成绩汇总"
+        worksheet.sheet_view.showGridLines = False
+        worksheet.freeze_panes = "A2"
+
+        dimension_columns = _dimension_columns(
+            [(dimension.dimension_id, dimension.title) for dimension in dimensions]
+        )
+        headers = _summary_headers(dimension_columns)
+        for column, header in enumerate(headers, start=1):
+            cell = worksheet.cell(row=1, column=column)
+            _set_literal_text(cell, header)
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        dimension_by_id = {dimension.dimension_id: dimension for dimension in dimensions}
+        dimension_header_start = 11
+        for offset, (dimension_id, _header) in enumerate(dimension_columns):
+            dimension = dimension_by_id[dimension_id]
+            cell = worksheet.cell(row=1, column=dimension_header_start + offset)
+            cell.comment = Comment(
+                "\n".join(
+                    (
+                        f"维度 ID：{dimension.dimension_id}",
+                        f"权重：{_compact_number(dimension.weight)}%",
+                        "分值范围："
+                        f"{_compact_number(dimension.minimum_score)}–"
+                        f"{_compact_number(dimension.maximum_score)}",
+                    )
+                ),
+                "课程论文评测",
+            )
+
+        for row_number, item in enumerate(batch.items, start=2):
+            values = _workbook_row(item, dimension_columns)
+            for column, header in enumerate(headers, start=1):
+                cell = worksheet.cell(row=row_number, column=column)
+                value = values[header]
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    cell.value = float(value)
+                    cell.number_format = "0.00"
+                else:
+                    _set_literal_text(cell, "" if value is None else str(value))
+                cell.alignment = Alignment(vertical="top", wrap_text=header in _WRAPPED_HEADERS)
+
+        last_column = get_column_letter(len(headers))
+        table_reference = f"A1:{last_column}{worksheet.max_row}"
+        worksheet.auto_filter.ref = table_reference
+        table = Table(displayName="CoursePaperScores", ref=table_reference)
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        worksheet.add_table(table)
+        worksheet.row_dimensions[1].height = 34
+        _fit_workbook_columns(worksheet, headers)
+        worksheet.print_title_rows = "1:1"
+        worksheet.page_setup.orientation = "landscape"
+        worksheet.page_setup.fitToWidth = 1
+        worksheet.sheet_properties.pageSetUpPr.fitToPage = True
+        workbook.properties.title = "课程论文评测成绩汇总"
+        workbook.save(temporary)
+        with temporary.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if workbook is not None:
+            workbook.close()
+        temporary.unlink(missing_ok=True)
+
+
+_WRAPPED_HEADERS = frozenset({"原文件名", "题目", "待核对字段", "结论", "错误摘要"})
+
+
+def _summary_headers(dimension_columns: Sequence[tuple[str, str]]) -> list[str]:
+    return [
+        "原文件名",
+        "姓名",
+        "学号",
+        "专业",
+        "题目",
+        "元数据置信度",
+        "元数据待核对",
+        "待核对字段",
+        "人工已核对",
+        "重复PDF内容",
+        *(column for _, column in dimension_columns),
+        "总分",
+        "等级",
+        "结论",
+        "任务状态",
+        "PDF文件名",
+        "错误摘要",
+    ]
+
+
+def _workbook_row(
+    item: BatchItem,
+    dimensions: Sequence[tuple[str, str]],
+) -> dict[str, str | float | None]:
+    metadata = item.metadata
+    row: dict[str, str | float | None] = {
+        "原文件名": item.source.filename,
+        "姓名": metadata.student_name if metadata else "未识别姓名",
+        "学号": metadata.student_id if metadata else "未识别学号",
+        "专业": metadata.major if metadata else "未识别专业",
+        "题目": metadata.paper_title if metadata else "未识别题目",
+        "元数据置信度": _metadata_confidence_number(metadata),
+        "元数据待核对": "是" if metadata is None or metadata.needs_review else "否",
+        "待核对字段": "、".join(_pending_metadata_labels(metadata)),
+        "人工已核对": "是" if metadata is not None and metadata.human_reviewed else "否",
+        "重复PDF内容": "是" if item.source.duplicate_sha256 else "否",
+        "总分": item.total_score,
+        "等级": item.grade or "",
+        "结论": item.conclusion or "",
+        "任务状态": item.status.value,
+        "PDF文件名": item.report_path.name if item.report_path else "",
+        "错误摘要": item.error or "",
+    }
+    for dimension_id, title in dimensions:
+        row[title] = item.dimension_scores.get(dimension_id)
+    return row
+
+
+def _set_literal_text(cell: Any, value: str) -> None:
+    cell.value = value
+    cell.data_type = "s"
+    cell.number_format = "@"
+    cell.hyperlink = None
+
+
+def _fit_workbook_columns(worksheet: Any, headers: Sequence[str]) -> None:
+    preferred_minimums = {
+        "原文件名": 20,
+        "姓名": 10,
+        "学号": 16,
+        "专业": 16,
+        "题目": 28,
+        "待核对字段": 16,
+        "结论": 28,
+        "PDF文件名": 24,
+        "错误摘要": 28,
+    }
+    for column, header in enumerate(headers, start=1):
+        width = preferred_minimums.get(header, 12)
+        for row in range(1, worksheet.max_row + 1):
+            value = worksheet.cell(row=row, column=column).value
+            if value is not None:
+                width = max(width, _display_width(str(value)) + 2)
+        worksheet.column_dimensions[get_column_letter(column)].width = min(width, 48)
+
+
+def _display_width(value: str) -> int:
+    return sum(
+        2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        for character in value
+    )
+
+
+def _compact_number(value: float) -> str:
+    return f"{value:g}"
+
+
 def _csv_row(item: BatchItem, dimensions: Sequence[tuple[str, str]]) -> dict[str, object]:
     metadata = item.metadata
     row: dict[str, object] = {
@@ -368,6 +580,13 @@ def _metadata_confidence(metadata: SubmissionMetadata | None) -> str:
         return ""
     values = [detail.confidence for detail in metadata.field_evidence.values()]
     return "" if not values else f"{sum(values) / len(values):.2f}"
+
+
+def _metadata_confidence_number(metadata: SubmissionMetadata | None) -> float | None:
+    if metadata is None:
+        return None
+    values = [detail.confidence for detail in metadata.field_evidence.values()]
+    return None if not values else sum(values) / len(values)
 
 
 def _pending_metadata_labels(metadata: SubmissionMetadata | None) -> list[str]:
