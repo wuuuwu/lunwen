@@ -37,14 +37,13 @@ from paper_reviewer.gui.theme import set_fluent_property
 _FIELD_LABELS: Mapping[str, str] = {
     "student_name": "姓名",
     "student_id": "学号",
-    "major": "专业",
     "paper_title": "题目",
 }
 _SOURCE_LABELS: Mapping[SubmissionMetadataSource, str] = {
     SubmissionMetadataSource.COVER_LABEL: "封面明确标签",
     SubmissionMetadataSource.VISIBLE_HEADING: "正文可见标题",
     SubmissionMetadataSource.MODEL_EVIDENCE: "既有模型证据",
-    SubmissionMetadataSource.PDF_METADATA: "旧版 PDF 隐藏元数据",
+    SubmissionMetadataSource.PDF_METADATA: "PDF 隐藏元数据",
     SubmissionMetadataSource.FILE_NAME: "结构化文件名",
     SubmissionMetadataSource.HUMAN_CORRECTION: "人工修正",
     SubmissionMetadataSource.PLACEHOLDER: "未识别占位值",

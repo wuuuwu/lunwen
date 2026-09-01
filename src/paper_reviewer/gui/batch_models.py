@@ -21,7 +21,6 @@ from paper_reviewer.domain.batch import BatchItem, BatchItemStatus
 _FIELD_LABELS: dict[str, str] = {
     "student_name": "姓名",
     "student_id": "学号",
-    "major": "专业",
     "paper_title": "题目",
 }
 
@@ -120,6 +119,21 @@ class BatchSourcePreviewModel(QAbstractTableModel):
 class BatchItemsTableModel(QAbstractTableModel):
     """Read-only batch item model with transient, event-derived stages."""
 
+    SOURCE_COLUMN = 0
+    STUDENT_NAME_COLUMN = 1
+    STUDENT_ID_COLUMN = 2
+    PAPER_TITLE_COLUMN = 3
+    METADATA_REVIEW_COLUMN = 4
+    STAGE_COLUMN = 5
+    STATUS_COLUMN = 6
+    SCORE_COLUMN = 7
+    REPORT_COLUMN = 8
+    METADATA_COLUMNS: ClassVar[dict[int, str]] = {
+        STUDENT_NAME_COLUMN: "student_name",
+        STUDENT_ID_COLUMN: "student_id",
+        PAPER_TITLE_COLUMN: "paper_title",
+    }
+
     ItemIdRole = Qt.ItemDataRole.UserRole + 1
     RunIdRole = Qt.ItemDataRole.UserRole + 2
     StatusRole = Qt.ItemDataRole.UserRole + 3
@@ -130,7 +144,6 @@ class BatchItemsTableModel(QAbstractTableModel):
         "原文件名",
         "姓名",
         "学号",
-        "专业",
         "题目",
         "信息核对",
         "当前阶段",
@@ -216,7 +229,10 @@ class BatchItemsTableModel(QAbstractTableModel):
             self._stages[item_id] = self.STAGE_TEXT.get(normalized, normalized)
         row = self.row_for_item(item_id)
         if row >= 0:
-            self.dataChanged.emit(self.index(row, 6), self.index(row, 6))
+            self.dataChanged.emit(
+                self.index(row, self.STAGE_COLUMN),
+                self.index(row, self.STAGE_COLUMN),
+            )
 
     def rowCount(
         self,
@@ -269,9 +285,9 @@ class BatchItemsTableModel(QAbstractTableModel):
         if role == self.MetadataReviewRole:
             return self._metadata_review_value(item)
         if role == Qt.ItemDataRole.DecorationRole:
-            if index.column() == 5:
+            if index.column() == self.METADATA_REVIEW_COLUMN:
                 return self._metadata_review_icon(item)
-            if index.column() == 7:
+            if index.column() == self.STATUS_COLUMN:
                 return self._status_icon(status)
         if role == Qt.ItemDataRole.ToolTipRole:
             return self._tooltip(item, index.column(), status)
@@ -298,7 +314,6 @@ class BatchItemsTableModel(QAbstractTableModel):
             item.source.filename,
             metadata.student_name if metadata else "未识别姓名",
             metadata.student_id if metadata else "未识别学号",
-            metadata.major if metadata else "未识别专业",
             metadata.paper_title if metadata else "未识别题目",
             self._metadata_review_text(item),
             self._stages.get(item.item_id, self.DEFAULT_STAGE.get(status, status)),
@@ -308,28 +323,27 @@ class BatchItemsTableModel(QAbstractTableModel):
         )
 
     def _tooltip(self, item: BatchItem, column: int, status: str) -> str:
-        if column == 0:
+        if column == self.SOURCE_COLUMN:
             return str(item.source.path)
-        if column == 5:
+        if column == self.METADATA_REVIEW_COLUMN:
             return self._metadata_review_tooltip(item)
-        if column == 7:
+        if column == self.STATUS_COLUMN:
             details = self.STATUS_DESCRIPTION.get(status, status)
             if item.error:
                 details += f"\n错误：{item.error}"
             if item.warnings:
                 details += "\n提示：" + "；".join(item.warnings)
             return details
-        if column == 9 and item.report_path:
+        if column == self.REPORT_COLUMN and item.report_path:
             return str(item.report_path)
-        if item.metadata and 1 <= column <= 4:
-            field = ("student_name", "student_id", "major", "paper_title")[column - 1]
+        if item.metadata and (field := self.METADATA_COLUMNS.get(column)) is not None:
             if field in item.metadata.pending_review_fields:
                 return f"{_FIELD_LABELS[field]}的自动提取结果需要人工核对。"
             if metadata_requires_local_recheck(item.metadata):
                 recheck_fields = metadata_recheck_fields(item.metadata)
                 if field in recheck_fields:
                     return (
-                        f"{_FIELD_LABELS[field]}可能包含旧版提取异常，"
+                        f"{_FIELD_LABELS[field]}可能包含封面字段边界异常，"
                         "建议重新检查。"
                     )
         return ""
@@ -345,7 +359,7 @@ class BatchItemsTableModel(QAbstractTableModel):
             fields = "、".join(
                 _FIELD_LABELS[field] for field in metadata_recheck_fields(item.metadata)
             )
-            parts.append(f"历史提取结果建议重新检查：{fields}")
+            parts.append(f"提取结果建议重新检查：{fields}")
         if item.warnings:
             parts.append("提示：" + "；".join(item.warnings))
         if item.error:
@@ -378,7 +392,6 @@ class BatchItemsTableModel(QAbstractTableModel):
             labels = {
                 "student_name": "姓名",
                 "student_id": "学号",
-                "major": "专业",
                 "paper_title": "题目",
             }
             fields = "、".join(
@@ -399,9 +412,9 @@ class BatchItemsTableModel(QAbstractTableModel):
     def _metadata_review_tooltip(self, item: BatchItem) -> str:
         metadata = item.metadata
         if metadata is None:
-            return "尚未提取姓名、学号、专业和题目。"
+            return "尚未提取姓名、学号和题目。"
         if metadata.human_reviewed:
-            return "姓名、学号、专业和题目已由用户明确确认。"
+            return "姓名、学号和题目已由用户明确确认。"
         if not metadata_requires_local_recheck(metadata):
             return "自动提取置信度达到当前阈值，尚未经人工核对。"
         parts = ["自动提取的信息尚未经过人工确认。"]
@@ -409,21 +422,20 @@ class BatchItemsTableModel(QAbstractTableModel):
             labels = {
                 "student_name": "姓名",
                 "student_id": "学号",
-                "major": "专业",
                 "paper_title": "题目",
             }
             fields = "、".join(
                 labels.get(field, field) for field in metadata.pending_review_fields
             )
             parts.append(f"低置信度或占位字段：{fields}。")
-        legacy_fields = [
+        boundary_fields = [
             field
             for field in metadata_recheck_fields(metadata)
             if field not in metadata.pending_review_fields
         ]
-        if legacy_fields:
-            fields = "、".join(_FIELD_LABELS[field] for field in legacy_fields)
-            parts.append(f"历史提取异常字段：{fields}，建议重新检查。")
+        if boundary_fields:
+            fields = "、".join(_FIELD_LABELS[field] for field in boundary_fields)
+            parts.append(f"边界异常字段：{fields}，建议重新检查。")
         if metadata.warnings:
             parts.append("提示：" + "；".join(metadata.warnings))
         return "\n".join(parts)

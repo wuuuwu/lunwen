@@ -186,7 +186,7 @@ class CourseBatchNewPage(QWidget):
         form.addRow("材料属性", self.non_classified_confirmation)
 
         self.pii_output_confirmation = QCheckBox(
-            "我知悉导出文件名和汇总表将包含姓名、学号、专业和题目"
+            "我知悉导出文件名和汇总表将包含姓名、学号和题目"
         )
         self.pii_output_confirmation.setObjectName("batchPiiOutputConfirmation")
         self.pii_output_confirmation.setAccessibleName("个人信息输出风险确认")

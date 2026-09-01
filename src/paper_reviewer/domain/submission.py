@@ -3,11 +3,11 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
-SUBMISSION_METADATA_SCHEMA_VERSION: Literal["1.1"] = "1.1"
-SubmissionMetadataSchemaVersion = Literal["1.0", "1.1"]
-SUBMISSION_METADATA_FIELDS = ("student_name", "student_id", "major", "paper_title")
+SUBMISSION_METADATA_SCHEMA_VERSION: Literal["2.0"] = "2.0"
+SubmissionMetadataSchemaVersion = Literal["2.0"]
+SUBMISSION_METADATA_FIELDS = ("student_name", "student_id", "paper_title")
 
 
 class SubmissionMetadataSource(StrEnum):
@@ -37,10 +37,11 @@ class SubmissionMetadata(BaseModel):
     can evolve without changing those projections.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     schema_version: SubmissionMetadataSchemaVersion = SUBMISSION_METADATA_SCHEMA_VERSION
     student_name: str
     student_id: str
-    major: str
     paper_title: str
     field_evidence: dict[str, SubmissionFieldEvidence]
     warnings: list[str] = Field(default_factory=list)
@@ -79,7 +80,7 @@ class SubmissionMetadata(BaseModel):
                 "field_evidence must cover all metadata fields; "
                 f"missing={missing}, unknown={unknown}"
             )
-        values = (self.student_name, self.student_id, self.major, self.paper_title)
+        values = (self.student_name, self.student_id, self.paper_title)
         if any(not value.strip() for value in values):
             raise ValueError("submission metadata values must not be blank")
         return self

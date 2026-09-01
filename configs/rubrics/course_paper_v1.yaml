@@ -1,12 +1,12 @@
 schema_version: "1"
 rubric_id: course-paper-general-assessment
-version: "0.1.0-experimental"
+version: "0.1.1-experimental"
 title: 普通课程论文 AI 辅助评测（通用实验版）
 applicable_levels: [undergraduate]
 applicable_paper_types: [course_paper_pdf]
 evaluation_mode: course_assessment
 experimental: true
-validation_notice: 通用评分模板尚未针对具体课程完成教育测量效度验证，教师应依据课程大纲确认或替换后再用于正式计分。
+validation_notice: 通用评分模板尚未针对具体课程完成教育测量效度验证，教师应仅依据课程大纲、作业要求和教学目标确认或替换后再用于正式计分。
 
 dimensions:
   - dimension_id: task_completion

@@ -215,7 +215,6 @@ def run_batch_output_self_test() -> None:
         metadata = SubmissionMetadata(
             student_name="=2+2",
             student_id="20260001",
-            major="课程测试",
             paper_title="中文课程论文",
             field_evidence=evidence,
         )

@@ -2056,7 +2056,7 @@ def _validate_batch_cloud_request(request: BatchReviewRequest) -> None:
     if request.contains_classified_material:
         raise ValueError("涉密材料不得提交云端批量评测。")
     if not request.pii_output_authorized:
-        raise ValueError("必须确认批次输出将包含姓名、学号、专业和论文题目。")
+        raise ValueError("必须确认批次输出将包含姓名、学号和论文题目。")
 
 
 def _validate_batch_snapshots(record: BatchRecord) -> None:
@@ -2536,13 +2536,6 @@ def _managed_item_report_path(record: BatchRecord, item: BatchItem) -> Path | No
     if candidate.parent != output_dir or candidate.is_symlink():
         return None
     managed_metadata = [item.metadata]
-    if item.metadata.schema_version == "1.0" and item.metadata.needs_review:
-        # Before schema 1.1 introduced safe pending-review names, completed
-        # reports always used the standard metadata-derived name. Accept that
-        # one exact legacy name so it can be retired, while still rejecting
-        # arbitrary files merely referenced by a modified manifest.
-        legacy_confirmed = item.metadata.model_copy(update={"human_reviewed": True})
-        managed_metadata.append(legacy_confirmed)
     if not any(
         is_allocated_report_filename(
             output_dir,
@@ -2646,7 +2639,10 @@ def _emit_batch_event(
         return
     event_payload = dict(payload or {})
     if event_type != "batch_run_event":
-        event_payload["record"] = record.model_dump(mode="json")
+        event_payload["record"] = record.model_dump(
+            mode="json",
+            exclude_computed_fields=True,
+        )
     sink(
         BatchEvent(
             batch_id=record.batch_id,

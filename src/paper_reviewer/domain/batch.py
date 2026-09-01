@@ -91,7 +91,7 @@ class BatchItem(BaseModel):
 class BatchRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     batch_id: str
     status: BatchStatus = BatchStatus.CREATED
     request: BatchReviewRequest

@@ -372,7 +372,12 @@ class MainWindow(QMainWindow):
                     event_type="batch_created",
                     status=created.status,
                     message="课程论文批次已创建。",
-                    payload={"record": created.model_dump(mode="json")},
+                    payload={
+                        "record": created.model_dump(
+                            mode="json",
+                            exclude_computed_fields=True,
+                        )
+                    },
                 )
             )
             return await self.service.run_batch(created.batch_id, event_sink=emit)

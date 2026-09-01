@@ -84,7 +84,7 @@ def test_course_progress_uses_metadata_and_reviews_without_thesis_panel(
             event_type="submission_metadata_started",
             status=RunStatus.INGESTED,
             stage="metadata",
-            message="正在提取姓名、学号、专业和论文题目",
+            message="正在提取姓名、学号和论文题目",
         )
     )
 
@@ -724,7 +724,6 @@ def test_course_report_shows_student_metadata_and_course_only_sections(
     metadata = SubmissionMetadata(
         student_name="张三",
         student_id="20260001",
-        major="公共管理",
         paper_title="数字政务课程论文",
         field_evidence={
             field: SubmissionFieldEvidence(
@@ -781,7 +780,7 @@ def test_course_report_shows_student_metadata_and_course_only_sections(
     assert "题目：数字政务课程论文" in metadata_text
     assert "姓名：张三" in metadata_text
     assert "学号：20260001" in metadata_text
-    assert "专业：公共管理" in metadata_text
+    assert "专业" not in metadata_text
     assert "信息核对：自动提取" in metadata_text
 
     pending_evidence = dict(metadata.field_evidence)

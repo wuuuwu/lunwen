@@ -1,9 +1,9 @@
 profile_id: course-paper-reviewers
-version: "0.1.0-experimental"
+version: "0.1.1-experimental"
 reviewers:
   - reviewer_id: course-requirements-reviewer
     title: 课程任务与知识运用 Reviewer
-    description: 评价课程任务完成度以及课程核心概念、理论或方法的理解与运用；不评价专业培养目标或毕业论文专业深度。
+    description: 依据课程任务、学习目标和核心知识点评价课程完成度以及课程概念、理论或方法的理解与运用。
     dimension_ids: [task_completion, course_knowledge_application]
     dimension_tags: [course_requirements]
     allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence, web_search]
@@ -12,7 +12,7 @@ reviewers:
 
   - reviewer_id: argumentation-reviewer
     title: 论证、证据与结构 Reviewer
-    description: 评价主要观点的证据支持、推理质量、文章结构和内容衔接。
+    description: 依据课程任务、学习目标和论文内容评价主要观点的证据支持、推理质量、文章结构和内容衔接。
     dimension_ids: [argument_evidence, structure_logic]
     dimension_tags: [argumentation]
     allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence, web_search]
@@ -21,7 +21,7 @@ reviewers:
 
   - reviewer_id: writing-norms-reviewer
     title: 写作与引用格式 Reviewer
-    description: 评价文字表达与引用格式的一致性；不据此检测或认定抄袭、代写、伪造等学术不端。
+    description: 依据课程作业的写作与引用要求评价文字表达和引用格式；不据此检测或认定抄袭、代写、伪造等学术不端。
     dimension_ids: [writing_expression, citation_format]
     dimension_tags: [writing_norms]
     allowed_tools: [search_paper, read_blocks, search_evidence, read_evidence, web_search]

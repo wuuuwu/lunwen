@@ -39,7 +39,7 @@ DISCLAIMER_LINES = (
 COURSE_DISCLAIMER_LINES = (
     "本结果仅供教师评阅参考，不是教师正式成绩。",
     "当前通用课程论文 Rubric 是可替换的实验性模板，正式评分前应由任课教师依据课程大纲确认。",
-    "姓名、学号、专业和题目由系统自动提取，使用和归档前必须人工核对。",
+    "姓名、学号和题目由系统自动提取，使用和归档前必须人工核对。",
     "本系统仅检查引用对应关系与格式，不自动检测或认定抄袭、代写、伪造等学术不端。",
     "模型置信度是未经校准的自评，不作为统计概率。",
 )
@@ -47,7 +47,6 @@ COURSE_DISCLAIMER_LINES = (
 _METADATA_FIELD_LABELS = {
     "student_name": "姓名",
     "student_id": "学号",
-    "major": "专业",
     "paper_title": "题目",
 }
 _METADATA_REPORT_LABELS = {
@@ -248,8 +247,6 @@ def _render_course_document(document: ReportDocument) -> str:
         f"{_metadata_text(metadata, 'student_name', '未识别姓名')}",
         f"- {_metadata_label('student_id', pending_fields)}："
         f"{_metadata_text(metadata, 'student_id', '未识别学号')}",
-        f"- {_metadata_label('major', pending_fields)}（仅用于识别与文件命名）："
-        f"{_metadata_text(metadata, 'major', '未识别专业')}",
         f"- {_metadata_label('paper_title', pending_fields)}："
         f"{_metadata_text(metadata, 'paper_title', '未识别题目')}",
         "- 元数据核对："

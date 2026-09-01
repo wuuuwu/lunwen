@@ -31,14 +31,13 @@ from paper_reviewer.gui.theme import set_fluent_property
 _FIELD_LABELS: Mapping[str, str] = {
     "student_name": "姓名",
     "student_id": "学号",
-    "major": "专业",
     "paper_title": "题目",
 }
 _SOURCE_LABELS: Mapping[SubmissionMetadataSource, str] = {
     SubmissionMetadataSource.COVER_LABEL: "封面明确标签",
     SubmissionMetadataSource.VISIBLE_HEADING: "正文可见标题",
     SubmissionMetadataSource.MODEL_EVIDENCE: "模型证据候选",
-    SubmissionMetadataSource.PDF_METADATA: "旧版 PDF 隐藏元数据",
+    SubmissionMetadataSource.PDF_METADATA: "PDF 隐藏元数据",
     SubmissionMetadataSource.FILE_NAME: "结构化文件名",
     SubmissionMetadataSource.HUMAN_CORRECTION: "人工修正",
     SubmissionMetadataSource.PLACEHOLDER: "未识别占位值",
@@ -77,7 +76,7 @@ class CourseMetadataDialog(QDialog):
         root.setSpacing(14)
 
         description = QLabel(
-            "请核对自动提取的姓名、学号、专业和题目。保存后只会在本地更新报告，"
+            "请核对自动提取的姓名、学号和题目。保存后只会在本地更新报告，"
             "不会重新调用模型。"
         )
         description.setObjectName("courseMetadataDescription")
@@ -118,7 +117,7 @@ class CourseMetadataDialog(QDialog):
             review_reason = (
                 "；待核对：置信度低于阈值或尚未识别"
                 if field in self._original.pending_review_fields
-                else _legacy_review_reason(self._original, field)
+                else _local_recheck_reason(self._original, field)
             )
             evidence_text = (
                 f"来源：{_SOURCE_LABELS.get(detail.source, detail.source.value)}；"
@@ -146,7 +145,7 @@ class CourseMetadataDialog(QDialog):
         root.addLayout(form)
 
         self.review_confirmation = QCheckBox(
-            "我已逐项核对姓名、学号、专业和题目，确认以上信息可用于报告和文件命名。"
+            "我已逐项核对姓名、学号和题目，确认以上信息可用于报告和文件命名。"
         )
         self.review_confirmation.setObjectName("confirmCourseMetadataReviewCheckBox")
         self.review_confirmation.setAccessibleName("确认已人工核对全部论文信息")
@@ -154,7 +153,7 @@ class CourseMetadataDialog(QDialog):
             "必须明确确认后才能保存；保存只在本地更新报告和汇总表。"
         )
         self.review_confirmation.setToolTip(
-            "确认已对照论文原文核对姓名、学号、专业和题目"
+            "确认已对照论文原文核对姓名、学号和题目"
         )
         self.review_confirmation.stateChanged.connect(self._confirmation_changed)
         root.addWidget(self.review_confirmation)
@@ -237,7 +236,7 @@ class CourseMetadataDialog(QDialog):
                 "信息已变化，请重新核对并勾选确认"
             )
         if not confirmed:
-            errors.append("请确认已逐项核对姓名、学号、专业和题目")
+            errors.append("请确认已逐项核对姓名、学号和题目")
         if errors:
             self.error_label.setText("；".join(errors))
             self.error_label.setAccessibleDescription(self.error_label.text())
@@ -266,7 +265,6 @@ class CourseMetadataDialog(QDialog):
         return SubmissionMetadata(
             student_name=values["student_name"],
             student_id=values["student_id"],
-            major=values["major"],
             paper_title=values["paper_title"],
             field_evidence=evidence,
             warnings=warnings,
@@ -349,8 +347,8 @@ def _camel_case(field: str) -> str:
     return "".join(part.capitalize() for part in field.split("_"))
 
 
-def _legacy_review_reason(metadata: SubmissionMetadata, field: str) -> str:
-    """Explain why a high-confidence historical value needs local review."""
+def _local_recheck_reason(metadata: SubmissionMetadata, field: str) -> str:
+    """Explain why a high-confidence value still needs local review."""
 
     if field not in metadata_recheck_fields(metadata):
         return ""
@@ -358,5 +356,5 @@ def _legacy_review_reason(metadata: SubmissionMetadata, field: str) -> str:
         field == "paper_title"
         and metadata.field_evidence[field].source is SubmissionMetadataSource.PDF_METADATA
     ):
-        return "；建议重新检查：历史版本可能误用了 PDF 隐藏标题"
-    return "；建议重新检查：历史版本可能把后续字段标签混入字段值"
+        return "；建议重新检查：字段值来自 PDF 隐藏标题"
+    return "；建议重新检查：字段值可能混入后续封面标签"

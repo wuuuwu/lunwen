@@ -734,14 +734,12 @@ class RunDetailPage(QWidget):
             paper_title = metadata.paper_title if metadata is not None else title
             student_name = metadata.student_name if metadata is not None else "未提取"
             student_id = metadata.student_id if metadata is not None else "未提取"
-            major = metadata.major if metadata is not None else "未提取"
             if metadata is None:
                 review_status = "尚未提取"
             elif metadata.needs_review:
                 labels = {
                     "student_name": "姓名",
                     "student_id": "学号",
-                    "major": "专业",
                     "paper_title": "题目",
                 }
                 pending = "、".join(
@@ -754,7 +752,7 @@ class RunDetailPage(QWidget):
                 review_status = "自动提取"
             self.report_metadata.setText(
                 f"题目：{paper_title}\n"
-                f"姓名：{student_name} · 学号：{student_id} · 专业：{major}\n"
+                f"姓名：{student_name} · 学号：{student_id}\n"
                 f"信息核对：{review_status}\n"
                 f"评价标准：{report.rubric.title} ({report.rubric.version}) · "
                 f"{provider_label(report.run.provider, report.run.model, provider_source)}"
@@ -970,7 +968,7 @@ class RunDetailPage(QWidget):
             "使用说明：\n"
             "• 本报告为 AI 辅助课程论文评测结果，最终成绩由任课教师确定。\n"
             "• 五级等级和及格参考线来自当前课程评价标准，使用前应结合课程大纲确认。\n"
-            "• 系统不考察专业培养目标，也不据此认定学术不端。\n"
+            "• 系统仅依据课程任务、学习目标和课程知识评价，不据此认定学术不端。\n"
             "• 模型置信度是未经校准的自评，不作为统计概率。"
         )
 

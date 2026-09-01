@@ -54,7 +54,7 @@ from paper_reviewer.gui.worker import AsyncTaskThread
 
 _ROLE_OPTIONS = (
     ("课程要求", "course_requirements"),
-    ("专业内容", "subject_matter"),
+    ("课程内容", "subject_matter"),
     ("论证与结构", "argumentation"),
     ("写作与引用", "writing_norms"),
 )
@@ -226,7 +226,7 @@ class RubricGeneratorWidget(QWidget):
         content = QWidget()
         layout = QVBoxLayout(content)
         description = QLabel(
-            "选择专业内容评价的深度。启用后，标准只依据您提供的学习目标和知识点，不自行扩展课程边界。"
+            "选择课程内容评价的深度。启用后，标准只依据您提供的学习目标和知识点，不自行扩展课程边界。"
         )
         description.setWordWrap(True)
         description.setProperty("fluentType", "secondary")
@@ -235,14 +235,14 @@ class RubricGeneratorWidget(QWidget):
         form.setVerticalSpacing(12)
         self.subject_mode = QComboBox()
         self.subject_mode.setObjectName("rubricSubjectMode")
-        self.subject_mode.addItem("不评测专业内容", SubjectAssessmentMode.NONE)
-        self.subject_mode.addItem("基础课程知识评测", SubjectAssessmentMode.BASIC)
-        self.subject_mode.addItem("专业深度评测", SubjectAssessmentMode.SPECIALIST)
+        self.subject_mode.addItem("不评价课程内容", SubjectAssessmentMode.NONE)
+        self.subject_mode.addItem("基础课程知识评价", SubjectAssessmentMode.BASIC)
+        self.subject_mode.addItem("深入课程内容评价", SubjectAssessmentMode.SPECIALIST)
         self.subject_mode.setCurrentIndex(1)
         self.subject_name = QLineEdit()
         self.subject_name.setObjectName("rubricSubjectName")
         self.subject_name.setPlaceholderText("例如：计算机科学与技术 / 教育学 / 经济学")
-        self.subject_name.setAccessibleName("课程所属专业或领域")
+        self.subject_name.setAccessibleName("课程领域")
         self.core_topics = QPlainTextEdit()
         self.core_topics.setObjectName("rubricCoreTopics")
         self.core_topics.setPlaceholderText("每行一个核心概念、理论、方法或技术")
@@ -250,17 +250,17 @@ class RubricGeneratorWidget(QWidget):
         self.common_errors = QPlainTextEdit()
         self.common_errors.setObjectName("rubricCommonErrors")
         self.common_errors.setPlaceholderText("每行一个常见严重错误，可留空")
-        self.common_errors.setAccessibleName("专业内容常见错误")
-        self.external_evidence = QCheckBox("评价时要求使用外部资料核验专业事实或数据")
+        self.common_errors.setAccessibleName("课程内容常见错误")
+        self.external_evidence = QCheckBox("评价时要求使用外部资料核验课程事实或数据")
         self.external_evidence.setObjectName("rubricExternalEvidence")
-        form.addRow("专业评价方式", self.subject_mode)
+        form.addRow("课程内容评价方式", self.subject_mode)
         form.addRow("课程领域", self.subject_name)
         form.addRow("核心知识点", self.core_topics)
         form.addRow("常见错误", self.common_errors)
         form.addRow("", self.external_evidence)
         layout.addLayout(form)
         warning = QLabel(
-            "专业深度评测只能辅助教师筛查问题，不能替代任课教师或领域专家作出最终判断。"
+            "深入课程内容评价只能辅助教师筛查问题，不能替代任课教师或课程领域专家作出最终判断。"
         )
         warning.setWordWrap(True)
         warning.setProperty("fluentType", "secondary")
@@ -517,7 +517,7 @@ class RubricGeneratorWidget(QWidget):
             ]
         else:
             subject_title = (
-                "专业知识与方法运用"
+                "课程知识与方法运用"
                 if mode is SubjectAssessmentMode.SPECIALIST
                 else "课程知识理解与运用"
             )
@@ -603,7 +603,7 @@ class RubricGeneratorWidget(QWidget):
 
     def _show_step(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
-        titles = ("课程与作业", "专业内容", "评价维度与权重", "打分方式", "生成与确认")
+        titles = ("课程与作业", "课程内容", "评价维度与权重", "打分方式", "生成与确认")
         self.step_label.setText(f"第 {index + 1}/5 步 · {titles[index]}")
         self.back_button.setEnabled(index > 0 and not self._busy)
         self.next_button.setVisible(index < 4)
@@ -644,7 +644,7 @@ class RubricGeneratorWidget(QWidget):
                 self.core_topics
             )
             if missing_subject:
-                errors.append("请填写课程所属专业或领域")
+                errors.append("请填写课程领域")
             if missing_topics:
                 errors.append("请至少填写一个学习目标或核心知识点")
             set_fluent_property(
@@ -654,7 +654,7 @@ class RubricGeneratorWidget(QWidget):
             )
             set_fluent_property(self.core_topics, "fluentInvalid", missing_topics)
             self.subject_name.setAccessibleDescription(
-                "请填写课程所属专业或领域" if missing_subject else ""
+                "请填写课程领域" if missing_subject else ""
             )
             self.core_topics.setAccessibleDescription(
                 "请至少填写一个学习目标或核心知识点" if missing_topics else ""
@@ -677,7 +677,7 @@ class RubricGeneratorWidget(QWidget):
             if self._subject_mode() is SubjectAssessmentMode.NONE and any(
                 row.role.currentData() == "subject_matter" for row in self.dimension_rows
             ):
-                errors.append("不评测专业内容时不能分配专业内容 Reviewer")
+                errors.append("不评价课程内容时不能分配课程内容 Reviewer")
         elif index == 3:
             try:
                 self._scoring_settings()

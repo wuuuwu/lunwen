@@ -107,7 +107,6 @@ class BlindCourseModel:
                         arguments={
                             "student_name": field("张三"),
                             "student_id": field("20260001"),
-                            "major": field("历史学"),
                             "paper_title": field("课程论文中的公共治理分析"),
                         },
                     )
@@ -208,7 +207,8 @@ async def test_course_run_extracts_once_blinds_reviewers_and_writes_course_artif
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["student_name"] == "张三"
     assert metadata["student_id"] == "20260001"
-    assert metadata["major"] == "历史学"
+    assert "major" not in metadata
+    assert "历史学" not in _request_text(model.requests[0])
 
     reviewer_requests = model.requests[1:4]
     downstream_text = "\n".join(

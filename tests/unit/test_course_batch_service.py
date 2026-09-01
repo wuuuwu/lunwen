@@ -181,7 +181,6 @@ def _metadata(name: str = "张三") -> SubmissionMetadata:
     return SubmissionMetadata(
         student_name=name,
         student_id="20260001",
-        major="公共管理",
         paper_title="课程论文",
         field_evidence={
             field: SubmissionFieldEvidence(
@@ -1226,47 +1225,6 @@ async def test_metadata_correction_rejects_stale_dialog_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_metadata_correction_retires_exact_schema_1_0_standard_report_name(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = MemoryBatchStore()
-    service, record, run_dir, original_report = _metadata_update_case(tmp_path, store)
-    original_report.unlink()
-    legacy = _metadata("旧姓名")
-    legacy_evidence = {
-        **legacy.field_evidence,
-        "paper_title": legacy.field_evidence["paper_title"].model_copy(
-            update={"confidence": 0.7}
-        ),
-    }
-    legacy = legacy.model_copy(
-        update={"schema_version": "1.0", "field_evidence": legacy_evidence}
-    )
-    legacy_standard_name = build_report_filename(
-        legacy.model_copy(update={"human_reviewed": True}),
-        record.items[0].run_id or "",
-    )
-    legacy_report = record.request.output_dir / legacy_standard_name
-    legacy_report.write_bytes(b"legacy schema 1.0 report")
-    record.items[0].metadata = legacy
-    record.items[0].report_path = legacy_report
-    store.save(record)
-    RunArtifactStore(run_dir).write_model("submission-metadata.json", legacy)
-    _install_metadata_update_fakes(monkeypatch, service, record)
-
-    corrected = await service.update_submission_metadata(
-        record.batch_id,
-        record.items[0].item_id,
-        _metadata("新姓名"),
-    )
-
-    assert not legacy_report.exists()
-    assert corrected.items[0].report_path is not None
-    assert corrected.items[0].report_path.read_bytes() == b"new local pdf"
-
-
-@pytest.mark.asyncio
 async def test_metadata_correction_retires_allocator_collision_report_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1841,7 +1799,6 @@ async def test_batch_metadata_recheck_preview_is_local_read_only_and_apply_is_pe
     item.run_id = "run-recheck"
     current = _metadata("张三 得分：").model_copy(
         update={
-            "schema_version": "1.0",
             "paper_title": "示例学院",
             "field_evidence": {
                 **_metadata().field_evidence,
@@ -1919,7 +1876,6 @@ async def test_batch_metadata_recheck_preview_is_local_read_only_and_apply_is_pe
     values = {
         "student_name": by_field["student_name"].suggested_value,
         "student_id": current.student_id,
-        "major": current.major,
         "paper_title": by_field["paper_title"].suggested_value,
     }
     decision = MetadataRecheckDecision(

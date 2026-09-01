@@ -27,7 +27,6 @@ def _metadata(
     return SubmissionMetadata(
         student_name="张三",
         student_id="20260001",
-        major="公共管理",
         paper_title="公共治理课程案例分析",
         field_evidence={
             field: SubmissionFieldEvidence(
@@ -87,7 +86,7 @@ def test_course_markdown_uses_configured_five_level_anchors(
     assert "课程论文 AI 辅助评测报告" in markdown
     assert "姓名：张三" in markdown
     assert "学号：20260001" in markdown
-    assert "专业（仅用于识别与文件命名）：公共管理" in markdown
+    assert "专业" not in markdown
     assert "论文题目：公共治理课程案例分析" in markdown
     for dimension in rubric.dimensions:
         assert dimension.title in markdown

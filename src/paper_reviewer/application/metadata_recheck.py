@@ -20,7 +20,6 @@ from paper_reviewer.domain.submission import (
 _FIELD_TITLES = {
     "student_name": "姓名",
     "student_id": "学号",
-    "major": "专业",
     "paper_title": "题目",
 }
 _SOURCE_REASONS = {
@@ -38,7 +37,7 @@ class MetadataRecheckValidationError(ValueError):
     """A display-safe validation failure for one recheck decision."""
 
 
-_LEGACY_METADATA_BOUNDARY_PATTERN = re.compile(
+_METADATA_BOUNDARY_CONTAMINATION_PATTERN = re.compile(
     r"(?:得分|成绩|分数|评分|班级|专业|学号|姓名|任课教师|考核方法|考核方式|教师评语)"
     r"\s*[:：]",
     re.IGNORECASE,
@@ -46,7 +45,7 @@ _LEGACY_METADATA_BOUNDARY_PATTERN = re.compile(
 
 
 def metadata_requires_local_recheck(metadata: SubmissionMetadata) -> bool:
-    """Select low-confidence records and known pre-1.1 extraction anomalies."""
+    """Select records with low-confidence or boundary-contaminated values."""
 
     return bool(metadata_recheck_fields(metadata))
 
@@ -55,11 +54,10 @@ def metadata_recheck_fields(metadata: SubmissionMetadata) -> tuple[str, ...]:
     """Return the metadata fields that should be presented for local recheck.
 
     ``SubmissionMetadata.needs_review`` intentionally only represents current
-    field-level confidence.  Batch records created by earlier versions can
-    also contain values from PDF hidden metadata or a following cover-field
-    label.  Keep those compatibility rules in this application-level helper so
-    the service and GUI make the same decision and can identify the exact
-    affected column.
+    field-level confidence.  Hidden PDF titles and text captured across a
+    following cover-field boundary require a separate local check.  Keep those
+    rules in this application-level helper so the service and GUI make the same
+    decision and can identify the exact affected column.
     """
 
     if metadata.human_reviewed:
@@ -72,10 +70,9 @@ def metadata_recheck_fields(metadata: SubmissionMetadata) -> tuple[str, ...]:
     ):
         fields.append("paper_title")
     for field in SUBMISSION_METADATA_FIELDS:
-        if _LEGACY_METADATA_BOUNDARY_PATTERN.search(getattr(metadata, field)):
+        if _METADATA_BOUNDARY_CONTAMINATION_PATTERN.search(getattr(metadata, field)):
             fields.append(field)
-    # Preserve the schema field order even when a field is identified by more
-    # than one compatibility rule.  This keeps UI text deterministic.
+    # Preserve schema field order when more than one rule identifies a field.
     return tuple(field for field in SUBMISSION_METADATA_FIELDS if field in fields)
 
 
@@ -208,7 +205,6 @@ def apply_metadata_recheck_decision(
         schema_version=candidate.schema_version if accepted else current.schema_version,
         student_name=values["student_name"],
         student_id=values["student_id"],
-        major=values["major"],
         paper_title=values["paper_title"],
         field_evidence=evidence,
         warnings=warnings,

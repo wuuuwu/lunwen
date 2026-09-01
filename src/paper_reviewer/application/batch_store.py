@@ -129,7 +129,7 @@ class BatchStore:
         temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
         try:
             with temporary.open("w", encoding="utf-8") as handle:
-                handle.write(record.model_dump_json(indent=2))
+                handle.write(record.model_dump_json(indent=2, exclude_computed_fields=True))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)

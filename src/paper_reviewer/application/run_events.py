@@ -74,7 +74,7 @@ RUN_EVENT_CATALOG: Mapping[str, RunEventDescriptor] = {
     "ingest_started": _descriptor("ingest_started", "正在解析论文"),
     "ingest_completed": _descriptor("ingest_completed", "论文解析完成"),
     "submission_metadata_started": _descriptor(
-        "submission_metadata_started", "正在提取姓名、学号、专业和论文题目"
+        "submission_metadata_started", "正在提取姓名、学号和论文题目"
     ),
     "submission_metadata_completed": _descriptor(
         "submission_metadata_completed", "学生与论文信息提取完成"

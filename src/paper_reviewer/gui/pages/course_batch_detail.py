@@ -138,7 +138,7 @@ class CourseBatchDetailPage(QWidget):
         self.recheck_metadata_button.setIcon(icons.icon("search"))
         self.recheck_metadata_button.setAccessibleName("批量重新检查论文信息")
         self.recheck_metadata_button.setAccessibleDescription(
-            "只在本机重新解析原 PDF，检查姓名、学号、专业和题目，并先显示差异预览。"
+            "只在本机重新解析原 PDF，检查姓名、学号和题目，并先显示差异预览。"
         )
         self.recheck_metadata_button.setToolTip(
             "本地重新检查待核对论文；不联网、不调用模型，应用前会显示差异"
@@ -195,7 +195,10 @@ class CourseBatchDetailPage(QWidget):
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(
+            self.model.PAPER_TITLE_COLUMN,
+            QHeaderView.ResizeMode.Stretch,
+        )
         header.setMinimumSectionSize(72)
         layout.addWidget(self.table, 1)
 
@@ -508,7 +511,6 @@ class CourseBatchDetailPage(QWidget):
         labels = {
             "student_name": "姓名",
             "student_id": "学号",
-            "major": "专业",
             "paper_title": "题目",
         }
         review_fields = metadata_recheck_fields(metadata)

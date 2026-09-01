@@ -73,7 +73,6 @@ def _metadata(*, needs_review: bool = False) -> SubmissionMetadata:
     return SubmissionMetadata(
         student_name="张三",
         student_id="20260001",
-        major="公共管理",
         paper_title="课程治理案例分析",
         field_evidence={
             field: SubmissionFieldEvidence(source=source, confidence=confidence)
@@ -152,13 +151,13 @@ def test_batch_items_model_exposes_chinese_status_metadata_and_accessibility(
     model.set_item_stage(item.item_id, "Meta 汇总")
 
     assert model.rowCount() == 1
-    assert model.columnCount() == 10
+    assert model.columnCount() == 9
     assert model.data(model.index(0, 1)) == "张三"
-    assert model.data(model.index(0, 5)) == "待核对（姓名、学号、专业、题目）"
-    assert model.data(model.index(0, 6)) == "Meta 汇总"
-    assert model.data(model.index(0, 7)) == "已完成"
-    assert model.data(model.index(0, 8)) == "82.5"
-    assert model.data(model.index(0, 9)) == "已生成"
+    assert model.data(model.index(0, 4)) == "待核对（姓名、学号、题目）"
+    assert model.data(model.index(0, 5)) == "Meta 汇总"
+    assert model.data(model.index(0, 6)) == "已完成"
+    assert model.data(model.index(0, 7)) == "82.5"
+    assert model.data(model.index(0, 8)) == "已生成"
     assert model.data(model.index(0, 0), model.ItemIdRole) == "item-1"
     assert "需要人工核对" in str(
         model.data(model.index(0, 1), Qt.ItemDataRole.AccessibleDescriptionRole)

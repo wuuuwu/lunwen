@@ -69,13 +69,13 @@ class CourseAssessmentBrief(BaseModel):
     def validate_design(self) -> CourseAssessmentBrief:
         if self.subject_assessment_mode is not SubjectAssessmentMode.NONE:
             if not self.subject_name:
-                raise ValueError("启用专业内容评测时必须填写课程所属领域")
+                raise ValueError("启用课程内容评价时必须填写课程领域")
             if not self.learning_outcomes and not self.core_topics:
-                raise ValueError("启用专业内容评测时必须提供学习目标或核心知识点")
+                raise ValueError("启用课程内容评价时必须提供学习目标或核心知识点")
         if self.subject_assessment_mode is SubjectAssessmentMode.NONE and any(
             item.reviewer_role == "subject_matter" for item in self.dimension_preferences
         ):
-            raise ValueError("不评测专业内容时不能分配专业内容 Reviewer")
+            raise ValueError("不评价课程内容时不能分配课程内容 Reviewer")
         total = sum(item.weight for item in self.dimension_preferences)
         if abs(total - 100) > 0.01:
             raise ValueError(f"评价维度权重必须合计 100，当前为 {total:g}")

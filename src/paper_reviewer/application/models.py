@@ -37,7 +37,7 @@ class ReportExportResult(BaseModel):
     reconstructed_from_snapshot: bool = False
 
 
-MetadataFieldName = Literal["student_name", "student_id", "major", "paper_title"]
+MetadataFieldName = Literal["student_name", "student_id", "paper_title"]
 
 
 class MetadataFieldSuggestion(BaseModel):

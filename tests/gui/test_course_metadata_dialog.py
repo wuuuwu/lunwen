@@ -17,7 +17,6 @@ def _metadata() -> SubmissionMetadata:
     return SubmissionMetadata(
         student_name="张三",
         student_id="20260001",
-        major="公共管理",
         paper_title="课程治理案例分析",
         field_evidence={
             field: SubmissionFieldEvidence(
@@ -64,7 +63,7 @@ def test_dialog_displays_warnings_and_returns_human_provenance(
     assert result.field_evidence["student_name"].confidence == 1
     assert result.field_evidence["student_name"].page is None
     assert result.field_evidence["student_name"].evidence is None
-    unchanged = result.field_evidence["major"]
+    unchanged = result.field_evidence["paper_title"]
     assert unchanged.source is SubmissionMetadataSource.COVER_LABEL
     assert unchanged.page == 1
     assert "信息已人工修改" in result.warnings

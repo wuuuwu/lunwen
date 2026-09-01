@@ -54,10 +54,8 @@ def _metadata(
         evidence=title,
     )
     return SubmissionMetadata(
-        schema_version="1.0",
         student_name=name,
         student_id="202600010001",
-        major="未识别专业",
         paper_title=title,
         field_evidence=evidence,
         warnings=["题目识别置信度较低，请人工核对"],
@@ -107,10 +105,10 @@ def test_recheck_keeps_unresolved_field_editable_but_unselected() -> None:
     )
     current = current.model_copy(
         update={
-            "major": "未识别专业",
+            "student_id": "未识别学号",
             "field_evidence": {
                 **current.field_evidence,
-                "major": SubmissionFieldEvidence(
+                "student_id": SubmissionFieldEvidence(
                     source=SubmissionMetadataSource.PLACEHOLDER,
                     confidence=0,
                 ),
@@ -121,10 +119,10 @@ def test_recheck_keeps_unresolved_field_editable_but_unselected() -> None:
 
     suggestions, unresolved = build_metadata_suggestions(current, candidate)
 
-    major = next(item for item in suggestions if item.field == "major")
-    assert major.selected_by_default is False
-    assert "编辑" in major.reason
-    assert unresolved == ["major"]
+    student_id = next(item for item in suggestions if item.field == "student_id")
+    assert student_id.selected_by_default is False
+    assert "编辑" in student_id.reason
+    assert unresolved == ["student_id"]
 
 
 def test_apply_recheck_accepts_edited_value_and_records_human_provenance() -> None:
@@ -141,7 +139,6 @@ def test_apply_recheck_accepts_edited_value_and_records_human_provenance() -> No
         values={
             "student_name": "张三",
             "student_id": current.student_id,
-            "major": current.major,
             "paper_title": "人工确认后的完整题目",
         },
         accepted_fields=["student_name", "paper_title"],
@@ -170,7 +167,6 @@ def test_confirm_without_changes_preserves_evidence_and_only_sets_reviewed() -> 
         values={
             "student_name": current.student_name,
             "student_id": current.student_id,
-            "major": current.major,
             "paper_title": current.paper_title,
         },
         accepted_fields=[],
@@ -264,10 +260,10 @@ def test_recheck_copies_candidate_evidence_only_for_the_same_existing_value() ->
     assert result.field_evidence["paper_title"] == candidate.field_evidence["paper_title"]
 
 
-def test_known_legacy_boundary_anomalies_cover_major_title_and_extra_labels() -> None:
-    major_polluted = _metadata().model_copy(update={"major": "心理学 教师评语：优秀"})
+def test_known_boundary_anomalies_cover_name_title_and_extra_labels() -> None:
+    name_polluted = _metadata().model_copy(update={"student_name": "张三 教师评语：优秀"})
     title_polluted = _metadata().model_copy(update={"paper_title": "课程论文 考核方式：闭卷"})
 
-    assert metadata_requires_local_recheck(major_polluted)
+    assert metadata_requires_local_recheck(name_polluted)
     assert metadata_requires_local_recheck(title_polluted)
     assert not metadata_requires_local_recheck(_metadata(human_reviewed=True))

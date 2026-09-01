@@ -24,7 +24,6 @@ def _metadata() -> SubmissionMetadata:
     return SubmissionMetadata(
         student_name="张三 得分：",
         student_id="202600010001",
-        major="未识别专业",
         paper_title="示例学院",
         field_evidence={
             field: SubmissionFieldEvidence(

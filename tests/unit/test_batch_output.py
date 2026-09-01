@@ -58,7 +58,6 @@ def _metadata(
     defaults = {
         "student_name": "张三",
         "student_id": "20260001",
-        "major": "经济学",
         "paper_title": "课程论文题目",
     }
     defaults.update(values)
@@ -160,19 +159,18 @@ def test_report_filename_normalizes_windows_names_and_limits_utf16() -> None:
     metadata = _metadata(
         student_name="  张：三  ",
         student_id="CON",
-        major="软件/工程",
         paper_title="😀" * 200 + "?",
     )
 
     filename = build_report_filename(metadata, "abcdef123456")
 
-    assert filename.startswith("张_三__CON_软件_工程_")
+    assert filename.startswith("张_三__CON_")
     assert filename.endswith("_课程论文评测报告.pdf")
     assert len(filename.encode("utf-16-le")) // 2 <= 240
     assert not any(character in filename for character in '<>:"/\\|?*')
 
 
-def test_low_confidence_critical_metadata_uses_source_filename_and_pending_marker() -> None:
+def test_low_confidence_critical_metadata_uses_safe_pending_name() -> None:
     metadata = _metadata(field_confidences={"student_name": 0.5})
 
     filename = build_report_filename(
@@ -181,26 +179,19 @@ def test_low_confidence_critical_metadata_uses_source_filename_and_pending_marke
         source_filename="原始交稿.pdf",
     )
 
-    assert filename == "原始交稿__待核对__abcdef12_课程论文评测报告.pdf"
+    assert filename == "待核对论文__待核对__abcdef12_课程论文评测报告.pdf"
+    assert "原始交稿" not in filename
     assert "张三" not in filename
     assert "20260001" not in filename
 
 
-def test_human_review_or_only_unknown_major_keeps_standard_filename() -> None:
+def test_human_review_keeps_standard_filename() -> None:
     reviewed = _metadata(
         field_confidences={"student_name": 0.2, "paper_title": 0.2},
         human_reviewed=True,
     )
-    major_only = _metadata(
-        major="未识别专业",
-        field_confidences={"major": 0.1},
-    )
-
     assert build_report_filename(reviewed, "abcdef123456").startswith(
-        "张三_20260001_经济学_课程论文题目"
-    )
-    assert build_report_filename(major_only, "abcdef123456").startswith(
-        "张三_20260001_未识别专业_课程论文题目"
+        "张三_20260001_课程论文题目"
     )
 
 
@@ -301,12 +292,12 @@ def test_batch_csv_lists_pending_fields_and_human_confirmation(tmp_path: Path) -
     (tmp_path / "confirmed").mkdir()
     pending = _record(
         tmp_path / "pending",
-        _metadata(field_confidences={"student_id": 0.4, "major": 0.3}),
+        _metadata(field_confidences={"student_id": 0.4, "paper_title": 0.3}),
     )
     confirmed = _record(
         tmp_path / "confirmed",
         _metadata(
-            field_confidences={"student_id": 0.4, "major": 0.3},
+            field_confidences={"student_id": 0.4, "paper_title": 0.3},
             human_reviewed=True,
         ),
     )
@@ -321,7 +312,7 @@ def test_batch_csv_lists_pending_fields_and_human_confirmation(tmp_path: Path) -
     with confirmed_destination.open(encoding="utf-8-sig", newline="") as handle:
         confirmed_row = next(csv.DictReader(handle))
     assert pending_row["元数据待核对"] == "是"
-    assert pending_row["待核对字段"] == "学号、专业"
+    assert pending_row["待核对字段"] == "学号、题目"
     assert pending_row["人工已核对"] == "否"
     assert confirmed_row["元数据待核对"] == "否"
     assert confirmed_row["待核对字段"] == ""
@@ -333,7 +324,7 @@ def test_batch_xlsx_is_styled_dynamic_typed_and_formula_safe(tmp_path: Path) -> 
         student_name="=HYPERLINK(\"https://invalid.example\")",
         student_id="0012300",
         paper_title="+SUM(1,1)",
-        field_confidences={"major": 0.4},
+        field_confidences={"paper_title": 0.4},
     )
     record = _record(tmp_path, metadata)
     failed = record.items[0].model_copy(deep=True)
@@ -358,6 +349,7 @@ def test_batch_xlsx_is_styled_dynamic_typed_and_formula_safe(tmp_path: Path) -> 
         headers = [cell.value for cell in worksheet[1]]
         assert "共同维度（completion）" in headers
         assert "共同维度（writing）" in headers
+        assert "专业" not in headers
         assert worksheet.freeze_panes == "A2"
         assert worksheet.auto_filter.ref == worksheet.tables["CoursePaperScores"].ref
         assert worksheet.tables["CoursePaperScores"].tableStyleInfo.showRowStripes
@@ -370,7 +362,7 @@ def test_batch_xlsx_is_styled_dynamic_typed_and_formula_safe(tmp_path: Path) -> 
         total = worksheet.cell(row=2, column=by_header["总分"])
         assert student_id.value == "0012300"
         assert student_id.data_type == "s"
-        assert confidence.value == pytest.approx(0.775)
+        assert confidence.value == pytest.approx(0.7333333333)
         assert confidence.data_type == "n"
         assert first_score.value == 88
         assert first_score.data_type == "n"

@@ -61,10 +61,15 @@ class RunArtifactStore:
         )
 
     def write_model(self, name: str, model: BaseModel) -> None:
-        self._write_text_atomic(name, model.model_dump_json(indent=2))
+        self._write_text_atomic(
+            name,
+            model.model_dump_json(indent=2, exclude_computed_fields=True),
+        )
 
     def write_model_list(self, name: str, items: Sequence[BaseModel]) -> None:
-        payload = [item.model_dump(mode="json") for item in items]
+        payload = [
+            item.model_dump(mode="json", exclude_computed_fields=True) for item in items
+        ]
         self.write_json(name, payload)
 
     def _write_text_atomic(self, name: str, content: str) -> None:

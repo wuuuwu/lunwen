@@ -44,8 +44,8 @@ _ROLE_DETAILS: dict[str, tuple[str, str]] = {
         "依据作业要求和课程学习目标评价任务完成度，不扩展教师未提供的课程要求。",
     ),
     "subject_matter": (
-        "课程专业内容 Reviewer",
-        "依据教师提供的课程领域、核心知识点和学习目标评价专业内容准确性。",
+        "课程内容 Reviewer",
+        "依据教师提供的课程领域、核心知识点和学习目标评价课程内容准确性。",
     ),
     "argumentation": (
         "论证、证据与结构 Reviewer",
@@ -161,7 +161,7 @@ def compile_rubric_generation(
     build_review_plan(rubric, profile)
     warnings = list(draft.assumptions)
     if request.brief.subject_assessment_mode.value == "specialist":
-        warnings.append("专业深度评测仍需任课教师或领域专家核对评价标准与最终结果。")
+        warnings.append("深入课程内容评价仍需任课教师或课程领域专家核对评价标准与最终结果。")
     return RubricGenerationResult(
         request=request,
         draft=draft,
@@ -448,7 +448,7 @@ def _generation_prompt(
         "维度数量、名称、顺序、权重和 reviewer_role 必须与 dimension_preferences 完全一致。",
         f"每个维度必须生成 {request.scoring.anchor_count} 个从低到高的评分等级。",
         "检查点必须具体、可观察，并能通过论文内容判断。",
-        "专业评价不得超出教师提供的学习目标和核心知识点。",
+        "课程内容评价不得超出教师提供的学习目标和核心知识点。",
         "不得生成一票否决、学术不端认定或自动处分规则。",
         "只调用 submit_rubric_draft，不要输出正文或 YAML。",
     ]

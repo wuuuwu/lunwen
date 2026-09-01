@@ -372,10 +372,7 @@ class ReviewOrchestrator:
             self._append_trace(
                 pipeline.run.run_id,
                 "submission_metadata_completed",
-                {
-                    "needs_review": metadata.needs_review,
-                    "warning_count": len(metadata.warnings),
-                },
+                {"warning_count": len(metadata.warnings)},
             )
         pipeline.submission_metadata = metadata
         pipeline.blocks = _blind_course_blocks(pipeline.blocks, metadata)
@@ -1264,18 +1261,17 @@ def _blind_course_blocks(
         for field, value in (
             ("student_name", metadata.student_name),
             ("student_id", metadata.student_id),
-            ("major", metadata.major),
         )
         if metadata.field_evidence[field].source is not SubmissionMetadataSource.PLACEHOLDER
         and normalize_text(value)
     ]
     blinded: list[DocumentBlock] = []
     identity_label = re.compile(
-        r"(?:学生姓名|姓名|作者|学生学号|学号|学生编号|专业名称|所学专业|专业)\s*[:：]",
+        r"(?:学生姓名|姓名|作者|学生学号|学号|学生编号)\s*[:：]",
         re.IGNORECASE,
     )
     identity_field_only = re.compile(
-        r"^\s*(?:学生姓名|姓名|作者|学生学号|学号|学生编号|专业名称|所学专业|专业)"
+        r"^\s*(?:学生姓名|姓名|作者|学生学号|学号|学生编号)"
         r"\s*[:：]?\s*$",
         re.IGNORECASE,
     )

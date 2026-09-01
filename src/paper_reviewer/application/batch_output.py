@@ -38,7 +38,6 @@ _CRITICAL_FILENAME_FIELDS = frozenset({"student_name", "student_id", "paper_titl
 _METADATA_FIELD_LABELS = {
     "student_name": "姓名",
     "student_id": "学号",
-    "major": "专业",
     "paper_title": "题目",
 }
 _MAX_FILENAME_UTF16_UNITS = 240
@@ -170,25 +169,15 @@ def build_report_filename(
     source_filename: str | None = None,
 ) -> str:
     if _critical_metadata_needs_review(metadata):
-        source_stem = Path(source_filename or "").stem
-        source = sanitize_filename_component(
-            source_stem,
-            fallback="未识别原文件",
-            max_utf16_units=150,
-        )
         run_token = sanitize_filename_component(
             run_id[:8],
             fallback="run",
             max_utf16_units=8,
         )
-        tail = f"{_PENDING_REVIEW_MARKER}{run_token}{_REPORT_SUFFIX}"
-        available = _MAX_FILENAME_UTF16_UNITS - _utf16_units(tail)
-        source = _truncate_utf16(source, available).rstrip(" ._") or "未识别原文件"
-        return f"{source}{tail}"
+        return f"待核对论文{_PENDING_REVIEW_MARKER}{run_token}{_REPORT_SUFFIX}"
     components = (
         sanitize_filename_component(metadata.student_name, fallback="未识别姓名"),
         sanitize_filename_component(metadata.student_id, fallback="未识别学号"),
-        sanitize_filename_component(metadata.major, fallback="未识别专业"),
         sanitize_filename_component(
             metadata.paper_title,
             fallback="未识别题目",
@@ -335,7 +324,6 @@ def write_batch_summary_csv(
         "原文件名",
         "姓名",
         "学号",
-        "专业",
         "题目",
         "元数据置信度",
         "元数据待核对",
@@ -399,7 +387,9 @@ def write_batch_summary_xlsx(
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         dimension_by_id = {dimension.dimension_id: dimension for dimension in dimensions}
-        dimension_header_start = 11
+        dimension_header_start = (
+            headers.index("重复PDF内容") + 2 if dimension_columns else 1
+        )
         for offset, (dimension_id, _header) in enumerate(dimension_columns):
             dimension = dimension_by_id[dimension_id]
             cell = worksheet.cell(row=1, column=dimension_header_start + offset)
@@ -465,7 +455,6 @@ def _summary_headers(dimension_columns: Sequence[tuple[str, str]]) -> list[str]:
         "原文件名",
         "姓名",
         "学号",
-        "专业",
         "题目",
         "元数据置信度",
         "元数据待核对",
@@ -491,7 +480,6 @@ def _workbook_row(
         "原文件名": item.source.filename,
         "姓名": metadata.student_name if metadata else "未识别姓名",
         "学号": metadata.student_id if metadata else "未识别学号",
-        "专业": metadata.major if metadata else "未识别专业",
         "题目": metadata.paper_title if metadata else "未识别题目",
         "元数据置信度": _metadata_confidence_number(metadata),
         "元数据待核对": "是" if metadata is None or metadata.needs_review else "否",
@@ -522,7 +510,6 @@ def _fit_workbook_columns(worksheet: Any, headers: Sequence[str]) -> None:
         "原文件名": 20,
         "姓名": 10,
         "学号": 16,
-        "专业": 16,
         "题目": 28,
         "待核对字段": 16,
         "结论": 28,
@@ -555,7 +542,6 @@ def _csv_row(item: BatchItem, dimensions: Sequence[tuple[str, str]]) -> dict[str
         "原文件名": _spreadsheet_safe(item.source.filename),
         "姓名": _spreadsheet_safe(metadata.student_name if metadata else "未识别姓名"),
         "学号": _spreadsheet_safe(metadata.student_id if metadata else "未识别学号"),
-        "专业": _spreadsheet_safe(metadata.major if metadata else "未识别专业"),
         "题目": _spreadsheet_safe(metadata.paper_title if metadata else "未识别题目"),
         "元数据置信度": _metadata_confidence(metadata),
         "元数据待核对": "是" if metadata is None or metadata.needs_review else "否",
